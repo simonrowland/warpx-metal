@@ -1,0 +1,20 @@
+diff --git a/Source/WarpX.cpp b/Source/WarpX.cpp
+index e73dda29..e3e61e8c 100644
+--- a/Source/WarpX.cpp
++++ b/Source/WarpX.cpp
+@@ -1487,6 +1487,15 @@ WarpX::ReadParameters ()
+ 
+         const amrex::ParmParse pp_warpx("warpx");
+         pp_warpx.queryarr("sort_intervals", sort_intervals_string_vec);
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) &&     (defined(SYCL_IMPLEMENTATION_ACPP) || defined(SYCL_IMPLEMENTATION_HIPSYCL) ||      defined(__ADAPTIVECPP__) || defined(__HIPSYCL__))
++        if (!(sort_intervals_string_vec.size() == 1 && sort_intervals_string_vec[0] == "-1")) {
++            ablastr::warn_manager::WMRecordWarning(
++                "Particles",
++                "Disabling warpx.sort_intervals on AdaptiveCpp/HipSYCL SYCL because the Metal GPU sort path corrupts particle attributes on this backend.",
++                ablastr::warn_manager::WarnPriority::high);
++            sort_intervals_string_vec = {"-1"};
++        }
++#endif
+         sort_intervals = utils::parser::IntervalsParser(sort_intervals_string_vec);
+ 
+         Vector<int> vect_sort_bin_size(AMREX_SPACEDIM,1);
