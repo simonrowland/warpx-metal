@@ -18,6 +18,7 @@ BUILD_JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 HOST_OS="$(uname -s)"
 PATCH_COUNT=0
 BINARY_COUNT=0
+JEXT_SUITE_COUNT=0
 WORK_DIR=""
 
 finish() {
@@ -31,8 +32,9 @@ finish() {
         outcome="PASS"
     fi
 
-    printf 'LOCAL_CI_RESULT outcome=%s host=%s patches=%d binaries=%d\n' \
-        "${outcome}" "${HOST_OS}" "${PATCH_COUNT}" "${BINARY_COUNT}"
+    printf 'LOCAL_CI_RESULT outcome=%s host=%s patches=%d binaries=%d jext_suites=%d\n' \
+        "${outcome}" "${HOST_OS}" "${PATCH_COUNT}" "${BINARY_COUNT}" \
+        "${JEXT_SUITE_COUNT}"
 }
 trap 'finish "$?"' EXIT
 
@@ -115,6 +117,10 @@ apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0002-fix-addplasma-metal-parser-momentum-oob.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0003-correct-macos-memory-guard-available-memory.patch"
+apply_patch "${WARPX_SOURCE_DIR}" \
+    "${ROOT_DIR}/patches/warpx/0004-metal-disable-particle-sort-override.patch"
+apply_patch "${WARPX_SOURCE_DIR}" \
+    "${ROOT_DIR}/patches/warpx/0005-add-impressed-current-j-ext.patch"
 
 (( PATCH_COUNT > 0 )) || fail "no patches were applied"
 git -C "${AMREX_SOURCE_DIR}" diff --check
@@ -228,6 +234,25 @@ BINARY_COUNT="${#binaries[@]}"
 (( BINARY_COUNT > 0 )) || fail "no linked WarpX executable found"
 printf 'Linked executable: %s\n' "${binaries[@]}"
 
+jext_executable=""
+for binary in "${binaries[@]}"; do
+    if [[ "$(basename "${binary}")" == warpx.3d* ]]; then
+        jext_executable="${binary}"
+        break
+    fi
+done
+[[ -n "${jext_executable}" ]] || fail "no linked 3D WarpX executable found for J_ext tests"
+
+printf 'Running J_ext CPU regression suite: %s\n' "${jext_executable}"
+# The checked-in regression decks are tiny and particle-free. Avoid unrelated
+# host memory pressure tripping the package crashguard before test logic runs;
+# callers can still supply a stricter value.
+WARPX_MAX_MEM_FRACTION="${WARPX_MAX_MEM_FRACTION:-0.99}" \
+    "${WARPX_SOURCE_DIR}/tests/jext/run_jext_regression.sh" \
+    "${jext_executable}" "${WORK_DIR}/jext-logs"
+JEXT_SUITE_COUNT=$((JEXT_SUITE_COUNT + 1))
+
 printf '%s\n' \
     "Host CPU build passed on ${HOST_OS}." \
+    'The 3D J_ext CPU regression suite passed.' \
     'A macOS PASS plus the -U__APPLE__ syntax gate does not prove Linux/GCC behavior.'

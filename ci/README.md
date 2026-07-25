@@ -11,12 +11,14 @@ and checkpoint-commit unit tests. It then clones pinned AMReX and WarpX
 revisions into a temporary directory, verifies each pin is reachable from its
 upstream `26.06` tag, installs the packaged AMReX replacement files, explicitly
 applies the AMReX and WarpX patch files used by this repository, and builds
-linked 2D and 3D CPU WarpX executables. Any test, clone, pin, patch-application,
-configuration, compilation, or link failure exits nonzero. The last output line
-is machine-readable:
+linked 2D and 3D CPU WarpX executables. It then runs the full 3D
+impressed-current regression suite, including analytic staggering,
+discrete-divergence, boundary, energy-injection, and unsupported-mode gates.
+Any test, clone, pin, patch-application, configuration, compilation, link, or
+regression failure exits nonzero. The last output line is machine-readable:
 
 ```text
-LOCAL_CI_RESULT outcome=PASS|FAIL host=... patches=... binaries=...
+LOCAL_CI_RESULT outcome=PASS|FAIL host=... patches=... binaries=... jext_suites=...
 ```
 
 Dependencies are Git, CMake, Ninja, Python 3, a C/C++ compiler, and OpenMP. On
@@ -31,4 +33,6 @@ properties. On Linux, the full build exercises the native Linux CPU path.
 
 Set `CMAKE_BUILD_PARALLEL_LEVEL` to change the default two build jobs. Set
 `KEEP_LOCAL_CI_WORKDIR=1` to retain the temporary source and build trees for
-debugging.
+debugging. The bounded, particle-free J_ext regression invocation defaults
+`WARPX_MAX_MEM_FRACTION` to `0.99` so unrelated host pressure does not abort
+before test logic runs; set that variable explicitly to use a stricter limit.

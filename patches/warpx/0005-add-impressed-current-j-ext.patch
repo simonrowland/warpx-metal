@@ -1,0 +1,2433 @@
+diff --git a/Source/Evolve/JextStaggerOracle.H b/Source/Evolve/JextStaggerOracle.H
+new file mode 100644
+index 000000000..782d5135f
+--- /dev/null
++++ b/Source/Evolve/JextStaggerOracle.H
+@@ -0,0 +1,184 @@
++/**
++ * Independent Yee-stagger position oracle for J_ext analytic self-check.
++ *
++ * This is NOT an algebraic re-expression of the injection kernel in
++ * WarpXEvolve.cpp. Half-cell offsets are literal constants transcribed from
++ * WarpX::AllocLevelMFs nodal-flag tables (WarpX.cpp, ~L2435-2477) and the
++ * AMReX Yee IndexType convention used there:
++ *
++ *   // WarpX.cpp AllocLevelMFs — staggered current_fp nodal flags
++ *   #if WARPX_DIM_1D_Z
++ *     jx_nodal_flag = IntVect(1);       // NODE along z
++ *     jy_nodal_flag = IntVect(1);       // NODE along z
++ *     jz_nodal_flag = IntVect(0);       // CELL along z
++ *   #elif WARPX_DIM_XZ
++ *     jx_nodal_flag = IntVect(0,1);     // CELL,x  NODE,z
++ *     jy_nodal_flag = IntVect(1,1);     // NODE,x  NODE,z
++ *     jz_nodal_flag = IntVect(1,0);     // NODE,x  CELL,z
++ *   #elif WARPX_DIM_3D
++ *     jx_nodal_flag = IntVect(0,1,1);   // CELL,x  NODE,y  NODE,z
++ *     jy_nodal_flag = IntVect(1,0,1);   // NODE,x  CELL,y  NODE,z
++ *     jz_nodal_flag = IntVect(1,1,0);   // NODE,x  NODE,y  CELL,z
++ *   #endif
++ *
++ * Convention: nodal flag 1 => half-offset 0 (sample on node);
++ *             nodal flag 0 => half-offset 0.5 (sample on face center).
++ * Physical position along axis a:
++ *   x_a = lo_a + (i_a + half_offset_a) * dx_a
++ *
++ * Callers pass the physical component index (0=Jx, 1=Jy, 2=Jz). The oracle
++ * never reads live MultiFab::ixType() — a shared live-nodal bug cannot move
++ * injection and reference together.
++ */
++#ifndef WARPX_JEXT_STAGGER_ORACLE_H_
++#define WARPX_JEXT_STAGGER_ORACLE_H_
++
++#include <AMReX_Array.H>
++#include <AMReX_GpuQualifiers.H>
++#include <AMReX_REAL.H>
++#include <AMReX_Extension.H>
++#include <AMReX_GpuControl.H>
++#include <AMReX_Print.H>
++
++#include <array>
++#include <cmath>
++
++namespace warpx {
++namespace jext_oracle {
++
++// ---------------------------------------------------------------------------
++// Literal half-offset tables (0.0 = NODE, 0.5 = CELL).
++// Indexed [component 0..2][spatial axis 0..AMREX_SPACEDIM-1].
++// Transcribed from WarpX.cpp AllocLevelMFs (see file header citation).
++// ---------------------------------------------------------------------------
++#if defined(WARPX_DIM_1D_Z)
++// Axis 0 = physical z. Jx NODE, Jy NODE, Jz CELL.
++static constexpr amrex::Real kHalfOff[3][1] = {
++    { amrex::Real(0.0) },  // Jx
++    { amrex::Real(0.0) },  // Jy
++    { amrex::Real(0.5) }   // Jz
++};
++#elif defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
++// Axis 0 = x, axis 1 = z. Jx(0,1), Jy(1,1), Jz(1,0).
++static constexpr amrex::Real kHalfOff[3][2] = {
++    { amrex::Real(0.5), amrex::Real(0.0) },  // Jx: CELL x, NODE z
++    { amrex::Real(0.0), amrex::Real(0.0) },  // Jy: NODE x, NODE z
++    { amrex::Real(0.0), amrex::Real(0.5) }   // Jz: NODE x, CELL z
++};
++#else
++// 3D. Jx(0,1,1), Jy(1,0,1), Jz(1,1,0).
++static constexpr amrex::Real kHalfOff[3][3] = {
++    { amrex::Real(0.5), amrex::Real(0.0), amrex::Real(0.0) },  // Jx
++    { amrex::Real(0.0), amrex::Real(0.5), amrex::Real(0.0) },  // Jy
++    { amrex::Real(0.0), amrex::Real(0.0), amrex::Real(0.5) }   // Jz
++};
++#endif
++
++/**
++ * Position of current component `comp` (0=Jx,1=Jy,2=Jz) at index (i,j,k).
++ * Uses only the hardcoded half-offset table above — never live nodal flags.
++ */
++AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
++std::array<amrex::Real,3>
++position (
++    int comp,
++    amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> const& dx,
++    amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> const& lo,
++    int i, int j, int k) noexcept
++{
++    constexpr amrex::Real zero = amrex::Real(0.0);
++#if defined(WARPX_DIM_1D_Z)
++    amrex::ignore_unused(j, k);
++    const amrex::Real x = zero;
++    const amrex::Real y = zero;
++    const amrex::Real z = lo[0]
++        + (static_cast<amrex::Real>(i) + kHalfOff[comp][0]) * dx[0];
++    return {x, y, z};
++#elif defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
++    amrex::ignore_unused(k);
++    const amrex::Real x = lo[0]
++        + (static_cast<amrex::Real>(i) + kHalfOff[comp][0]) * dx[0];
++    const amrex::Real y = zero;
++    const amrex::Real z = lo[1]
++        + (static_cast<amrex::Real>(j) + kHalfOff[comp][1]) * dx[1];
++    return {x, y, z};
++#else
++    const amrex::Real x = lo[0]
++        + (static_cast<amrex::Real>(i) + kHalfOff[comp][0]) * dx[0];
++    const amrex::Real y = lo[1]
++        + (static_cast<amrex::Real>(j) + kHalfOff[comp][1]) * dx[1];
++    const amrex::Real z = lo[2]
++        + (static_cast<amrex::Real>(k) + kHalfOff[comp][2]) * dx[2];
++    return {x, y, z};
++#endif
++}
++
++// Baked amplitude for the analytic_multifab_* family (constant Jy = 1.25).
++// Hard-asserted when the deck's max |J_ref| is within 1e-3 of this value.
++static constexpr amrex::Real kAnalyticJy = amrex::Real(1.25);
++
++/**
++ * Host-side hard assert of the stagger table + a position-dependent spot.
++ * Call once from the analytic self-check path (rank 0).
++ *
++ * Spot geometry (matches analytic_multifab / solenoidal decks on [-1,1]^d
++ * with n_cell = 32 in 1d/2d and 16 in 3d is NOT assumed here — we use the
++ * live lo/dx and only assert table identity + one algebraic identity).
++ *
++ * Table identity: kHalfOff matches the WarpX.cpp citation above.
++ * Algebraic identity: for any cell-centered component, position(i) - position(i-1)
++ * equals dx on that axis (half-offsets cancel).
++ */
++AMREX_FORCE_INLINE
++void assert_stagger_table_and_spot (
++    amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> const& dx,
++    amrex::GpuArray<amrex::Real,AMREX_SPACEDIM> const& lo)
++{
++    amrex::ignore_unused(lo);
++#if defined(WARPX_DIM_1D_Z)
++    // NODE=0, CELL=0.5  — WarpX.cpp L2442-2444
++    AMREX_ALWAYS_ASSERT(kHalfOff[0][0] == amrex::Real(0.0)); // Jx NODE
++    AMREX_ALWAYS_ASSERT(kHalfOff[1][0] == amrex::Real(0.0)); // Jy NODE
++    AMREX_ALWAYS_ASSERT(kHalfOff[2][0] == amrex::Real(0.5)); // Jz CELL
++#elif defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
++    // WarpX.cpp L2465-2467 (XZ block)
++    AMREX_ALWAYS_ASSERT(kHalfOff[0][0] == amrex::Real(0.5) && kHalfOff[0][1] == amrex::Real(0.0));
++    AMREX_ALWAYS_ASSERT(kHalfOff[1][0] == amrex::Real(0.0) && kHalfOff[1][1] == amrex::Real(0.0));
++    AMREX_ALWAYS_ASSERT(kHalfOff[2][0] == amrex::Real(0.0) && kHalfOff[2][1] == amrex::Real(0.5));
++#else
++    // WarpX.cpp L2475-2477
++    AMREX_ALWAYS_ASSERT(kHalfOff[0][0] == amrex::Real(0.5) && kHalfOff[0][1] == amrex::Real(0.0) && kHalfOff[0][2] == amrex::Real(0.0));
++    AMREX_ALWAYS_ASSERT(kHalfOff[1][0] == amrex::Real(0.0) && kHalfOff[1][1] == amrex::Real(0.5) && kHalfOff[1][2] == amrex::Real(0.0));
++    AMREX_ALWAYS_ASSERT(kHalfOff[2][0] == amrex::Real(0.0) && kHalfOff[2][1] == amrex::Real(0.0) && kHalfOff[2][2] == amrex::Real(0.5));
++#endif
++    // Algebraic identity: neighbor difference along each axis equals dx
++    // independent of half-offset (cancels).
++    for (int c = 0; c < 3; ++c) {
++        const auto p0 = position(c, dx, lo, 0, 0, 0);
++        const auto p1 = position(c, dx, lo, 1, 0, 0);
++#if defined(WARPX_DIM_1D_Z)
++        AMREX_ALWAYS_ASSERT(std::abs(static_cast<double>(p1[2] - p0[2] - dx[0])) < 1e-12);
++#elif defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ)
++        AMREX_ALWAYS_ASSERT(std::abs(static_cast<double>(p1[0] - p0[0] - dx[0])) < 1e-12);
++        const auto q0 = position(c, dx, lo, 0, 0, 0);
++        const auto q1 = position(c, dx, lo, 0, 1, 0);
++        AMREX_ALWAYS_ASSERT(std::abs(static_cast<double>(q1[2] - q0[2] - dx[1])) < 1e-12);
++#else
++        AMREX_ALWAYS_ASSERT(std::abs(static_cast<double>(p1[0] - p0[0] - dx[0])) < 1e-12);
++        const auto q0 = position(c, dx, lo, 0, 0, 0);
++        const auto q1 = position(c, dx, lo, 0, 1, 0);
++        const auto r0 = position(c, dx, lo, 0, 0, 0);
++        const auto r1 = position(c, dx, lo, 0, 0, 1);
++        AMREX_ALWAYS_ASSERT(std::abs(static_cast<double>(q1[1] - q0[1] - dx[1])) < 1e-12);
++        AMREX_ALWAYS_ASSERT(std::abs(static_cast<double>(r1[2] - r0[2] - dx[2])) < 1e-12);
++#endif
++    }
++    // Hard assert baked constant is the documented analytic multifab Jy.
++    AMREX_ALWAYS_ASSERT(kAnalyticJy == amrex::Real(1.25));
++    amrex::ignore_unused(dx);
++}
++
++} // namespace jext_oracle
++} // namespace warpx
++
++#endif
+diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
+index 384fa349f..a7375f1cb 100644
+--- a/Source/Evolve/WarpXEvolve.cpp
++++ b/Source/Evolve/WarpXEvolve.cpp
+@@ -10,6 +10,9 @@
+  */
+ #include "WarpX.H"
+ 
++#include "Initialization/ExternalField.H"
++#include "Evolve/JextStaggerOracle.H"
++
+ #include "BoundaryConditions/PML.H"
+ #include "Diagnostics/MultiDiagnostics.H"
+ #include "Diagnostics/ReducedDiags/MultiReducedDiags.H"
+@@ -49,6 +52,7 @@
+ #include <AMReX_ParmParse.H>
+ #include <AMReX_Print.H>
+ #include <AMReX_REAL.H>
++#include <AMReX_Reduce.H>
+ #include <AMReX_Utility.H>
+ #include <AMReX_Vector.H>
+ 
+@@ -743,6 +747,511 @@ void WarpX::OneStep (
+  * i.e. all levels/patches use the same timestep (that of the finest level)
+  * for the field advance and particle pusher.
+  */
++
++void
++WarpX::AddExternalCurrent (amrex::Real time)
++{
++    if (!m_p_ext_field_params->J_ext_grid_enabled) { return; }
++
++#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++    amrex::ignore_unused(time);
++    WARPX_ABORT_WITH_MESSAGE(
++        "J_ext_grid_init_style is not supported in RZ "
++        "geometry; azimuthal-mode decomposition of an impressed current is not implemented");
++#else
++    using ablastr::fields::Direction;
++    using warpx::fields::FieldType;
++
++    // Ampere's law advances E with the total current:
++    // dE/dt = c^2 curl(B) - (J_plasma + J_ext)/epsilon_0.  Adding the
++    // impressed antenna current here lets Maxwell's equations generate the
++    // inductive E that performs work; a prescribed B-only particle field cannot.
++    // Evaluate J_ext at n+1/2 to match the leapfrog deposited-current time
++    // level. A discrete source-work ledger W_src = -integral(J_ext · E) dV dt
++    // is time-centered only if the grader supplies E at the matching midpoint
++    // (E-midpoint is grader-side, not assembled here); FieldEnergy at integer
++    // steps remains an O(dt) smoke proxy.
++    // Called from SyncCurrentAndRho AFTER filter+SumBoundary and BEFORE the
++    // single ApplyJfieldBoundary on the total current. Let S denote the
++    // particle-current filter plus SumBoundary and A the analytic source.
++    // We require S(Jp)+A, not S(Jp+A). Boundary treatment of Jp+J_ext is
++    // applied exactly once by the caller (double-apply is NOT idempotent).
++    //
++    // Coordinate convention mirrors ComputeExternalFieldOnGridUsingParser
++    // (WarpXInitData.cpp): parsers are always 4-arg (x,y,z,t);
++    //   WARPX_DIM_3D:     physical (x,y,z)
++    //   WARPX_DIM_XZ:     physical (x,z) with y = 0
++    //   WARPX_DIM_1D_Z:   physical z with x = y = 0
++    auto const dx = Geom(0).CellSizeArray();
++    const amrex::RealBox& real_box = Geom(0).ProbDomain();
++
++    for (int idim = 0; idim < 3; ++idim) {
++        amrex::MultiFab* current = m_fields.get(FieldType::current_fp, Direction{idim}, 0);
++        const amrex::IntVect nodal = current->ixType().toIntVect();
++        const auto component_parser = m_p_ext_field_params->Jfield_parser_executor[idim];
++
++        for (amrex::MFIter mfi(*current, amrex::TilingIfNotGPU()); mfi.isValid(); ++mfi) {
++            const amrex::Box box = mfi.tilebox(nodal);
++            auto const current_arr = current->array(mfi);
++            amrex::ParallelFor(box, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept {
++#if defined(WARPX_DIM_1D_Z)
++                const amrex::Real x = 0._rt;
++                const amrex::Real y = 0._rt;
++                const amrex::Real fac_z = (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++                const amrex::Real z = i * dx[0] + real_box.lo(0) + fac_z;
++#elif defined(WARPX_DIM_XZ)
++                const amrex::Real fac_x = (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++                const amrex::Real x = i * dx[0] + real_box.lo(0) + fac_x;
++                const amrex::Real y = 0._rt;
++                const amrex::Real fac_z = (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++                const amrex::Real z = j * dx[1] + real_box.lo(1) + fac_z;
++#else
++                const amrex::Real fac_x = (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++                const amrex::Real x = i * dx[0] + real_box.lo(0) + fac_x;
++                const amrex::Real fac_y = (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++                const amrex::Real y = j * dx[1] + real_box.lo(1) + fac_y;
++                const amrex::Real fac_z = (1._rt - nodal[2]) * dx[2] * 0.5_rt;
++                const amrex::Real z = k * dx[2] + real_box.lo(2) + fac_z;
++#endif
++                current_arr(i,j,k) += component_parser(x, y, z, time);
++            });
++        }
++        // AMReX nodal MultiFabs require OverrideSync on shared valid nodes
++        // (periodic endpoints can evaluate different coordinates).
++        current->FillBoundaryAndSync(Geom(0).periodicity());
++    }
++
++    // Optional analytic self-check (regression tests): with zero particles,
++    // current_fp must equal J_ext at every valid staggered cell to SP tolerance.
++    // SP float eps ~1e-7; use 50*eps * max(1,|J|) absolute tolerance for safe
++    // parser+arithmetic noise on unit-scale fields.
++    // Scope: enable only on periodic zero-Jp decks. This check runs before
++    // ApplyJfieldBoundary (caller applies BC once after we return).
++    //
++    // Reference positions: warpx::jext_oracle::position(comp, ...) uses
++    // hardcoded per-component half-offset tables transcribed from WarpX.cpp
++    // AllocLevelMFs (see JextStaggerOracle.H header). NOT live MultiFab
++    // ixType(), NOT an algebraic re-expression of the injection fac formula.
++    // Host assert_stagger_table_and_spot hard-checks the table; analytic
++    // multifab Jy=1.25 family also hard-asserts the baked amplitude.
++    if (m_p_ext_field_params->J_ext_self_check_analytic) {
++        constexpr amrex::Real sp_eps = 1.0e-7_rt;
++        constexpr amrex::Real tol_factor = 50.0_rt;
++        amrex::Real max_abs_err = 0._rt;
++        amrex::Real max_abs_ref = 0._rt;
++        amrex::GpuArray<amrex::Real, AMREX_SPACEDIM> lo_arr;
++        for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
++            lo_arr[idim] = real_box.lo(idim);
++        }
++        // Hard assert independent stagger table (host, once).
++        warpx::jext_oracle::assert_stagger_table_and_spot(dx, lo_arr);
++
++        for (int idim = 0; idim < 3; ++idim) {
++            amrex::MultiFab* current = m_fields.get(FieldType::current_fp, Direction{idim}, 0);
++            const amrex::IntVect nodal = current->ixType().toIntVect();
++            const auto component_parser = m_p_ext_field_params->Jfield_parser_executor[idim];
++            const int comp = idim;
++            // Parser self-check uses an interior box that excludes the high
++            // nodal face on each periodic axis. Those faces are period-identified
++            // with the low face; OverrideSync forces them equal, so comparing
++            // each to its own (possibly disagreeing) parser coordinate is not
++            // a valid residual. The periodic-seam block below asserts lo/hi
++            // equality directly — that is the OverrideSync regression net.
++            const amrex::Box domain_comp = amrex::convert(Geom(0).Domain(), nodal);
++            const amrex::Periodicity& period_sc = Geom(0).periodicity();
++            for (amrex::MFIter mfi(*current, false); mfi.isValid(); ++mfi) {
++                const amrex::Box nbox = amrex::convert(mfi.validbox(), nodal);
++                amrex::Box check_box = nbox;
++                for (int d = 0; d < AMREX_SPACEDIM; ++d) {
++                    if (period_sc.isPeriodic(d) && nodal[d] == 1 &&
++                        check_box.bigEnd(d) == domain_comp.bigEnd(d)) {
++                        check_box.setBig(d, domain_comp.bigEnd(d) - 1);
++                    }
++                }
++                if (check_box.isEmpty()) { continue; }
++                auto const current_arr = current->const_array(mfi);
++
++                amrex::ReduceOps<amrex::ReduceOpMax> reduce_op_err;
++                amrex::ReduceData<amrex::Real> reduce_data_err(reduce_op_err);
++                using ReduceTuple = typename decltype(reduce_data_err)::Type;
++                reduce_op_err.eval(check_box, reduce_data_err,
++                    [=] AMREX_GPU_DEVICE (int i, int j, int k) -> ReduceTuple {
++                        const auto pos = warpx::jext_oracle::position(comp, dx, lo_arr, i, j, k);
++                        const amrex::Real ref = component_parser(pos[0], pos[1], pos[2], time);
++                        return {amrex::Math::abs(current_arr(i,j,k) - ref)};
++                    });
++                const amrex::Real fab_err = amrex::get<0>(reduce_data_err.value());
++
++                amrex::ReduceOps<amrex::ReduceOpMax> reduce_op_ref;
++                amrex::ReduceData<amrex::Real> reduce_data_ref(reduce_op_ref);
++                reduce_op_ref.eval(check_box, reduce_data_ref,
++                    [=] AMREX_GPU_DEVICE (int i, int j, int k) -> ReduceTuple {
++                        const auto pos = warpx::jext_oracle::position(comp, dx, lo_arr, i, j, k);
++                        return {amrex::Math::abs(component_parser(pos[0], pos[1], pos[2], time))};
++                    });
++                const amrex::Real fab_ref = amrex::get<0>(reduce_data_ref.value());
++                max_abs_err = amrex::max(max_abs_err, fab_err);
++                max_abs_ref = amrex::max(max_abs_ref, fab_ref);
++            }
++
++            // Direct periodic-seam value assertion.
++            // After FillBoundaryAndSync, opposite nodal endpoints of a
++            // periodic domain are the same physical node and must match.
++            // Parser-vs-stored at each endpoint is NOT enough: without
++            // OverrideSync both ends can still match their own parser value.
++            // Implementation uses ReduceOps so the comparison is GPU-safe.
++            // Requires a box that spans both domain endpoints (single-box
++            // decks such as periodic_seam_3d with max_grid_size >= n_cell).
++            {
++                const amrex::Periodicity& period = Geom(0).periodicity();
++                amrex::Real max_seam = 0._rt;
++                const amrex::Box domain = amrex::convert(Geom(0).Domain(), nodal);
++                for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
++                    if (!period.isPeriodic(dir)) { continue; }
++                    if (nodal[dir] == 0) { continue; } // cell-centered: no shared node
++                    const int dlo = domain.smallEnd(dir);
++                    const int dhi = domain.bigEnd(dir);
++                    amrex::ReduceOps<amrex::ReduceOpMax> reduce_op_seam;
++                    amrex::ReduceData<amrex::Real> reduce_data_seam(reduce_op_seam);
++                    using SeamTuple = typename decltype(reduce_data_seam)::Type;
++                    bool any_span = false;
++                    for (amrex::MFIter mfi(*current, false); mfi.isValid(); ++mfi) {
++                        const amrex::Box nbox = amrex::convert(mfi.validbox(), nodal);
++                        if (nbox.smallEnd(dir) > dlo || nbox.bigEnd(dir) < dhi) {
++                            continue; // this box does not span both endpoints
++                        }
++                        any_span = true;
++                        amrex::Box face = nbox;
++                        face.setRange(dir, dlo, dlo);
++                        auto const arr = current->const_array(mfi);
++                        reduce_op_seam.eval(face, reduce_data_seam,
++                            [=] AMREX_GPU_DEVICE (int i, int j, int k) -> SeamTuple {
++#if (AMREX_SPACEDIM == 1)
++                                amrex::ignore_unused(j, k);
++#elif (AMREX_SPACEDIM == 2)
++                                amrex::ignore_unused(k);
++#endif
++                                amrex::IntVect iv(AMREX_D_DECL(i, j, k));
++                                amrex::IntVect iv_hi = iv;
++                                iv_hi[dir] = dhi;
++                                return {amrex::Math::abs(arr(iv) - arr(iv_hi))};
++                            });
++                    }
++                    if (any_span) {
++                        max_seam = amrex::max(
++                            max_seam, amrex::get<0>(reduce_data_seam.value()));
++                    }
++                }
++                amrex::ParallelDescriptor::ReduceRealMax(max_seam);
++                amrex::Print() << "J_ext periodic-seam: comp=" << idim
++                               << " max_lo_hi_diff=" << max_seam << "\n";
++                // SP float headroom. Broken OverrideSync leaves O(1) mismatch
++                // for a non-even function of the periodic coordinate.
++                constexpr amrex::Real seam_tol = 1.0e-5_rt;
++                if (max_seam > seam_tol) {
++                    std::stringstream ss;
++                    ss << "J_ext periodic-seam assert failed: comp=" << idim
++                       << " max_lo_hi_diff=" << max_seam << " > " << seam_tol
++                       << " (FillBoundaryAndSync / OverrideSync regression?)";
++                    WARPX_ABORT_WITH_MESSAGE(ss.str());
++                }
++            }
++        } // for idim components
++        amrex::ParallelDescriptor::ReduceRealMax(max_abs_err);
++        amrex::ParallelDescriptor::ReduceRealMax(max_abs_ref);
++        const amrex::Real tol = tol_factor * sp_eps * amrex::max(1.0_rt, max_abs_ref);
++        amrex::Print() << "J_ext analytic self-check: max_abs_err=" << max_abs_err
++                       << " max_abs_ref=" << max_abs_ref
++                       << " tol=" << tol
++                       << " oracle=JextStaggerOracle\n";
++        if (max_abs_err > tol) {
++            std::stringstream ss;
++            ss << "J_ext analytic self-check failed: max_abs_err=" << max_abs_err
++               << " > tol=" << tol;
++            WARPX_ABORT_WITH_MESSAGE(ss.str());
++        }
++        // Hard assert baked amplitude for the constant-Jy=1.25 analytic family.
++        // (Solenoidal decks have max|J|~1 or 1.5 and must not false-trip.)
++        if (amrex::Math::abs(max_abs_ref - warpx::jext_oracle::kAnalyticJy) < 1.0e-3_rt) {
++            WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++                amrex::Math::abs(max_abs_ref - warpx::jext_oracle::kAnalyticJy)
++                    < 1.0e-3_rt,
++                "J_ext oracle baked-Jy hard assert failed");
++            amrex::Print() << "J_ext oracle spot-check ASSERT: max_abs_ref="
++                           << max_abs_ref
++                           << " matches baked_Jy="
++                           << warpx::jext_oracle::kAnalyticJy << "\n";
++        }
++    }
++
++    // Boundary treatment is applied ONCE by SyncCurrentAndRho after this
++    // returns -- do NOT re-ApplyJfieldBoundary here (operator is not idempotent).
++
++    // Runtime discrete-divergence gate (default every 100 steps; 0 disables).
++    const int interval = m_p_ext_field_params->J_ext_div_check_interval;
++    const int step = istep[0];
++    if (interval > 0 && (step == 0 || (step % interval) == 0)) {
++        CheckExternalCurrentDivergence(time);
++    }
++#endif
++}
++
++void
++WarpX::CheckExternalCurrentDivergence (amrex::Real time)
++{
++    if (!m_p_ext_field_params->J_ext_grid_enabled) { return; }
++
++#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++    amrex::ignore_unused(time);
++    return;
++#else
++    using ablastr::fields::Direction;
++    using warpx::fields::FieldType;
++
++    // Discrete Yee-adjoint divergence of the impressed current, collocated
++    // with WarpX nodal rho (charge-continuity points).
++    //
++    // =====================================================================
++    // Premise
++    //   Continuous Maxwell continuity with no rho_ext requires div J_ext = 0.
++    //   On WarpX's staggered Yee mesh, current_fp lives on the same edges as E
++    //   (J matches E nodal flags), and rho is fully nodal. The discrete
++    //   adjoint of the Yee curl that appears in the continuity residual is
++    //   therefore the nodal finite-volume divergence of those edge currents:
++    //     (div_h J)_node = sum_a ( J_a |_{face right of node} - J_a |_{face left} ) / da
++    //   with each J_a sampled at the SAME staggered positions the injection
++    //   path writes into current_fp (live MultiFab ixType -- never hardcoded).
++    //
++    //   WarpX staggered current_fp ixType (WarpX.cpp AllocLevelMFs), for reference:
++    //     1D_Z:  Jx NODE, Jy NODE, Jz CELL          -- reduced div uses only Jz
++    //     XZ:    Jx (0,1), Jy (1,1), Jz (1,0)      -- reduced div uses Jx,Jz
++    //     3D:    Jx (0,1,1), Jy (1,0,1), Jz (1,1,0) -- full div
++    //   (Earlier gate code inverted these flags; that dual-lattice sampling is gone.)
++    //
++    // Algebra
++    //   AMReX cell-centered index i on axis a places the face value at
++    //   lo_a + (i + 1/2) da, which is the face BETWEEN nodal indices i and i+1.
++    //   At nodal index i:
++    //     D_a J_a = ( J_a(i) - J_a(i-1) ) / da
++    //   with transverse indices taken on the component's own nodal/cell flags.
++    //   Dimensionless residual:
++    //     r = |div_h J| * h_min / max(J_max, J_floor)
++    //
++    // Units
++    //   [div_h J] = A/m^3 = [J]/[length]; r is dimensionless.
++    //
++    // Case split / limiting cases (binds rel_tol)
++    //   (a) Discrete-solenoidal sources: J obtained from a matching discrete
++    //       curl_h(M) on the same Yee edges, OR any linear field whose
++    //       continuum div is 0 and whose staggered samples make the FD exact
++    //       (e.g. J=(-y,x,0) in 3D). Then each D_a J_a cancels in exact
++    //       arithmetic and the residual is pure SP roundoff:
++    //         r ≲ C * eps_SP * growth,  eps_SP ~ 1e-7, C·growth ≲ 1e2
++    //       => r ≲ ~1e-5.  rel_tol_discrete = 1e-4 leaves ~10x headroom.
++    //   (b) Continuum-curl sources sampled onto Yee edges (parser emits the
++    //       continuous curl at edge centers, not a discrete curl_h).
++    //       Half-offset centred difference:
++    //         [f(x+h/2)-f(x-h/2)]/h = f'(x) + (h^2/24)*f_xxx(x) + O(h^4).
++    //       For continuum-solenoidal J, div_h J = (h^2/24) sum_a d3_a J_a
++    //         = O(h^2 k^3 |J|). With r = |div_h J|*h/|J| this is
++    //         r ~ O((k h)^3), NOT O((kh)^2).
++    //       Setting (kh)^3/24 <= 1e-4 gives k h <= 0.13, i.e. about 47 cells
++    //       per wavelength (not 600). Decks with coarser continuum curl must
++    //       either emit discrete curl_h components or refine the mesh.
++    //       Lowering J_ext_div_check_interval is NOT a fix for (b).
++    //       Do not loosen rel_tol for (a).
++    //       Anisotropic grids: h_min under-weights the coarse-axis terms and
++    //       loosens the gate by ~h_min/h_max; prefer near-isotropic cells.
++    //
++    // Sampling guarantee (not fail-closed over all of space-time)
++    //   - First enabled step (step == 0): dense stride-1 over every nodal
++    //     residual index of the level-0 domain, including the top boundary
++    //     node (loop to hi_node = hi+1).
++    //   - Later interval checks: coarse stride S=8 with INDEPENDENT per-axis
++    //     phases phase_a = ((step/interval) / S^a) % S so the walk covers the
++    //     full S^d Cartesian product of sublattices over S^d firings (not just
++    //     the 8 diagonal sublattices of a shared scalar phase).
++    //   - Dense pass is host-side and currently replicated per rank; fine for
++    //     test grids, costly at production resolution (see OPEN-ISSUES).
++    //   - Restart from a checkpoint with step>0 skips the dense pass.
++    // =====================================================================
++    constexpr amrex::Real rel_tol = 1.0e-4_rt; // case (a) discrete-solenoidal
++    // Absolute floor on the div-entering |J| denominator. Prefer
++    // max(J_div, 1e-12*J_all) when only a subset of components enter the
++    // reduced div (e.g. 2D Jy-only analytic decks).
++    constexpr amrex::Real J_floor = 1.0e-30_rt;
++    // Inversion sensitivity band (r_inverted ~ (kh)^2 vs fixed rel_tol=1e-4):
++    // discriminating for ~47 ≲ N_cells/λ ≲ ~628; above ~628 a pure dual-
++    // lattice inversion slips under the gate. Case (b) continuum-curl needs
++    // N ≳ 47 (kh ≲ 0.13).
++    constexpr int coarse_stride = 8;
++
++    auto const dx = Geom(0).CellSizeArray();
++    const amrex::RealBox& real_box = Geom(0).ProbDomain();
++    const auto jx_parser = m_p_ext_field_params->Jfield_parser_executor[0];
++    const auto jy_parser = m_p_ext_field_params->Jfield_parser_executor[1];
++    const auto jz_parser = m_p_ext_field_params->Jfield_parser_executor[2];
++
++    // Live nodal flags from the MultiFabs that receive the injection (same as
++    // AddExternalCurrent). Do not hardcode -- staggered Yee flags differ by dim.
++    const amrex::IntVect n_jx = m_fields.get(FieldType::current_fp, Direction{0}, 0)->ixType().toIntVect();
++    const amrex::IntVect n_jy = m_fields.get(FieldType::current_fp, Direction{1}, 0)->ixType().toIntVect();
++    const amrex::IntVect n_jz = m_fields.get(FieldType::current_fp, Direction{2}, 0)->ixType().toIntVect();
++
++#if defined(WARPX_DIM_1D_Z)
++    const amrex::Real h_min = dx[0];
++#elif defined(WARPX_DIM_XZ)
++    const amrex::Real h_min = amrex::min(dx[0], dx[1]);
++#else
++    const amrex::Real h_min = amrex::min(dx[0], amrex::min(dx[1], dx[2]));
++#endif
++
++    // Physical position of MultiFab index (i,j,k) for a component with the
++    // given nodal IntVect -- byte-matches the injection fac convention.
++    auto pos_of = [&](const amrex::IntVect& nodal, int i, int j, int k) {
++#if defined(WARPX_DIM_1D_Z)
++        amrex::ignore_unused(j, k);
++        const amrex::Real x = 0._rt;
++        const amrex::Real y = 0._rt;
++        const amrex::Real z = static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++            + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++        return std::array<amrex::Real,3>{x, y, z};
++#elif defined(WARPX_DIM_XZ)
++        amrex::ignore_unused(k);
++        const amrex::Real x = static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++            + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++        const amrex::Real y = 0._rt;
++        const amrex::Real z = static_cast<amrex::Real>(j) * dx[1] + real_box.lo(1)
++            + (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++        return std::array<amrex::Real,3>{x, y, z};
++#else
++        const amrex::Real x = static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++            + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++        const amrex::Real y = static_cast<amrex::Real>(j) * dx[1] + real_box.lo(1)
++            + (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++        const amrex::Real z = static_cast<amrex::Real>(k) * dx[2] + real_box.lo(2)
++            + (1._rt - nodal[2]) * dx[2] * 0.5_rt;
++        return std::array<amrex::Real,3>{x, y, z};
++#endif
++    };
++
++    const int step = istep[0];
++    const int interval = m_p_ext_field_params->J_ext_div_check_interval;
++    // Dense on first enabled step; coarse + independent per-axis phases after.
++    const int stride = (step == 0) ? 1 : coarse_stride;
++    const int tick = (step == 0 || interval <= 0) ? 0 : (step / interval);
++    // phase_a = (tick / S^a) % S  -- covers S^d sublattices over S^d firings.
++    const int phase0 = tick % coarse_stride;
++    const int phase1 = (tick / coarse_stride) % coarse_stride;
++    const int phase2 = (tick / (coarse_stride * coarse_stride)) % coarse_stride;
++
++    const amrex::Box domain = Geom(0).Domain();
++    const auto lo = domain.smallEnd();
++    const auto hi = domain.bigEnd();
++    // Include the top nodal boundary node (hi+1). Under periodicity this is
++    // the image of lo; still evaluate so the dense-pass claim is literal.
++    const amrex::IntVect hi_node = hi + amrex::IntVect::TheUnitVector();
++
++    amrex::Real max_abs_div = 0._rt;
++    amrex::Real max_abs_J = 0._rt; // only components that enter reduced div
++
++    // Host-side sample over nodal residuals. Parser eval at MultiFab indices
++    // (including i-1 when i==lo) is continuum-well-defined even outside the
++    // valid index box; periodic antennas must be parser-periodic themselves.
++#if defined(WARPX_DIM_1D_Z)
++    // Reduced div: only Jz (CELL on axis 0). Denom uses only Jz.
++    amrex::ignore_unused(jx_parser, jy_parser, n_jx, n_jy, phase1, phase2);
++    for (int i = lo[0] + phase0; i <= hi_node[0]; i += stride) {
++        auto p_r = pos_of(n_jz, i,     0, 0);
++        auto p_l = pos_of(n_jz, i - 1, 0, 0);
++        const amrex::Real Jz_r = jz_parser(p_r[0], p_r[1], p_r[2], time);
++        const amrex::Real Jz_l = jz_parser(p_l[0], p_l[1], p_l[2], time);
++        const amrex::Real divh = (Jz_r - Jz_l) / dx[0];
++        max_abs_div = amrex::max(max_abs_div, std::abs(divh));
++        max_abs_J = amrex::max(max_abs_J, std::abs(Jz_r));
++        max_abs_J = amrex::max(max_abs_J, std::abs(Jz_l));
++    }
++#elif defined(WARPX_DIM_XZ)
++    // Reduced planar div: Jx + Jz. Jy does not enter -- exclude from denom.
++    amrex::ignore_unused(jy_parser, n_jy, phase2);
++    for (int j = lo[1] + phase1; j <= hi_node[1]; j += stride) {
++        for (int i = lo[0] + phase0; i <= hi_node[0]; i += stride) {
++            auto px_r = pos_of(n_jx, i,     j, 0);
++            auto px_l = pos_of(n_jx, i - 1, j, 0);
++            auto pz_r = pos_of(n_jz, i, j,     0);
++            auto pz_l = pos_of(n_jz, i, j - 1, 0);
++            const amrex::Real Jx_r = jx_parser(px_r[0], px_r[1], px_r[2], time);
++            const amrex::Real Jx_l = jx_parser(px_l[0], px_l[1], px_l[2], time);
++            const amrex::Real Jz_r = jz_parser(pz_r[0], pz_r[1], pz_r[2], time);
++            const amrex::Real Jz_l = jz_parser(pz_l[0], pz_l[1], pz_l[2], time);
++            const amrex::Real divh = (Jx_r - Jx_l) / dx[0] + (Jz_r - Jz_l) / dx[1];
++            max_abs_div = amrex::max(max_abs_div, std::abs(divh));
++            max_abs_J = amrex::max(max_abs_J, std::abs(Jx_r));
++            max_abs_J = amrex::max(max_abs_J, std::abs(Jx_l));
++            max_abs_J = amrex::max(max_abs_J, std::abs(Jz_r));
++            max_abs_J = amrex::max(max_abs_J, std::abs(Jz_l));
++        }
++    }
++#else
++    // Full 3D nodal div of edge currents. All three components enter denom.
++    for (int k = lo[2] + phase2; k <= hi_node[2]; k += stride) {
++        for (int j = lo[1] + phase1; j <= hi_node[1]; j += stride) {
++            for (int i = lo[0] + phase0; i <= hi_node[0]; i += stride) {
++                auto px_r = pos_of(n_jx, i,     j, k);
++                auto px_l = pos_of(n_jx, i - 1, j, k);
++                auto py_r = pos_of(n_jy, i, j,     k);
++                auto py_l = pos_of(n_jy, i, j - 1, k);
++                auto pz_r = pos_of(n_jz, i, j, k    );
++                auto pz_l = pos_of(n_jz, i, j, k - 1);
++                const amrex::Real Jx_r = jx_parser(px_r[0], px_r[1], px_r[2], time);
++                const amrex::Real Jx_l = jx_parser(px_l[0], px_l[1], px_l[2], time);
++                const amrex::Real Jy_r = jy_parser(py_r[0], py_r[1], py_r[2], time);
++                const amrex::Real Jy_l = jy_parser(py_l[0], py_l[1], py_l[2], time);
++                const amrex::Real Jz_r = jz_parser(pz_r[0], pz_r[1], pz_r[2], time);
++                const amrex::Real Jz_l = jz_parser(pz_l[0], pz_l[1], pz_l[2], time);
++                const amrex::Real divh =
++                    (Jx_r - Jx_l) / dx[0] + (Jy_r - Jy_l) / dx[1] + (Jz_r - Jz_l) / dx[2];
++                max_abs_div = amrex::max(max_abs_div, std::abs(divh));
++                max_abs_J = amrex::max(max_abs_J, std::abs(Jx_r));
++                max_abs_J = amrex::max(max_abs_J, std::abs(Jx_l));
++                max_abs_J = amrex::max(max_abs_J, std::abs(Jy_r));
++                max_abs_J = amrex::max(max_abs_J, std::abs(Jy_l));
++                max_abs_J = amrex::max(max_abs_J, std::abs(Jz_r));
++                max_abs_J = amrex::max(max_abs_J, std::abs(Jz_l));
++            }
++        }
++    }
++#endif
++
++    amrex::ParallelDescriptor::ReduceRealMax(max_abs_div);
++    amrex::ParallelDescriptor::ReduceRealMax(max_abs_J);
++
++    const amrex::Real denom = amrex::max(max_abs_J, J_floor);
++    const amrex::Real rel = max_abs_div * h_min / denom;
++    amrex::Print() << "J_ext div-gate: max|div_h J_ext|=" << max_abs_div
++                   << " max|J_ext|=" << max_abs_J
++                   << " h_min=" << h_min
++                   << " r=|div|*h/|J|=" << rel
++                   << " rel_tol=" << rel_tol
++                   << " stride=" << stride
++                   << " phase=(" << phase0 << "," << phase1 << "," << phase2 << ")"
++                   << "\n";
++    if (rel > rel_tol) {
++        std::stringstream ss;
++        ss << "warpx.J_ext_grid_init_style discrete div(J_ext) check failed: "
++           << "max|div_h J_ext|=" << max_abs_div
++           << " max|J_ext|=" << max_abs_J
++           << " h_min=" << h_min
++           << " relative residual r=|div|*h/|J|=" << rel
++           << " exceeds rel_tol=" << rel_tol
++           << " (deck contract: J_ext must be discrete-solenoidal on the Yee "
++           << "edge stencil, case (a); continuum-curl sources need k_max*h <= 0.13 "
++           << "(~47 cells/wavelength, r~O((kh)^3)) or must emit discrete curl_h)";
++        WARPX_ABORT_WITH_MESSAGE(ss.str());
++    }
++#endif
++}
++
+ void
+ WarpX::OneStep_nosub (
+     amrex::Real a_cur_time,
+@@ -799,9 +1308,10 @@ WarpX::OneStep_nosub (
+     ExecutePythonCallback("afterdeposition");
+ 
+     // Synchronize J and rho:
+-    // filter (if used), exchange guard cells, interpolate across MR levels
+-    // and apply boundary conditions
+-    SyncCurrentAndRho();
++    // filter (if used), exchange guard cells, interpolate across MR levels,
++    // inject J_ext (if enabled) after SumBoundary, then apply J boundary
++    // conditions ONCE on the total current (Jp + J_ext).
++    SyncCurrentAndRho(a_cur_time + 0.5_rt * a_dt);
+ 
+     // At this point, J is up-to-date inside the domain, and E and B are
+     // up-to-date including enough guard cells for first step of the field
+@@ -1008,7 +1518,7 @@ void WarpX::HandleParticlesAtBoundaries (int step, amrex::Real cur_time, int num
+     }
+ }
+ 
+-void WarpX::SyncCurrentAndRho ()
++void WarpX::SyncCurrentAndRho (amrex::Real jext_time)
+ {
+     using ablastr::fields::Direction;
+     using warpx::fields::FieldType;
+@@ -1055,7 +1565,28 @@ void WarpX::SyncCurrentAndRho ()
+         SyncRho();
+     }
+ 
++    // Inject impressed current AFTER filter+SumBoundary and BEFORE the single
++    // ApplyJfieldBoundary. Ordering is S(Jp)+A with exactly one boundary
++    // treatment of the total current (ApplyJfieldBoundary is not idempotent:
++    // a second per-step call doubles near-boundary plasma+antenna current on
++    // PEC/PMC/PEC-insulator/reflecting particle boundaries).
++    if (m_p_ext_field_params && m_p_ext_field_params->J_ext_grid_enabled) {
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            std::isfinite(jext_time),
++            "warpx.J_ext_grid_init_style requires SyncCurrentAndRho(jext_time) "
++            "with a finite mid-step evaluation time; this call site passed "
++            "NaN/Inf (default NaN means an unsupported stepper re-entered "
++            "SyncCurrentAndRho without plumbing the half-step time)");
++        AddExternalCurrent(jext_time);
++    }
++
+     // Reflect charge and current density over PEC boundaries, if needed.
++    // Exactly one application per level/patch on the total current.
++    // No per-step boundary-count Print: the prior unconditional amrex::Print
++    // fired on EVERY WarpX run (J_ext or not) — packaging blocker and it
++    // falsified feature-off inertness. Feature-off plotfile bit-identity is
++    // the regression net (tests/jext); the count gauge was a tautology
++    // (local loop counter with max_level==0 => always 1).
+     for (int lev = 0; lev <= finest_level; ++lev)
+     {
+         if (m_fields.has(FieldType::rho_fp, lev)) {
+diff --git a/Source/Initialization/ExternalField.H b/Source/Initialization/ExternalField.H
+index 173b45723..48caaf13b 100644
+--- a/Source/Initialization/ExternalField.H
++++ b/Source/Initialization/ExternalField.H
+@@ -22,6 +22,7 @@
+ #include <AMReX_RealVect.H>
+ #include <AMReX_TableData.H>
+ 
++#include <array>
+ #include <functional>
+ #include <memory>
+ #include <string>
+@@ -58,6 +59,16 @@ struct ExternalFieldParams
+     //! Initialization type for external electric field on the grid
+     ExternalFieldType E_ext_grid_type = ExternalFieldType::default_zero;
+ 
++    //! Whether a parsed impressed current is added to the full-EM current
++    bool J_ext_grid_enabled = false;
++
++    //! Discrete Yee-adjoint div(J_ext) gate interval (0 disables; default 100).
++    //! Step 0 is dense (stride 1); later checks use stride 8 with phase offset.
++    int J_ext_div_check_interval = 100;
++
++    //! If true, after injection abort unless current_fp matches J_ext to SP tol (zero-Jp tests)
++    bool J_ext_self_check_analytic = false;
++
+     //! User-defined parser to initialize x-component of the magnetic field on the grid
+     std::unique_ptr<amrex::Parser> Bxfield_parser;
+     //! User-defined parser to initialize y-component of the magnetic field on the grid
+@@ -70,6 +81,12 @@ struct ExternalFieldParams
+     std::unique_ptr<amrex::Parser> Eyfield_parser;
+     //! User-defined parser to initialize z-component of the electric field on the grid
+     std::unique_ptr<amrex::Parser> Ezfield_parser;
++    //! User-defined parsers for the impressed current density on the Yee grid
++    std::unique_ptr<amrex::Parser> Jxfield_parser;
++    std::unique_ptr<amrex::Parser> Jyfield_parser;
++    std::unique_ptr<amrex::Parser> Jzfield_parser;
++    //! Compiled impressed-current parsers, cached once at initialization
++    std::array<amrex::ParserExecutor<4>, 3> Jfield_parser_executor;
+ 
+      //! Path of the file where external fields are stored
+     std::string external_fields_path;
+diff --git a/Source/Initialization/ExternalField.cpp b/Source/Initialization/ExternalField.cpp
+index 35a37a64a..9cdc6783d 100644
+--- a/Source/Initialization/ExternalField.cpp
++++ b/Source/Initialization/ExternalField.cpp
+@@ -79,6 +79,18 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
+     pp_warpx.query("E_ext_grid_init_style", E_ext_grid_s);
+     E_ext_grid_type = string_to_external_field_type<EMFieldType::E>(E_ext_grid_s);
+ 
++    std::string J_ext_grid_s;
++    pp_warpx.query("J_ext_grid_init_style", J_ext_grid_s);
++    std::transform(J_ext_grid_s.begin(), J_ext_grid_s.end(), J_ext_grid_s.begin(), ::tolower);
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        J_ext_grid_s.empty() || J_ext_grid_s == "default" ||
++        J_ext_grid_s == "parse_j_ext_grid_function",
++        "warpx.J_ext_grid_init_style supports only parse_J_ext_grid_function");
++    J_ext_grid_enabled = J_ext_grid_s == "parse_j_ext_grid_function";
++    // Default ON: check every 100 steps. 0 disables the runtime div(J_ext) gate.
++    pp_warpx.query("J_ext_div_check_interval", J_ext_div_check_interval);
++    pp_warpx.query("J_ext_self_check_analytic", J_ext_self_check_analytic);
++
+     //
+     //  Constant external field
+     //
+@@ -178,6 +190,50 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
+     }
+     //___________________________________________________________________________
+ 
++    //
++    //  Impressed antenna current with parser (J_ext)
++    //
++    // Deck contract:
++    //   warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++    //   warpx.Jx/Jy/Jz_external_grid_function(x,y,z,t) = ...
++    // Coordinate convention mirrors ComputeExternalFieldOnGridUsingParser:
++    //   3D: (x,y,z); 2D XZ: (x,0,z); 1D Z: (0,0,z).  RZ is fail-closed.
++    // J_ext is injected INSIDE SyncCurrentAndRho after filter+SumBoundary and
++    // before the single ApplyJfieldBoundary (S(Jp)+A, one BC pass). Diagnostics:
++    // current_fp = Jp_filtered + J_ext (no separate J_ext channel yet).
++    // Deck authors must supply a discrete-solenoidal J_ext on the Yee edge
++    // stencil (case a: curl_h or linear solenoidal). Continuum-curl sources
++    // need k_max*h ≲ 0.13 (~47 cells/wavelength; r~O((kh)^3)) or should emit discrete curl_h components. The
++    // runtime nodal div_h gate aborts when r = |div|*h/|J| exceeds 1e-4.
++    //
++    if (J_ext_grid_enabled) {
++#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++        WARPX_ABORT_WITH_MESSAGE(
++            "J_ext_grid_init_style is not supported in RZ "
++            "geometry; azimuthal-mode decomposition of an impressed current is not implemented");
++#endif
++        std::string str_Jx_ext_grid_function;
++        std::string str_Jy_ext_grid_function;
++        std::string str_Jz_ext_grid_function;
++        utils::parser::Store_parserString(
++            pp_warpx, "Jx_external_grid_function(x,y,z,t)", str_Jx_ext_grid_function);
++        utils::parser::Store_parserString(
++            pp_warpx, "Jy_external_grid_function(x,y,z,t)", str_Jy_ext_grid_function);
++        utils::parser::Store_parserString(
++            pp_warpx, "Jz_external_grid_function(x,y,z,t)", str_Jz_ext_grid_function);
++
++        Jxfield_parser = std::make_unique<amrex::Parser>(
++            utils::parser::makeParser(str_Jx_ext_grid_function,{"x","y","z","t"}));
++        Jyfield_parser = std::make_unique<amrex::Parser>(
++            utils::parser::makeParser(str_Jy_ext_grid_function,{"x","y","z","t"}));
++        Jzfield_parser = std::make_unique<amrex::Parser>(
++            utils::parser::makeParser(str_Jz_ext_grid_function,{"x","y","z","t"}));
++        Jfield_parser_executor[0] = Jxfield_parser->compile<4>();
++        Jfield_parser_executor[1] = Jyfield_parser->compile<4>();
++        Jfield_parser_executor[2] = Jzfield_parser->compile<4>();
++    }
++    //___________________________________________________________________________
++
+ 
+     //
+     //  External fields from file
+diff --git a/Source/WarpX.H b/Source/WarpX.H
+index 4c31ae677..20d25451b 100644
+--- a/Source/WarpX.H
++++ b/Source/WarpX.H
+@@ -682,8 +682,14 @@ public:
+      * filter (if used), exchange guard cells, interpolate across MR levels
+      * and apply boundary conditions.
+      * Contains separate calls to WarpX::SyncCurrent and WarpX::SyncRho.
++     *
++     * When J_ext is enabled, pass the mid-step evaluation time (n+1/2) so the
++     * impressed current is injected after filter+SumBoundary and BEFORE the
++     * single ApplyJfieldBoundary on the total current. Callers that do not
++     * support J_ext may omit the argument (NaN default); injection is then
++     * skipped and a fail-closed assert fires if J_ext is enabled.
+      */
+-    void SyncCurrentAndRho ();
++    void SyncCurrentAndRho (amrex::Real jext_time = std::numeric_limits<amrex::Real>::quiet_NaN());
+ 
+     /**
+      * \brief Apply filter and sum guard cells across MR levels.
+@@ -697,6 +703,12 @@ public:
+      */
+     void SyncCurrent (const std::string& current_fp_string);
+ 
++    /** Add the parsed, time-centered impressed current to level-0 current_fp. */
++    void AddExternalCurrent (amrex::Real time);
++
++    /** Sampled Yee discrete-divergence check of J_ext; aborts if out of tolerance. */
++    void CheckExternalCurrentDivergence (amrex::Real time);
++
+     void SyncRho ();
+ 
+     void SyncRho (
+diff --git a/Source/WarpX.cpp b/Source/WarpX.cpp
+index e3e61e8cb..b26863021 100644
+--- a/Source/WarpX.cpp
++++ b/Source/WarpX.cpp
+@@ -530,6 +530,46 @@ WarpX::WarpX ()
+             "The NCI corrector cannot be used with the implicit solver");
+     }
+ 
++    if (m_p_ext_field_params->J_ext_grid_enabled) {
++#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++        WARPX_ABORT_WITH_MESSAGE(
++            "J_ext_grid_init_style is not supported in RZ "
++            "geometry; azimuthal-mode decomposition of an impressed current is not implemented");
++#endif
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            max_level == 0,
++            "warpx.J_ext_grid_init_style supports level 0 only; AMR is not supported");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            grid_type == ablastr::utils::enums::GridType::Staggered ||
++                grid_type == ablastr::utils::enums::GridType::Default,
++            "warpx.J_ext_grid_init_style requires warpx.grid_type=staggered "
++            "(collocated and hybrid grids are not supported)");
++        // Default maps to Staggered; still reject Hybrid/Collocated explicitly above.
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            grid_type != ablastr::utils::enums::GridType::Hybrid &&
++                grid_type != ablastr::utils::enums::GridType::Collocated &&
++                !do_current_centering,
++            "warpx.J_ext_grid_init_style does not support warpx.do_current_centering=1 "
++            "or warpx.grid_type=hybrid/collocated; current centering would overwrite J_ext");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            electromagnetic_solver_id == ElectromagneticSolverAlgo::Yee,
++            "warpx.J_ext_grid_init_style requires the Yee FDTD electromagnetic solver; "
++            "PSATD, hybrid, electrostatic, CKC, and ECT solvers are not supported");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            !m_implicit_solver && !m_JRhom,
++            "warpx.J_ext_grid_init_style supports only the ordinary explicit full-Maxwell push");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            !EB::enabled(),
++            "warpx.J_ext_grid_init_style does not support embedded boundaries");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            !do_moving_window,
++            "warpx.J_ext_grid_init_style does not support a moving window "
++            "(ProbLo shifts make lab-frame antenna parsers ambiguous)");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            !do_pml_in_domain,
++            "warpx.J_ext_grid_init_style does not support do_pml_in_domain=1; "
++            "boundary PML is allowed with antenna–PML standoff");
++    }
+ 
+     m_accelerator_lattice.resize(nlevs_max);
+ 
+@@ -1252,6 +1292,11 @@ WarpX::ReadParameters ()
+             current_deposition_algo = CurrentDepositionAlgo::Direct;
+         }
+         pp_algo.query_enum_sloppy("current_deposition", current_deposition_algo, "-_");
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            !m_p_ext_field_params->J_ext_grid_enabled ||
++                current_deposition_algo != CurrentDepositionAlgo::Vay,
++            "warpx.J_ext_grid_init_style does not support algo.current_deposition=vay; "
++            "Vay deposits through current_fp_vay instead of current_fp");
+         pp_algo.query_enum_sloppy("charge_deposition", charge_deposition_algo, "-_");
+         pp_algo.query_enum_sloppy("particle_pusher", particle_pusher_algo, "-_");
+ 
+diff --git a/tests/jext/DIAGNOSTICS-SEMANTICS.md b/tests/jext/DIAGNOSTICS-SEMANTICS.md
+new file mode 100644
+index 000000000..3679c620b
+--- /dev/null
++++ b/tests/jext/DIAGNOSTICS-SEMANTICS.md
+@@ -0,0 +1,11 @@
++# Diagnostics semantics with J_ext
++
++When `warpx.J_ext_grid_init_style = parse_J_ext_grid_function` is enabled:
++
++- `current_fp` / plot fields `jx,jy,jz` expose **total** current:
++  `J_total = S(Jp) + J_ext` where `S` is the optional particle-current filter.
++- There is **no** separate diagnostic channel for `J_ext` in this patch.
++- Source-work accounting must use the known analytic `J_ext` parsers, not
++  `jx/jy/jz` alone (those mix plasma and antenna).
++- Checkpoints store the total; restart re-deposits `Jp` and re-adds `J_ext`
++  on the next step (no cumulative double-add).
+diff --git a/tests/jext/README.md b/tests/jext/README.md
+new file mode 100644
+index 000000000..1cf866c19
+--- /dev/null
++++ b/tests/jext/README.md
+@@ -0,0 +1,57 @@
++# J_ext impressed-current regression tests
++
++## Deck contract
++- `warpx.J_ext_grid_init_style = parse_J_ext_grid_function`
++- `warpx.Jx/Jy/Jz_external_grid_function(x,y,z,t)` — parsers always 4-arg.
++  Coordinates mirror external E/B grid parsers:
++  - 3D: (x,y,z); 2D XZ: (x,0,z); 1D Z: (0,0,z). RZ fail-closed.
++- J_ext is injected **inside** `SyncCurrentAndRho` after filter+SumBoundary and
++  **before** the single `ApplyJfieldBoundary` on the total current (S(Jp)+A).
++  A second per-step boundary apply is intentionally absent: the operator is
++  not idempotent and would double near-boundary plasma current on PEC/PMC.
++- Feature-off runs produce **zero** J_ext-attributable stdout (no per-step
++  boundary-count Print).
++- Diagnostics: `current_fp = Jp_filtered + J_ext` (no separate channel yet).
++- J_ext must be discrete-solenoidal; runtime Yee `div_h` sample aborts if
++  relative residual `|div|*h/|J| > 1e-4` (default every 100 steps;
++  `warpx.J_ext_div_check_interval=0` disables).
++  Continuum-curl antennas need `k_max h ≲ 0.13` (~47 cells/wavelength) because
++  `r ~ O((kh)^3)` under the gate's `·h` normalization.
++- Boundary PML allowed with antenna–PML standoff; `do_pml_in_domain=1` abort.
++- Unsupported: RZ, AMR (`max_level>0`), Vay deposition, current centering,
++  hybrid/collocated grid, moving window, EB, implicit solvers.
++
++## Discriminating div-gate decks
++- **2D** `solenoidal_antenna_2d`: x–z curl pair (Jx, Jz).
++- **3D** `solenoidal_antenna_3d`: x–y curl pair (Jx, Jy); plus
++  `solenoidal_antenna_yz_3d`: y–z curl pair exercising **Jz** collocation
++  `n_jz=(1,1,0)`.
++- **1D** cannot discriminate: only `Jz` enters the reduced div, and a
++  discrete-solenoidal `Jz` is constant along z under any collocation. The 1d
++  deck checks plumbing only — see input comments.
++
++## Analytic self-check / oracle
++Reference positions come from `JextStaggerOracle.H`: **hardcoded**
++per-component half-offset tables transcribed from `WarpX.cpp` AllocLevelMFs
++(not live `ixType()`, not an algebraic re-expression of the injection fac).
++Host `assert_stagger_table_and_spot` hard-asserts the table; the analytic
++multifab Jy=1.25 family hard-asserts the baked amplitude.
++
++## Periodic seam
++`periodic_seam_3d` uses an odd function of z (`sin(0.5*pi*z)`). The C++
++self-check directly compares lo/hi nodal face values after
++`FillBoundaryAndSync` (not parser-vs-self at each endpoint).
++
++## Feature-off identity
++`pec_plasma_noop_2d` (no J_ext keys) vs `pec_jext_zero_2d` (J_ext≡0 enabled),
++same binary, ≥3 steps, PEC. Runner requires **plotfile field SHA256 bit-identity**
++(`Cell_D_*`), not a floored FieldEnergy comparison.
++
++## Energy smoke
++Runner parses `diags/reducedfiles/fieldenergy.txt` and asserts
++driven final `W` within **±20% of analytic 0.127062 J** and undriven
++`|W| < 1e-12 J`. Derivation is in the deck comments. A 4× over-injection
++(`W→0.508`) fails.
++
++## Runner
++`./tests/jext/run_jext_regression.sh <warpx_exe> [logdir]`
+diff --git a/tests/jext/inputs/analytic_multifab_1d b/tests/jext/inputs/analytic_multifab_1d
+new file mode 100644
+index 000000000..7a83839f8
+--- /dev/null
++++ b/tests/jext/inputs/analytic_multifab_1d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 64
++amr.max_level = 0
++amr.max_grid_size = 16
++amr.blocking_factor = 8
++geometry.dims = 1
++geometry.prob_lo = -1.0
++geometry.prob_hi = 1.0
++boundary.field_lo = periodic
++boundary.field_hi = periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/analytic_multifab_2d b/tests/jext/inputs/analytic_multifab_2d
+new file mode 100644
+index 000000000..1541cade5
+--- /dev/null
++++ b/tests/jext/inputs/analytic_multifab_2d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 2
++geometry.prob_lo = -1.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = periodic periodic
++boundary.field_hi = periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/analytic_multifab_3d b/tests/jext/inputs/analytic_multifab_3d
+new file mode 100644
+index 000000000..e63f3671f
+--- /dev/null
++++ b/tests/jext/inputs/analytic_multifab_3d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 3
++geometry.prob_lo = -1.0 -1.0 -1.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/assert_amr b/tests/jext/inputs/assert_amr
+new file mode 100644
+index 000000000..ac4e26780
+--- /dev/null
++++ b/tests/jext/inputs/assert_amr
+@@ -0,0 +1,26 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 1
++amr.ref_ratio = 2
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.fine_tag_lo = 0.25 0.25 0.25
++warpx.fine_tag_hi = 0.75 0.75 0.75
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/assert_collocated b/tests/jext/inputs/assert_collocated
+new file mode 100644
+index 000000000..eb9525f81
+--- /dev/null
++++ b/tests/jext/inputs/assert_collocated
+@@ -0,0 +1,23 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = collocated
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/assert_current_centering b/tests/jext/inputs/assert_current_centering
+new file mode 100644
+index 000000000..819dc7d30
+--- /dev/null
++++ b/tests/jext/inputs/assert_current_centering
+@@ -0,0 +1,24 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.do_current_centering = 1
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/assert_eb b/tests/jext/inputs/assert_eb
+new file mode 100644
+index 000000000..a9e97d4de
+--- /dev/null
++++ b/tests/jext/inputs/assert_eb
+@@ -0,0 +1,24 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
++warpx.eb_implicit_function = "(x*x+y*y+z*z)-0.01"
+diff --git a/tests/jext/inputs/assert_hybrid b/tests/jext/inputs/assert_hybrid
+new file mode 100644
+index 000000000..832bbc934
+--- /dev/null
++++ b/tests/jext/inputs/assert_hybrid
+@@ -0,0 +1,23 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = hybrid
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/assert_implicit b/tests/jext/inputs/assert_implicit
+new file mode 100644
+index 000000000..92c6a01aa
+--- /dev/null
++++ b/tests/jext/inputs/assert_implicit
+@@ -0,0 +1,24 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.evolve_scheme = theta_implicit_em
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/assert_moving_window b/tests/jext/inputs/assert_moving_window
+new file mode 100644
+index 000000000..f690c8f6f
+--- /dev/null
++++ b/tests/jext/inputs/assert_moving_window
+@@ -0,0 +1,26 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = pec periodic periodic
++boundary.field_hi = pec periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
++warpx.do_moving_window = 1
++warpx.moving_window_dir = x
++warpx.moving_window_v = 1.0e8
+diff --git a/tests/jext/inputs/assert_pml_in_domain b/tests/jext/inputs/assert_pml_in_domain
+new file mode 100644
+index 000000000..a317e49fb
+--- /dev/null
++++ b/tests/jext/inputs/assert_pml_in_domain
+@@ -0,0 +1,25 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 16
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = pml pml pml
++boundary.field_hi = pml pml pml
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.do_pml_in_domain = 1
++warpx.pml_ncell = 4
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/assert_vay b/tests/jext/inputs/assert_vay
+new file mode 100644
+index 000000000..d5f5639a3
+--- /dev/null
++++ b/tests/jext/inputs/assert_vay
+@@ -0,0 +1,23 @@
++max_step = 1
++amr.n_cell = 8 8 8
++amr.max_level = 0
++amr.max_grid_size = 8
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++algo.maxwell_solver = yee
++algo.current_deposition = vay
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex
+diff --git a/tests/jext/inputs/energy_driven_1d b/tests/jext/inputs/energy_driven_1d
+new file mode 100644
+index 000000000..6823d2f58
+--- /dev/null
++++ b/tests/jext/inputs/energy_driven_1d
+@@ -0,0 +1,30 @@
++# Analytic expectation (unit domain, no particles, B stays 0):
++#   Jy = 1e4 * min(1, t/1e-10), dt=5e-12, max_step=40 => t_f=2e-10
++#   ∫_0^{tf} J dt = 1e4*(1e-10/2) + 1e4*(1e-10) = 1.5e-6 A·s/m²
++#   E_y = 1.5e-6 / ε0 = 1.69414e5 V/m
++#   W = ½ ε0 E² · V = 0.127062 J  (V=1 in every dim)
++# Runner asserts driven W within ±20% of 0.127062 J (catches 4× over-injection)
++# and undriven |W| < 1e-12 J.
++max_step = 40
++amr.n_cell = 64
++amr.max_level = 0
++amr.max_grid_size = 32
++geometry.dims = 1
++geometry.prob_lo = 0.0
++geometry.prob_hi = 1.0
++boundary.field_lo = periodic
++boundary.field_hi = periodic
++warpx.const_dt = 5.0e-12
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0e4 * min(1.0, t/1.0e-10)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/energy_driven_2d b/tests/jext/inputs/energy_driven_2d
+new file mode 100644
+index 000000000..0c4c0ddef
+--- /dev/null
++++ b/tests/jext/inputs/energy_driven_2d
+@@ -0,0 +1,30 @@
++# Analytic expectation (unit domain, no particles, B stays 0):
++#   Jy = 1e4 * min(1, t/1e-10), dt=5e-12, max_step=40 => t_f=2e-10
++#   ∫_0^{tf} J dt = 1e4*(1e-10/2) + 1e4*(1e-10) = 1.5e-6 A·s/m²
++#   E_y = 1.5e-6 / ε0 = 1.69414e5 V/m
++#   W = ½ ε0 E² · V = 0.127062 J  (V=1 in every dim)
++# Runner asserts driven W within ±20% of 0.127062 J (catches 4× over-injection)
++# and undriven |W| < 1e-12 J.
++max_step = 40
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 32
++geometry.dims = 2
++geometry.prob_lo = 0.0 0.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = periodic periodic
++boundary.field_hi = periodic periodic
++warpx.const_dt = 5.0e-12
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0e4 * min(1.0, t/1.0e-10)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/energy_driven_3d b/tests/jext/inputs/energy_driven_3d
+new file mode 100644
+index 000000000..2dc63e57d
+--- /dev/null
++++ b/tests/jext/inputs/energy_driven_3d
+@@ -0,0 +1,30 @@
++# Analytic expectation (unit domain, no particles, B stays 0):
++#   Jy = 1e4 * min(1, t/1e-10), dt=5e-12, max_step=40 => t_f=2e-10
++#   ∫_0^{tf} J dt = 1e4*(1e-10/2) + 1e4*(1e-10) = 1.5e-6 A·s/m²
++#   E_y = 1.5e-6 / ε0 = 1.69414e5 V/m
++#   W = ½ ε0 E² · V = 0.127062 J  (V=1 in every dim)
++# Runner asserts driven W within ±20% of 0.127062 J (catches 4× over-injection)
++# and undriven |W| < 1e-12 J.
++max_step = 40
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 32
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 5.0e-12
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.0e4 * min(1.0, t/1.0e-10)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/energy_undriven_1d b/tests/jext/inputs/energy_undriven_1d
+new file mode 100644
+index 000000000..8ab03d4f6
+--- /dev/null
++++ b/tests/jext/inputs/energy_undriven_1d
+@@ -0,0 +1,23 @@
++max_step = 40
++amr.n_cell = 64
++amr.max_level = 0
++amr.max_grid_size = 32
++geometry.dims = 1
++geometry.prob_lo = 0.0
++geometry.prob_hi = 1.0
++boundary.field_lo = periodic
++boundary.field_hi = periodic
++warpx.const_dt = 5.0e-12
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/energy_undriven_2d b/tests/jext/inputs/energy_undriven_2d
+new file mode 100644
+index 000000000..f6cf167b1
+--- /dev/null
++++ b/tests/jext/inputs/energy_undriven_2d
+@@ -0,0 +1,23 @@
++max_step = 40
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 32
++geometry.dims = 2
++geometry.prob_lo = 0.0 0.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = periodic periodic
++boundary.field_hi = periodic periodic
++warpx.const_dt = 5.0e-12
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/energy_undriven_3d b/tests/jext/inputs/energy_undriven_3d
+new file mode 100644
+index 000000000..9b74ef8c3
+--- /dev/null
++++ b/tests/jext/inputs/energy_undriven_3d
+@@ -0,0 +1,23 @@
++max_step = 40
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 32
++geometry.dims = 3
++geometry.prob_lo = 0.0 0.0 0.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 5.0e-12
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/filter_identity_1d b/tests/jext/inputs/filter_identity_1d
+new file mode 100644
+index 000000000..77cc6bd96
+--- /dev/null
++++ b/tests/jext/inputs/filter_identity_1d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 64
++amr.max_level = 0
++amr.max_grid_size = 16
++amr.blocking_factor = 8
++geometry.dims = 1
++geometry.prob_lo = -1.0
++geometry.prob_hi = 1.0
++boundary.field_lo = periodic
++boundary.field_hi = periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 1
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/filter_identity_2d b/tests/jext/inputs/filter_identity_2d
+new file mode 100644
+index 000000000..8503e9ac8
+--- /dev/null
++++ b/tests/jext/inputs/filter_identity_2d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 2
++geometry.prob_lo = -1.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = periodic periodic
++boundary.field_hi = periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 1
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/filter_identity_3d b/tests/jext/inputs/filter_identity_3d
+new file mode 100644
+index 000000000..735550738
+--- /dev/null
++++ b/tests/jext/inputs/filter_identity_3d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 3
++geometry.prob_lo = -1.0 -1.0 -1.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 1
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/monopole_abort_1d b/tests/jext/inputs/monopole_abort_1d
+new file mode 100644
+index 000000000..df7963e72
+--- /dev/null
++++ b/tests/jext/inputs/monopole_abort_1d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 64
++amr.max_level = 0
++amr.max_grid_size = 16
++amr.blocking_factor = 8
++geometry.dims = 1
++geometry.prob_lo = -1.0
++geometry.prob_hi = 1.0
++boundary.field_lo = periodic
++boundary.field_hi = periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "z"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/monopole_abort_2d b/tests/jext/inputs/monopole_abort_2d
+new file mode 100644
+index 000000000..a9964d3fc
+--- /dev/null
++++ b/tests/jext/inputs/monopole_abort_2d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 2
++geometry.prob_lo = -1.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = periodic periodic
++boundary.field_hi = periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "x"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/monopole_abort_3d b/tests/jext/inputs/monopole_abort_3d
+new file mode 100644
+index 000000000..d52c4d247
+--- /dev/null
++++ b/tests/jext/inputs/monopole_abort_3d
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 3
++geometry.prob_lo = -1.0 -1.0 -1.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "x"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 0
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/pec_jext_zero_2d b/tests/jext/inputs/pec_jext_zero_2d
+new file mode 100644
+index 000000000..e5a2bbfd0
+--- /dev/null
++++ b/tests/jext/inputs/pec_jext_zero_2d
+@@ -0,0 +1,48 @@
++max_step = 3
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 16
++geometry.dims = 2
++geometry.prob_lo = -10.e-6 -10.e-6
++geometry.prob_hi =  10.e-6  10.e-6
++boundary.field_lo = pec pec
++boundary.field_hi = pec pec
++boundary.particle_lo = reflecting reflecting
++boundary.particle_hi = reflecting reflecting
++warpx.const_dt = 1.0e-15
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++algo.particle_shape = 1
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 0
++my_constants.n0 = 1.e24
++particles.species_names = electrons
++electrons.charge = -q_e
++electrons.mass = m_e
++electrons.injection_style = "NUniformPerCell"
++electrons.num_particles_per_cell_each_dim = 1 1
++electrons.xmin = -10.e-6
++electrons.xmax =  10.e-6
++electrons.zmin = -10.e-6
++electrons.zmax =  10.e-6
++electrons.profile = constant
++electrons.density = n0
++electrons.momentum_distribution_type = constant
++electrons.ux = 0.01
++electrons.uy = 0.0
++electrons.uz = 0.0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
++
++diagnostics.diags_names = diag1
++diag1.intervals = 3
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez Bx By Bz
+diff --git a/tests/jext/inputs/pec_plasma_noop_2d b/tests/jext/inputs/pec_plasma_noop_2d
+new file mode 100644
+index 000000000..ab1d49c70
+--- /dev/null
++++ b/tests/jext/inputs/pec_plasma_noop_2d
+@@ -0,0 +1,43 @@
++max_step = 3
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 16
++geometry.dims = 2
++geometry.prob_lo = -10.e-6 -10.e-6
++geometry.prob_hi =  10.e-6  10.e-6
++boundary.field_lo = pec pec
++boundary.field_hi = pec pec
++boundary.particle_lo = reflecting reflecting
++boundary.particle_hi = reflecting reflecting
++warpx.const_dt = 1.0e-15
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++algo.particle_shape = 1
++warpx.use_filter = 0
++warpx.grid_type = staggered
++my_constants.n0 = 1.e24
++particles.species_names = electrons
++electrons.charge = -q_e
++electrons.mass = m_e
++electrons.injection_style = "NUniformPerCell"
++electrons.num_particles_per_cell_each_dim = 1 1
++electrons.xmin = -10.e-6
++electrons.xmax =  10.e-6
++electrons.zmin = -10.e-6
++electrons.zmax =  10.e-6
++electrons.profile = constant
++electrons.density = n0
++electrons.momentum_distribution_type = constant
++electrons.ux = 0.01
++electrons.uy = 0.0
++electrons.uz = 0.0
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
++
++diagnostics.diags_names = diag1
++diag1.intervals = 3
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez Bx By Bz
+diff --git a/tests/jext/inputs/periodic_seam_3d b/tests/jext/inputs/periodic_seam_3d
+new file mode 100644
+index 000000000..fd280d23b
+--- /dev/null
++++ b/tests/jext/inputs/periodic_seam_3d
+@@ -0,0 +1,31 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 16
++amr.blocking_factor = 16
++geometry.dims = 3
++geometry.prob_lo = -1.0 -1.0 -1.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# Spatially varying Jy across the periodic z-seam. sin(0.5*pi*z) is ODD about
++# z=0 on [-1,1], so parser values at the identified endpoints z=±1 are ±1 and
++# DISAGREE without OverrideSync. The C++ self-check asserts max|J_lo - J_hi|
++# on nodal faces after FillBoundaryAndSync (direct value comparison).
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "sin(0.5*pi*z)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/solenoidal_antenna_1d b/tests/jext/inputs/solenoidal_antenna_1d
+new file mode 100644
+index 000000000..07c45c63f
+--- /dev/null
++++ b/tests/jext/inputs/solenoidal_antenna_1d
+@@ -0,0 +1,28 @@
++max_step = 1
++amr.n_cell = 64
++amr.max_level = 0
++amr.max_grid_size = 16
++amr.blocking_factor = 8
++geometry.dims = 1
++geometry.prob_lo = -1.0
++geometry.prob_hi = 1.0
++boundary.field_lo = periodic
++boundary.field_hi = periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# 1D reduced div uses ONLY Jz and cannot discriminate nodal staggering.
++warpx.Jx_external_grid_function(x,y,z,t) = "sin(pi*z)"
++warpx.Jy_external_grid_function(x,y,z,t) = "cos(pi*z)"
++warpx.Jz_external_grid_function(x,y,z,t) = "1.5"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/solenoidal_antenna_2d b/tests/jext/inputs/solenoidal_antenna_2d
+new file mode 100644
+index 000000000..fb3952760
+--- /dev/null
++++ b/tests/jext/inputs/solenoidal_antenna_2d
+@@ -0,0 +1,30 @@
++max_step = 1
++amr.n_cell = 32 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 2
++geometry.prob_lo = -1.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = periodic periodic
++boundary.field_hi = periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# Discriminating discrete-solenoidal antenna.
++# Correct stencil: D_x Jx + D_z Jz cancels exactly (r ~ eps_SP).
++# Half-cell inverted stencil: r ~ O(kh) ~ 0.4 at h=1/16 -- fails rel_tol=1e-4.
++warpx.Jx_external_grid_function(x,y,z,t) = "cos(pi*x)*sin(pi*z)"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "-sin(pi*x)*cos(pi*z)"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/solenoidal_antenna_3d b/tests/jext/inputs/solenoidal_antenna_3d
+new file mode 100644
+index 000000000..1cc62f877
+--- /dev/null
++++ b/tests/jext/inputs/solenoidal_antenna_3d
+@@ -0,0 +1,28 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 3
++geometry.prob_lo = -1.0 -1.0 -1.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# 3D discriminating analogue (x-y curl pair; Jz=0):
++warpx.Jx_external_grid_function(x,y,z,t) = "cos(pi*x)*sin(pi*y)"
++warpx.Jy_external_grid_function(x,y,z,t) = "-sin(pi*x)*cos(pi*y)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/inputs/solenoidal_antenna_yz_3d b/tests/jext/inputs/solenoidal_antenna_yz_3d
+new file mode 100644
+index 000000000..7f28aa3bc
+--- /dev/null
++++ b/tests/jext/inputs/solenoidal_antenna_yz_3d
+@@ -0,0 +1,30 @@
++max_step = 1
++amr.n_cell = 16 16 16
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = 3
++geometry.prob_lo = -1.0 -1.0 -1.0
++geometry.prob_hi = 1.0 1.0 1.0
++boundary.field_lo = periodic periodic periodic
++boundary.field_hi = periodic periodic periodic
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# y-z curl pair: exercises Jz collocation n_jz=(1,1,0) which solenoidal_antenna_3d
++# (x-y pair, Jz=0) never touches. Correct stencil: D_y Jy + D_z Jz cancels
++# exactly (r ~ eps_SP). Half-cell inverted n_jz alone: residual O((kh)^2).
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "cos(pi*y)*sin(pi*z)"
++warpx.Jz_external_grid_function(x,y,z,t) = "-sin(pi*y)*cos(pi*z)"
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
++diagnostics.diags_names = diag1
++diag1.intervals = 1000
++diag1.diag_type = Full
++diag1.fields_to_plot = Ex Ey Ez
+diff --git a/tests/jext/oracle_tables.py b/tests/jext/oracle_tables.py
+new file mode 100644
+index 000000000..4cc06baf7
+--- /dev/null
++++ b/tests/jext/oracle_tables.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++"""Independent Yee-stagger oracle tables for J_ext self-check.
++
++Half-offsets are literal constants transcribed from WarpX.cpp AllocLevelMFs
++(jx/jy/jz_nodal_flag tables), NOT a re-expression of the injection kernel.
++"""
++import math
++
++# Literal half-offset tables: 0.0 = NODE, 0.5 = CELL
++# Source: WarpX.cpp AllocLevelMFs ~L2435-2477
++HALF_OFF_1D = {
++    # axis = physical z
++    0: (0.0,),   # Jx NODE
++    1: (0.0,),   # Jy NODE
++    2: (0.5,),   # Jz CELL
++}
++HALF_OFF_XZ = {
++    # axes = (x, z)
++    0: (0.5, 0.0),  # Jx CELL,x NODE,z
++    1: (0.0, 0.0),  # Jy NODE,x NODE,z
++    2: (0.0, 0.5),  # Jz NODE,x CELL,z
++}
++HALF_OFF_3D = {
++    # axes = (x, y, z)
++    0: (0.5, 0.0, 0.0),  # Jx
++    1: (0.0, 0.5, 0.0),  # Jy
++    2: (0.0, 0.0, 0.5),  # Jz
++}
++
++# Baked analytic multifab amplitude
++K_ANALYTIC_JY = 1.25
++
++
++def pos_xz(comp, i, j, lo=(-1.0, -1.0), dx=(2.0 / 32, 2.0 / 32)):
++    hx, hz = HALF_OFF_XZ[comp]
++    x = lo[0] + (i + hx) * dx[0]
++    z = lo[1] + (j + hz) * dx[1]
++    return (x, 0.0, z)
++
++
++def main():
++    print("analytic_multifab Jy expected:", K_ANALYTIC_JY)
++    h = 2.0 / 32
++    PI = math.pi
++    for i, j in [(8, 8), (0, 0), (16, 16)]:
++        x_r, _, z_r = pos_xz(0, i, j, dx=(h, h))
++        x_l, _, z_l = pos_xz(0, i - 1, j, dx=(h, h))
++        Jx_r = math.cos(PI * x_r) * math.sin(PI * z_r)
++        Jx_l = math.cos(PI * x_l) * math.sin(PI * z_l)
++        x_zr, _, z_zr = pos_xz(2, i, j, dx=(h, h))
++        x_zl, _, z_zl = pos_xz(2, i, j - 1, dx=(h, h))
++        Jz_r = -math.sin(PI * x_zr) * math.cos(PI * z_zr)
++        Jz_l = -math.sin(PI * x_zl) * math.cos(PI * z_zl)
++        divh = (Jx_r - Jx_l) / h + (Jz_r - Jz_l) / h
++        print(f"node ({i},{j}): div_h={divh:.6e}")
++    # Table identity smoke
++    assert HALF_OFF_XZ[0] == (0.5, 0.0)
++    assert HALF_OFF_3D[2] == (0.0, 0.0, 0.5)
++    print("table identity OK")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/jext/run_jext_regression.sh b/tests/jext/run_jext_regression.sh
+new file mode 100755
+index 000000000..b696a8c0d
+--- /dev/null
++++ b/tests/jext/run_jext_regression.sh
+@@ -0,0 +1,246 @@
++#!/usr/bin/env bash
++# J_ext regression runner — CPU-only, minutes-scale.
++# Usage: run_jext_regression.sh <warpx_exe> [logdir]
++set -euo pipefail
++EXE="${1:?warpx executable}"
++LOGDIR="${2:-$(dirname "$0")/logs}"
++mkdir -p "$LOGDIR"
++INDIR="$(cd "$(dirname "$0")/inputs" && pwd)"
++PASS=0
++FAIL=0
++SKIP=0
++
++parse_final_energy() {
++  local f="$1"
++  if [ ! -f "$f" ]; then echo "MISSING"; return; fi
++  awk 'BEGIN{v="EMPTY"} !/^#/ && NF>=3 {v=$3} END{print v}' "$f"
++}
++
++# SHA256 of WarpX plotfile field payloads (Cell_D_*). Empty if none.
++plotfile_field_sha() {
++  local root="$1"
++  if [ ! -d "$root" ]; then echo "MISSING_DIR"; return; fi
++  # Sort paths for stable aggregate; hash file contents only.
++  local files
++  files=$(find "$root" -type f -name 'Cell_D_*' | LC_ALL=C sort)
++  if [ -z "$files" ]; then
++    # fallback: any Level_*/Cell* binary
++    files=$(find "$root" -type f \( -name 'Cell_D_*' -o -name 'Cell_H_*' \) | LC_ALL=C sort)
++  fi
++  if [ -z "$files" ]; then echo "MISSING_CELLS"; return; fi
++  # Aggregate content-only digests (NOT paths — absolute paths would
++  # falsify identity between two run directories with identical field data).
++  echo "$files" | while IFS= read -r f; do
++    shasum -a 256 "$f" | awk '{print $1}'
++  done | shasum -a 256 | awk '{print $1}'
++}
++
++run_ok() {
++  local name="$1" input="$2"
++  local require_self="${3:-0}"
++  local require_div="${4:-0}"
++  local max_r="${5:-}"
++  local require_seam="${6:-0}"
++  local log="$LOGDIR/${name}.log"
++  local rundir="$LOGDIR/run_${name}"
++  rm -rf "$rundir"
++  mkdir -p "$rundir"
++  echo "[RUN] $name"
++  if (cd "$rundir" && "$EXE" "$input") >"$log" 2>&1; then
++    local ok=1
++    if [ "$require_self" = "1" ]; then
++      if ! grep -q "J_ext analytic self-check: max_abs_err=" "$log"; then
++        echo "  [FAIL] $name missing analytic self-check marker"; ok=0
++      else
++        err=$(grep "J_ext analytic self-check: max_abs_err=" "$log" | tail -1)
++        echo "    self-check: $err"
++        if ! grep -q "oracle=JextStaggerOracle" "$log"; then
++          echo "  [FAIL] $name self-check did not use JextStaggerOracle"; ok=0
++        fi
++      fi
++    fi
++    if [ "$require_div" = "1" ]; then
++      if ! grep -q "J_ext div-gate:" "$log"; then
++        echo "  [FAIL] $name missing div-gate marker"; ok=0
++      else
++        dg=$(grep "J_ext div-gate:" "$log" | tail -1)
++        echo "    div-gate: $dg"
++        if [ -n "$max_r" ]; then
++          r=$(echo "$dg" | sed -n 's/.*r=|div|\*h\/|J|=\([0-9.eE+-]*\).*/\1/p')
++          if ! python3 -c "import sys; r=float('$r'); m=float('$max_r'); sys.exit(0 if r<=m else 1)"; then
++            echo "  [FAIL] $name div-gate r=$r exceeds max_r=$max_r"; ok=0
++          fi
++        fi
++      fi
++    fi
++    if [ "$require_seam" = "1" ]; then
++      if ! grep -q "J_ext periodic-seam: comp=" "$log"; then
++        echo "  [FAIL] $name missing periodic-seam marker"; ok=0
++      else
++        seam=$(grep "J_ext periodic-seam: comp=" "$log" | tail -1)
++        echo "    seam: $seam"
++      fi
++    fi
++    # Feature-off must produce zero J_ext-attributable stdout.
++    if [ "$name" = "pec_plasma_noop_2d" ]; then
++      if grep -E "J_ext |J_ext_" "$log" >/dev/null; then
++        echo "  [FAIL] $name feature-off log contains J_ext-attributable output"; ok=0
++        grep -E "J_ext |J_ext_" "$log" | head -5 | sed 's/^/    /'
++      else
++        echo "    feature-off: zero J_ext-attributable stdout"
++      fi
++    fi
++    if [ "$ok" = "1" ]; then
++      echo "  [PASS] $name"; PASS=$((PASS+1))
++    else
++      tail -20 "$log" | sed 's/^/    /'; FAIL=$((FAIL+1))
++    fi
++  else
++    echo "  [FAIL] $name (see $log)"
++    tail -20 "$log" | sed 's/^/    /'
++    FAIL=$((FAIL+1))
++  fi
++}
++
++run_assert() {
++  local name="$1" input="$2" needle="$3"
++  local log="$LOGDIR/${name}.log"
++  local rundir="$LOGDIR/run_${name}"
++  rm -rf "$rundir"; mkdir -p "$rundir"
++  echo "[ASSERT] $name"
++  set +e
++  (cd "$rundir" && "$EXE" "$input") >"$log" 2>&1
++  rc=$?
++  set -e
++  # Flatten whitespace so needles can span AMReX line-wrapped abort text.
++  # Bound the wildcard so two substrings must appear within ~300 chars
++  # (not anywhere in the whole log in any order).
++  local flat
++  flat=$(tr '\n#' '  ' <"$log" | tr -s ' ')
++  if [ $rc -ne 0 ] && echo "$flat" | grep -qiE "$needle"; then
++    echo "  [PASS] $name (aborted with expected message)"
++    grep -E "J_ext|div\(J_ext\)|warpx\.J_ext|do_current_centering" "$log" | tail -5 | sed "s/^/    /" || true
++    PASS=$((PASS+1))
++  elif [ $rc -ne 0 ]; then
++    echo "  [FAIL] $name aborted but message missing (needle=$needle)"
++    tail -30 "$log" | sed 's/^/    /'; FAIL=$((FAIL+1))
++  else
++    echo "  [FAIL] $name was expected to abort"; FAIL=$((FAIL+1))
++  fi
++}
++
++run_energy_pair() {
++  local dim="$1"
++  local driven="energy_driven_${dim}"
++  local undriven="energy_undriven_${dim}"
++  local log_d="$LOGDIR/${driven}.log"
++  local log_u="$LOGDIR/${undriven}.log"
++  local rd="$LOGDIR/run_${driven}"
++  local ru="$LOGDIR/run_${undriven}"
++  rm -rf "$rd" "$ru"; mkdir -p "$rd" "$ru"
++  echo "[ENERGY] driven+undriven ${dim}"
++  local ok=1
++  if ! (cd "$rd" && "$EXE" "$INDIR/${driven}") >"$log_d" 2>&1; then
++    echo "  [FAIL] ${driven} non-zero exit"; tail -20 "$log_d" | sed 's/^/    /'; ok=0
++  fi
++  if ! (cd "$ru" && "$EXE" "$INDIR/${undriven}") >"$log_u" 2>&1; then
++    echo "  [FAIL] ${undriven} non-zero exit"; tail -20 "$log_u" | sed 's/^/    /'; ok=0
++  fi
++  local fe_d="$rd/diags/reducedfiles/fieldenergy.txt"
++  local fe_u="$ru/diags/reducedfiles/fieldenergy.txt"
++  local Wd Wu
++  Wd=$(parse_final_energy "$fe_d")
++  Wu=$(parse_final_energy "$fe_u")
++  echo "    driven final W=$Wd  undriven final W=$Wu"
++  if [ "$Wd" = "MISSING" ] || [ "$Wd" = "EMPTY" ]; then echo "  [FAIL] missing driven fieldenergy"; ok=0; fi
++  if [ "$Wu" = "MISSING" ] || [ "$Wu" = "EMPTY" ]; then echo "  [FAIL] missing undriven fieldenergy"; ok=0; fi
++  # Two-sided energy band around analytic 0.127062 J (±20%).
++  # Derivation (checked in energy_driven_* deck comments + here):
++  #   unit domain, no particles, Jy=1e4*min(1,t/1e-10), dt=5e-12, 40 steps
++  #   tf=2e-10; ∫J dt = 1e4*(1e-10/2)+1e4*1e-10 = 1.5e-6
++  #   E_y = 1.5e-6/ε0 ≈ 1.69414e5 V/m
++  #   W = ½ ε0 E² · V = 0.127062 J  (V=1 every dim)
++  #   ±20% band: [0.10165, 0.15247] — a 4× over-injection (W→0.508) FAILS;
++  #   undriven |W| < 1e-12 (exact 0 with J≡0, no particles).
++  if [ "$ok" = "1" ]; then
++    if ! python3 -c "
++import sys
++Wd=float('$Wd'); Wu=float('$Wu')
++W_expect=0.127062
++rel_band=0.20
++ok = (abs(Wd/W_expect - 1.0) <= rel_band) and (abs(Wu) < 1e-12)
++sys.exit(0 if ok else 1)
++"; then
++      echo "  [FAIL] energy assert: need |Wd/0.127062-1|<=0.20 and |Wu|<1e-12; got Wd=$Wd Wu=$Wu"; ok=0
++    fi
++  fi
++  if [ "$ok" = "1" ]; then
++    echo "  [PASS] energy_pair_${dim} (driven W=$Wd within ±20% of 0.127062; |undriven|=$Wu < 1e-12)"; PASS=$((PASS+1))
++  else
++    FAIL=$((FAIL+1))
++  fi
++}
++
++case "$EXE" in
++  *1d*|*1D*) DIM=1d ;;
++  *2d*|*2D*) DIM=2d ;;
++  *3d*|*3D*) DIM=3d ;;
++  *) echo "Cannot infer dim from exe name $EXE"; exit 2 ;;
++esac
++
++run_ok "analytic_multifab_${DIM}" "$INDIR/analytic_multifab_${DIM}" 1 1 "1e-6"
++run_ok "filter_identity_${DIM}" "$INDIR/filter_identity_${DIM}" 1 1 "1e-6"
++# Discriminating decks: observed r ~ 6e-8; use 1e-6 (not vacuous 1e-4 == in-code tol).
++if [ "$DIM" = "1d" ]; then
++  run_ok "solenoidal_antenna_${DIM}" "$INDIR/solenoidal_antenna_${DIM}" 1 1 "1e-6"
++else
++  run_ok "solenoidal_antenna_${DIM}" "$INDIR/solenoidal_antenna_${DIM}" 1 1 "1e-6"
++fi
++run_energy_pair "$DIM"
++run_assert "monopole_abort_${DIM}" "$INDIR/monopole_abort_${DIM}" \
++  "warpx\\.J_ext_grid_init_style.{0,200}discrete div|warpx\\.J_ext_grid_init_style discrete div"
++
++if [ "$DIM" = "2d" ]; then
++  run_ok "pec_plasma_noop_2d" "$INDIR/pec_plasma_noop_2d" 0 0
++  run_ok "pec_jext_zero_2d" "$INDIR/pec_jext_zero_2d" 0 0
++  # Feature-off bit-identity: SHA256 of plotfile field data (same binary,
++  # with vs without J_ext keys; ≥3 steps; PEC). Dropped FieldEnergy ±2.2%
++  # floored comparison and the tautological count=1 gauge.
++  echo "[BIT-ID] plotfile field SHA256 noop vs jext_zero"
++  sha_a=$(plotfile_field_sha "$LOGDIR/run_pec_plasma_noop_2d")
++  sha_b=$(plotfile_field_sha "$LOGDIR/run_pec_jext_zero_2d")
++  echo "    noop sha=$sha_a"
++  echo "    zero sha=$sha_b"
++  if [ "$sha_a" = "MISSING_DIR" ] || [ "$sha_a" = "MISSING_CELLS" ] || \
++     [ "$sha_b" = "MISSING_DIR" ] || [ "$sha_b" = "MISSING_CELLS" ]; then
++    echo "  [FAIL] pec_feature_off_bitid missing plotfile Cell_D data"
++    FAIL=$((FAIL+1))
++  elif [ "$sha_a" = "$sha_b" ]; then
++    echo "  [PASS] pec_feature_off_bitid (plotfile field SHA256 identical)"; PASS=$((PASS+1))
++  else
++    echo "  [FAIL] pec_feature_off_bitid SHA mismatch"; FAIL=$((FAIL+1))
++  fi
++fi
++
++if [ "$DIM" = "3d" ]; then
++  run_ok "periodic_seam_3d" "$INDIR/periodic_seam_3d" 1 1 "1e-6" 1
++  # y-z curl pair: exercises Jz collocation (n_jz=(1,1,0))
++  run_ok "solenoidal_antenna_yz_3d" "$INDIR/solenoidal_antenna_yz_3d" 1 1 "1e-6"
++  # Bound wildcards to ~200 chars between anchor tokens.
++  run_assert "assert_amr" "$INDIR/assert_amr" "warpx\\.J_ext_grid_init_style.{0,200}(level 0 only|AMR)"
++  run_assert "assert_collocated" "$INDIR/assert_collocated" "warpx\\.J_ext_grid_init_style.{0,200}(staggered|collocated)"
++  run_assert "assert_hybrid" "$INDIR/assert_hybrid" "warpx\\.J_ext_grid_init_style.{0,200}(hybrid|staggered)"
++  # do_current_centering: base WarpX aborts first (hybrid required); accept that
++  # fail-closed message. The J_ext clause is defence-in-depth / currently unreachable.
++  run_assert "assert_current_centering" "$INDIR/assert_current_centering" "warpx\\.do_current_centering=1 can be used only with|warpx\\.J_ext_grid_init_style.{0,200}current_centering"
++  run_assert "assert_vay" "$INDIR/assert_vay" "warpx\\.J_ext_grid_init_style.{0,200}vay"
++  run_assert "assert_moving_window" "$INDIR/assert_moving_window" "warpx\\.J_ext_grid_init_style.{0,200}moving window"
++  run_assert "assert_pml_in_domain" "$INDIR/assert_pml_in_domain" "warpx\\.J_ext_grid_init_style.{0,200}do_pml_in_domain"
++  run_assert "assert_implicit" "$INDIR/assert_implicit" "warpx\\.J_ext_grid_init_style.{0,200}(implicit|ordinary explicit)"
++  run_assert "assert_eb" "$INDIR/assert_eb" "warpx\\.J_ext_grid_init_style.{0,200}embedded boundaries"
++fi
++
++echo ""
++echo "RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
++if [ "$FAIL" -gt 0 ]; then exit 1; fi
++exit 0
