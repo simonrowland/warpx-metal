@@ -19,6 +19,7 @@ HOST_OS="$(uname -s)"
 PATCH_COUNT=0
 BINARY_COUNT=0
 JEXT_SUITE_COUNT=0
+UNIFORM_TILE_LEAVE_OFF_SUITE_COUNT=0
 WORK_DIR=""
 
 finish() {
@@ -32,9 +33,9 @@ finish() {
         outcome="PASS"
     fi
 
-    printf 'LOCAL_CI_RESULT outcome=%s host=%s patches=%d binaries=%d jext_suites=%d\n' \
+    printf 'LOCAL_CI_RESULT outcome=%s host=%s patches=%d binaries=%d jext_suites=%d uniform_tile_leave_off_suites=%d\n' \
         "${outcome}" "${HOST_OS}" "${PATCH_COUNT}" "${BINARY_COUNT}" \
-        "${JEXT_SUITE_COUNT}"
+        "${JEXT_SUITE_COUNT}" "${UNIFORM_TILE_LEAVE_OFF_SUITE_COUNT}"
 }
 trap 'finish "$?"' EXIT
 
@@ -111,6 +112,8 @@ copy_amrex_replacement "AMReX_Random.cpp" "Src/Base/AMReX_Random.cpp"
 
 apply_patch "${AMREX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/amrex-post/0004-metal-pic-rng-reduction-fixes.patch"
+apply_patch "${AMREX_SOURCE_DIR}" \
+    "${ROOT_DIR}/patches/amrex-post/0005-metal-uniform-tile-leave.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0001-metal-source-identity.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
@@ -243,6 +246,34 @@ for binary in "${binaries[@]}"; do
 done
 [[ -n "${jext_executable}" ]] || fail "no linked 3D WarpX executable found for J_ext tests"
 
+uniform_tile_leave_off_executable=""
+for binary in "${binaries[@]}"; do
+    if [[ "$(basename "${binary}")" == warpx.2d* ]]; then
+        uniform_tile_leave_off_executable="${binary}"
+        break
+    fi
+done
+[[ -n "${uniform_tile_leave_off_executable}" ]] || \
+    fail "no linked 2D WarpX executable found for uniform-tile-leave flag-OFF test"
+
+uniform_tile_leave_off_dir="${WORK_DIR}/uniform-tile-leave-off"
+uniform_tile_leave_off_log="${uniform_tile_leave_off_dir}/run.log"
+mkdir -p "${uniform_tile_leave_off_dir}"
+printf 'Running uniform-tile-leave explicit-OFF CPU test: %s\n' \
+    "${uniform_tile_leave_off_executable}"
+(
+    cd "${uniform_tile_leave_off_dir}"
+    WARPX_MAX_MEM_FRACTION="${WARPX_MAX_MEM_FRACTION:-0.99}" \
+        "${uniform_tile_leave_off_executable}" \
+        "${ROOT_DIR}/tests/warpx/inputs_test_2species" \
+        max_step=2 particles.redistribute_uniform_tile_leave=0
+) 2>&1 | tee "${uniform_tile_leave_off_log}"
+if grep -Fq 'AMReX particle Redistribute uniform-tile-leave: ON' \
+    "${uniform_tile_leave_off_log}"; then
+    fail "uniform-tile-leave activation marker present in explicit-OFF run"
+fi
+UNIFORM_TILE_LEAVE_OFF_SUITE_COUNT=$((UNIFORM_TILE_LEAVE_OFF_SUITE_COUNT + 1))
+
 printf 'Running J_ext CPU regression suite: %s\n' "${jext_executable}"
 # The checked-in regression decks are tiny and particle-free. Avoid unrelated
 # host memory pressure tripping the package crashguard before test logic runs;
@@ -254,5 +285,6 @@ JEXT_SUITE_COUNT=$((JEXT_SUITE_COUNT + 1))
 
 printf '%s\n' \
     "Host CPU build passed on ${HOST_OS}." \
+    'The uniform-tile-leave explicit-OFF CPU test passed without activation.' \
     'The 3D J_ext CPU regression suite passed.' \
     'A macOS PASS plus the -U__APPLE__ syntax gate does not prove Linux/GCC behavior.'

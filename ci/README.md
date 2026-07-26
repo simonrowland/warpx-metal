@@ -11,14 +11,16 @@ and checkpoint-commit unit tests. It then clones pinned AMReX and WarpX
 revisions into a temporary directory, verifies each pin is reachable from its
 upstream `26.06` tag, installs the packaged AMReX replacement files, explicitly
 applies the AMReX and WarpX patch files used by this repository, and builds
-linked 2D and 3D CPU WarpX executables. It then runs the full 3D
-impressed-current regression suite, including analytic staggering,
+linked 2D and 3D CPU WarpX executables. It then runs a bounded 2D particle
+smoke with `particles.redistribute_uniform_tile_leave=0`, requiring a clean
+exit and absence of the flag-ON activation marker. Finally, it runs the full
+3D impressed-current regression suite, including analytic staggering,
 discrete-divergence, boundary, energy-injection, and unsupported-mode gates.
 Any test, clone, pin, patch-application, configuration, compilation, link, or
 regression failure exits nonzero. The last output line is machine-readable:
 
 ```text
-LOCAL_CI_RESULT outcome=PASS|FAIL host=... patches=... binaries=... jext_suites=...
+LOCAL_CI_RESULT outcome=PASS|FAIL host=... patches=... binaries=... jext_suites=... uniform_tile_leave_off_suites=...
 ```
 
 Dependencies are Git, CMake, Ninja, Python 3, a C/C++ compiler, and OpenMP. On
@@ -36,3 +38,6 @@ Set `CMAKE_BUILD_PARALLEL_LEVEL` to change the default two build jobs. Set
 debugging. The bounded, particle-free J_ext regression invocation defaults
 `WARPX_MAX_MEM_FRACTION` to `0.99` so unrelated host pressure does not abort
 before test logic runs; set that variable explicitly to use a stricter limit.
+The uniform-tile-leave smoke streams its output while retaining a temporary
+log, so a failing run preserves diagnostics in the CI output even when the
+temporary tree is removed.

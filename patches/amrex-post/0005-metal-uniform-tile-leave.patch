@@ -1,0 +1,1724 @@
+diff --git a/Docs/sphinx_documentation/source/Particle.rst b/Docs/sphinx_documentation/source/Particle.rst
+index 8332cc5cb..1089af1d8 100644
+--- a/Docs/sphinx_documentation/source/Particle.rst
++++ b/Docs/sphinx_documentation/source/Particle.rst
+@@ -797,6 +797,37 @@ with OpenMP, the first thing to look at is whether there are enough tiles availa
+ | tile_size         | If tiling is on, the maximum tile_size in each direction              | Ints        | 1024000,8,8 |
+ +-------------------+-----------------------------------------------------------------------+-------------+-------------+
+
++``particles.redistribute_uniform_tile_leave`` is a separate opt-in Boolean
++parameter (default ``false``). It sends every particle through the
++Redistribute leave/pack path, avoiding the GPU stay-count device-to-host
++readback at the cost of packing and buffering 100 percent of local particles.
++If ``N`` particles carry ``S`` packed bytes each, the source tiles and full
++send buffer coexist. In ``D`` dimensions, the GPU path also keeps
++``16 + 4*D`` bytes of ``ParticleCopyOp`` metadata and a 4-byte destination
++index per moved particle, for ``M = 20 + 4*D`` bytes. The pack peak is
++therefore ``2*N*S + N*M``.
++On the shipping NOMPI Metal build, the non-GPU-aware, unpinned send-buffer
++branch also creates a full ``pinned_snd_buffer`` staging copy. Both send
++buffers remain live while destination tiles grow. Thus ``3*N*S + N*M`` is a
++conservative capacity-and-lifetime upper bound; allocator reuse and effective
++buffer capacities can lower the observed high-water mark. For
++``N = 1,048,576`` and ``S = 80 B``, the validated 2D build has ``M = 28 B``:
++upper bounds of 188 MiB at pack and 268 MiB at unpack. The normal estimate is
++80 MiB of payload plus ``(1/128)*80 MiB = 0.625 MiB`` of crossings, or
++80.625 MiB total. The 1M-particle validation measured 152 MiB arena plus
++52 MiB pinned, about 204 MiB host-visible, so it did not reach the bound.
++Conservative 3D sizing adds one 8 B real to the payload: ``S = 88 B`` and
++``M = 32 B`` give 208 MiB at pack and 296 MiB at unpack. The old 160 MiB
++figure was only a payload lower bound. No OOM was observed at 1M; larger cases
++retain OOM risk.
++The mode changes in-tile ordering, so flag-ON versus flag-OFF requires
++order-insensitive particle comparisons and tolerance-based physics checks, not
++bitwise hashes. Enablement aborts with more than one MPI rank. Non-GPU
++single-rank runs exercise host-side semantics only and emit a warning.
++CUDA/HIP runs execute the GPU partition mechanism but remain outside the
++validated backend; they also warn. Mechanism/durability validation covers
++SYCL/Metal; field-level flag-ON evidence remains pending.
++
+ The next set concerns runtime parameters that control particle I/O. Parallel file systems tend not to like it when
+ too many MPI tasks touch the disk at once. Additionally, performance can degrade if all MPI tasks try writing to the
+ same file, or if too many small files are created. In general, the "correct" values of these parameters will depend on the
+diff --git a/Docs/sphinx_documentation/source/RuntimeParameters.rst b/Docs/sphinx_documentation/source/RuntimeParameters.rst
+index 5fab4215d..f982be815 100644
+--- a/Docs/sphinx_documentation/source/RuntimeParameters.rst
++++ b/Docs/sphinx_documentation/source/RuntimeParameters.rst
+@@ -1157,6 +1157,43 @@ Particles
+    When tiling is enabled, this is the default tile size. Note that a big
+    number like 1024000 effectively turns tiling off in that direction.
+
++.. py:data:: particles.redistribute_uniform_tile_leave
++   :type: bool
++   :value: false
++
++   This opt-in mode treats every particle in a tile as leaving during
++   :cpp:`ParticleContainer::Redistribute`, then reconstructs particles at their
++   assigned destinations. It avoids the GPU stay-count device-to-host readback,
++   but increases local packing and buffering from roughly the crossing fraction
++   to 100 percent of particles. In ``D`` dimensions, four ``int`` vectors plus
++   a D-int ``IntVect`` give ``16 + 4*D B`` of ``ParticleCopyOp`` metadata;
++   the destination index adds 4 B, so ``M = 20 + 4*D B`` per moved particle.
++   Source payload,
++   the full send buffer, and metadata produce a ``2*N*S + N*M`` pack peak. The
++   shipping NOMPI Metal build then makes a full ``pinned_snd_buffer`` staging
++   copy; both send buffers stay live while destination tiles grow. Thus
++   ``3*N*S + N*M`` is a conservative capacity-and-lifetime upper bound;
++   allocator reuse and effective buffer capacities can lower the observed
++   high-water mark. With ``N = 1,048,576`` and ``S = 80 B``, the validated 2D
++   build has ``M = 28 B``: upper bounds of 188 MiB at pack and 268 MiB at
++   unpack. The normal estimate is 80 MiB of payload plus
++   ``(1/128)*80 MiB = 0.625 MiB`` of crossings, or 80.625 MiB total. The
++   1M-particle validation measured 152 MiB arena plus 52 MiB pinned, about
++   204 MiB host-visible, so it did not reach the bound. Conservative 3D sizing
++   adds one 8 B real to the payload: ``S = 88 B`` and ``M = 32 B`` give
++   208 MiB at pack and 296 MiB at unpack. The former 160 MiB value was only a
++   payload lower bound. No OOM was observed at 1M; larger cases retain OOM
++   risk.
++
++   Flag-ON drains and re-appends particles, changing in-tile ordering relative
++   to flag-OFF. Use order-insensitive particle identity/destination comparisons
++   and tolerance-based physics observables; bitwise/hash equality is invalid.
++   Enablement aborts with more than one MPI rank because that path is
++   unvalidated. Non-GPU runs exercise host-side semantics only and warn.
++   CUDA/HIP runs execute the GPU partition mechanism but warn because the
++   validated backend is SYCL/Metal. Field-level flag-ON evidence remains
++   pending.
++
+ .. py:data:: particles.do_mem_efficient_sort
+    :type: bool
+    :value: true
+diff --git a/Src/Particle/AMReX_ParticleContainer.H b/Src/Particle/AMReX_ParticleContainer.H
+index bb9cc4870..bcabe674c 100644
+--- a/Src/Particle/AMReX_ParticleContainer.H
++++ b/Src/Particle/AMReX_ParticleContainer.H
+@@ -1551,6 +1551,7 @@ private:
+                            int lev, int gid, int tid,
+                            int lev_min, int lev_max, int nGrow, int local,
+                            bool remove_negative, int myproc,
++                           bool uniform_tile_leave,
+                            Gpu::DeviceVector<int>& boxes,
+                            Gpu::DeviceVector<int>& levels,
+                            Gpu::DeviceVector<int>& tiles,
+diff --git a/Src/Particle/AMReX_ParticleContainerBase.H b/Src/Particle/AMReX_ParticleContainerBase.H
+index 3676ccaf0..1f682a1d7 100644
+--- a/Src/Particle/AMReX_ParticleContainerBase.H
++++ b/Src/Particle/AMReX_ParticleContainerBase.H
+@@ -288,6 +288,12 @@ public:
+     static Long MaxParticlesPerRead ();
+     static const std::string& AggregationType ();
+     static int AggregationBuffer ();
++    /**
++     * Opt-in, default-off full-tile leave mode for particle Redistribute.
++     * This is architecture-neutral so CPU runs can validate Metal-workaround
++     * semantics with the same input flag.
++     */
++    static bool RedistributeUniformTileLeave ();
+
+     static AMREX_EXPORT bool do_tiling;
+     static AMREX_EXPORT IntVect tile_size;
+diff --git a/Src/Particle/AMReX_ParticleContainerBase.cpp b/Src/Particle/AMReX_ParticleContainerBase.cpp
+index 410607cf2..0ed3228a4 100644
+--- a/Src/Particle/AMReX_ParticleContainerBase.cpp
++++ b/Src/Particle/AMReX_ParticleContainerBase.cpp
+@@ -329,6 +329,40 @@ int ParticleContainerBase::AggregationBuffer ()
+     return aggregation_buffer;
+ }
+
++bool ParticleContainerBase::RedistributeUniformTileLeave ()
++{
++    static bool enabled = false;
++    static bool first = true;
++
++    if (first)
++    {
++        first = false;
++        ParmParse pp("particles");
++        pp.query("redistribute_uniform_tile_leave", enabled);
++        if (enabled)
++        {
++            if (ParallelDescriptor::NProcs() != 1) {
++                amrex::Abort(
++                    "particles.redistribute_uniform_tile_leave requires exactly "
++                    "one MPI rank; multi-rank cost and correctness are not validated");
++            }
++#ifndef AMREX_USE_GPU
++            amrex::Warning(
++                "particles.redistribute_uniform_tile_leave on a non-GPU build "
++                "exercises host-side Redistribute semantics only");
++#elif !defined(AMREX_METAL_PORT)
++            amrex::Warning(
++                "particles.redistribute_uniform_tile_leave is executing the GPU "
++                "partition mechanism on an unvalidated backend; the validated "
++                "backend is SYCL/Metal");
++#endif
++            amrex::Print() << "AMReX particle Redistribute uniform-tile-leave: ON\n";
++        }
++    }
++
++    return enabled;
++}
++
+ void ParticleContainerBase::BuildRedistributeMask (int lev, int nghost) const
+ {
+     BL_PROFILE("ParticleContainer::BuildRedistributeMask");
+diff --git a/Src/Particle/AMReX_ParticleContainerI.H b/Src/Particle/AMReX_ParticleContainerI.H
+index 5a10fffc6..04c801d34 100644
+--- a/Src/Particle/AMReX_ParticleContainerI.H
++++ b/Src/Particle/AMReX_ParticleContainerI.H
+@@ -1399,6 +1399,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+                      int lev, int gid, int tid,
+                      int lev_min, int lev_max, int nGrow, int local,
+                      bool remove_negative, int myproc,
++                     bool uniform_tile_leave,
+                      Gpu::DeviceVector<int>& boxes,
+                      Gpu::DeviceVector<int>& levels,
+                      Gpu::DeviceVector<int>& tiles,
+@@ -1421,6 +1422,15 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+                 copyParticle(ptd, ptd, last, pindex);
+                 correctCellVectors(last, pindex, gid, p);
+                 --last;
++            } else if (uniform_tile_leave) {
++                swapParticle(ptd, ptd, last, pindex);
++                correctCellVectors(last, pindex, gid, p);
++                boxes[num_move] = gid;
++                levels[num_move] = lev;
++                tiles[num_move] = tid;
++                src_indices[num_move] = static_cast<int>(last);
++                ++num_move;
++                --last;
+             } else {
+                 ++pindex;
+             }
+@@ -1430,7 +1440,9 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+         // Fast path: if on the finest level, try the last good location first
+         // If not on finest level, we need to do the full locate because even if
+         // the last assignment works, the particle might belong on a finer level.
+-        if (lev == lev_max && pld.m_tile == tid && pld.m_grid == gid && pld.m_lev == lev && who == myproc)  {
++        if (!uniform_tile_leave &&
++            lev == lev_max && pld.m_tile == tid && pld.m_grid == gid &&
++            pld.m_lev == lev && who == myproc) {
+             const auto iv = Index(p, lev);
+             if (pld.m_tilebox.contains(iv)) {
+                 ++pindex;
+@@ -1452,7 +1464,9 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+
+         // flag particle for move if needed
+         who = BufferMap().procID(pld.m_grid, pld.m_tile, pld.m_lev);
+-        if (pld.m_lev != lev || pld.m_grid != gid || pld.m_tile != tid || who != myproc) {
++        if (uniform_tile_leave ||
++            pld.m_lev != lev || pld.m_grid != gid || pld.m_tile != tid ||
++            who != myproc) {
+             // the particle is valid but needs to be sent somewhere else
+             swapParticle(ptd, ptd, last, pindex);
+             correctCellVectors(last, pindex, gid, p);
+@@ -1490,6 +1504,9 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+
+     BL_PROFILE("ParticleContainer::Redistribute_impl()");
+     BL_PROFILE_VAR_NS("Redistribute_partition", blp_partition);
++    // The host path uses the same full-tile-leave semantics for validation.
++    // See partitionParticlesByDest for the packing, peak-memory, and ordering costs.
++    bool const uniform_tile_leave = RedistributeUniformTileLeave();
+
+     int theEffectiveFinestLevel = m_gdb->finestLevel();
+     while (!m_gdb->LevelDefined(theEffectiveFinestLevel)) { theEffectiveFinestLevel--; }
+@@ -1626,6 +1643,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+                                                     lev, gid, tid,
+                                                     lev_min, lev_max, nGrow, local,
+                                                     remove_negative, myproc,
++                                                    uniform_tile_leave,
+                                                     boxes, levels, tiles,
+                                                     src_indices, periodic_shift);
+ #else // GPU algorithm
+@@ -1633,7 +1651,8 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+                                                 std::forward<CellAssignor>(CellAssignor{}),
+                                                 BufferMap(),
+                                                 plo, phi, rlo, rhi, is_per, lev, gid, tid,
+-                                                lev_min, lev_max, nGrow, remove_negative);
++                                                lev_min, lev_max, nGrow, remove_negative,
++                                                uniform_tile_leave);
+
+         int num_move = np - num_stay;
+         *new_size_ptrs[pmap_it] = num_stay;
+@@ -1653,9 +1672,18 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+
+             if (!p.id().is_valid())
+             {
+-                p_boxes[i] = -1;
+-                p_tiles[i] = -1;
+-                p_levs[i]  = -1;
++                if (uniform_tile_leave && !remove_negative)
++                {
++                    p_boxes[i] = gid;
++                    p_tiles[i] = tid;
++                    p_levs[i]  = lev;
++                }
++                else
++                {
++                    p_boxes[i] = -1;
++                    p_tiles[i] = -1;
++                    p_levs[i]  = -1;
++                }
+             }
+             else
+             {
+@@ -1695,6 +1723,7 @@ ParticleContainer_impl<ParticleType, NArrayReal, NArrayInt, Allocator, CellAssig
+                                          lev, gid, tid,
+                                          lev_min, lev_max, nGrow, local,
+                                          remove_negative, myproc,
++                                         uniform_tile_leave,
+                                          boxes, levels, tiles,
+                                          src_indices, periodic_shift);
+         }
+diff --git a/Src/Particle/AMReX_ParticleUtil.H b/Src/Particle/AMReX_ParticleUtil.H
+index 95c2d0b06..844aa6b06 100644
+--- a/Src/Particle/AMReX_ParticleUtil.H
++++ b/Src/Particle/AMReX_ParticleUtil.H
+@@ -653,7 +653,8 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
+                           const GpuArray<ParticleReal,AMREX_SPACEDIM>& rhi,
+                           const GpuArray<int ,AMREX_SPACEDIM>& is_per,
+                           int lev, int gid, int tid,
+-                          int lev_min, int lev_max, int nGrow, bool remove_negative)
++                          int lev_min, int lev_max, int nGrow, bool remove_negative,
++                          bool uniform_tile_leave)
+ {
+     auto getPID = pmap.getPIDFunctor();
+     int pid = ParallelContext::MyProcSub();
+@@ -711,6 +712,72 @@ partitionParticlesByDest (PTile& ptile, const PLocator& ploc, CellAssignor const
+             p_particle_stays[i] = stays;
+         });
+
++    if (uniform_tile_leave)
++    {
++        /*
++         * Uniform full-tile leave on Metal retains the normal
++         * normalize/locate/fallback kernel and its data-dependent stay store,
++         * but makes the relocation shape uniform by treating the whole tile
++         * as leavers. Normal
++         * Redistribute packs roughly f_crossing*N particles; this packs N, so
++         * the volume rises from the crossing fraction to 100% (a
++         * 1/f_crossing multiplier, measured as 128x for 8192/1048576
++         * crossings). The benefit is eliminating the device-to-host
++         * stay-count reduction/readback. The reference micro-harness measured
++         * 39 ms/iteration versus 56 ms for mixed leave/stay at 1M particles
++         * and 64 boxes. The production SYCL/Metal path subsequently completed
++         * a 2000-iteration flag-ON soak and three short WarpX runs; field-level
++         * flag-ON parity remains unvalidated.
++         *
++         * Peak memory follows the Redistribute_impl allocation lifetime. Let
++         * N be the source-particle count and S the packed bytes per particle.
++         * The GPU arm allocates four DeviceVector<int> fields plus one
++         * DeviceVector<IntVect> in ParticleCopyOp: 16 + 4*D B in D
++         * dimensions. ParticleCopyPlan::m_dst_indices adds 4 B, so
++         * M = 20 + 4*D B of move-scaled metadata per particle (28 B in 2D,
++         * 32 B in 3D).
++         *
++         * At packBuffer, source tiles N*S, snd_buffer N*S, and metadata N*M
++         * coexist: 2*N*S + N*M. On the shipping NOMPI Metal configuration,
++         * UseGpuAwareMpi() is false and The_Arena() is not pinned, so the
++         * pinned_snd_buffer branch makes another full N*S staging copy.
++         * snd_buffer and pinned_snd_buffer remain live while unpackBuffer
++         * grows destination tiles to N*S. Thus 3*N*S + N*M is a conservative
++         * capacity-and-lifetime upper bound, excluding allocator/reallocation
++         * overhead; allocator reuse and effective buffer capacities can lower
++         * the observed high-water mark.
++         *
++         * In the validated double-precision hybrid deck, S = 8 B idcpu +
++         * 7*8 B reals + 4*4 B ints = 80 B. At N = 1,048,576, N*S =
++         * 83,886,080 B = 80 MiB. The validated 2D build has M = 28 B,
++         * N*M = 28 MiB, a 188 MiB pack upper bound, and a 268 MiB unpack
++         * upper bound (about 3.3x the normal estimate:
++         * 80 MiB payload + (1/128)*80 MiB crossings = 80.625 MiB).
++         * The 1M-particle validation measured 152 MiB arena plus 52 MiB
++         * pinned, about 204 MiB host-visible, so it did not reach that bound.
++         * Conservative 3D sizing adds one 8 B real to the payload: S = 88 B
++         * and M = 32 B give 208 MiB at pack and 296 MiB at unpack. The former
++         * 160 MiB figure was only the 2*N*S payload lower bound. No OOM was
++         * observed at 1M; that does not guarantee larger configurations.
++         *
++         * Multi-rank/MPI cost is unmeasured and may invert this trade: all
++         * local particles are packed and buffered, while remote wire volume
++         * remains destination-dependent. Runtime enablement therefore aborts
++         * when more than one MPI rank is present.
++         *
++         * Full leave/reappend also changes in-tile ordering relative to the
++         * mixed path. Flag-ON is bitwise/hash divergent from flag-OFF by
++         * construction; compare order-insensitive particle identity and
++         * destination plus tolerance-based physics observables instead.
++         *
++         * With zero stayers, the existing order is already a valid all-leaver
++         * partition. Calling partitionParticles(ptile, 0, ...) is a proven
++         * no-op (max_num_swaps = min(0, N) = 0) but still instantiates device
++         * kernels in the flag-OFF metallib, so return the invariant directly.
++         */
++        return 0;
++    }
++
+     return partitionParticles(ptile,
+         [=] AMREX_GPU_DEVICE (auto& /* ptd */, int i) -> bool {
+             return p_particle_stays[i];
+diff --git a/Tests/Particles/RedistributeSOA/main.cpp b/Tests/Particles/RedistributeSOA/main.cpp
+index b28c6f904..d7cdc88a7 100644
+--- a/Tests/Particles/RedistributeSOA/main.cpp
++++ b/Tests/Particles/RedistributeSOA/main.cpp
+@@ -3,6 +3,16 @@
+ #include <AMReX_MultiFab.H>
+ #include <AMReX_Particles.H>
+
++#include <algorithm>
++#include <array>
++#include <fstream>
++#include <iomanip>
++#include <limits>
++#include <sstream>
++#include <string>
++#include <tuple>
++#include <vector>
++
+ using namespace amrex;
+
+ static constexpr int NR = 7;
+@@ -304,6 +314,70 @@ public:
+             }
+         }
+     }
++
++    void writeSnapshot (const std::string& filename) const
++    {
++        using Position = std::array<ParticleReal, AMREX_SPACEDIM>;
++        using Record = std::tuple<Long, int, int, int, int, int, Position>;
++        std::vector<Record> records;
++        records.reserve(static_cast<std::size_t>(
++            TotalNumberOfParticles(false, true)));
++
++        for (int lev = 0; lev <= finestLevel(); ++lev)
++        {
++            const auto& plev = GetParticles(lev);
++            for (MFIter mfi = MakeMFIter(lev); mfi.isValid(); ++mfi)
++            {
++                const int gid = mfi.index();
++                const int tid = mfi.LocalTileIndex();
++                const auto particle_tile = plev.find(std::make_pair(gid, tid));
++                if (particle_tile == plev.end()) {
++                    continue;
++                }
++                const auto& ptile = particle_tile->second;
++                const auto& ptd = ptile.getConstParticleTileData();
++                const auto np = ptile.numParticles();
++
++                for (int i = 0; i < np; ++i)
++                {
++                    ConstParticleType p(ptd, i);
++                    Position pos{};
++                    for (int d = 0; d < AMREX_SPACEDIM; ++d) {
++                        pos[d] = p.pos(d);
++                    }
++                    records.emplace_back(
++                        p.id(), p.cpu(), ParallelDescriptor::MyProc(),
++                        lev, gid, tid, pos);
++                }
++            }
++        }
++
++        std::sort(records.begin(), records.end(),
++            [] (const Record& lhs, const Record& rhs) {
++                return std::tie(std::get<0>(lhs), std::get<1>(lhs)) <
++                       std::tie(std::get<0>(rhs), std::get<1>(rhs));
++            });
++
++        std::ostringstream ranked_filename;
++        ranked_filename << filename << ".rank"
++                        << std::setfill('0') << std::setw(6)
++                        << ParallelDescriptor::MyProc();
++        std::ofstream snapshot(
++            ranked_filename.str(), std::ios::out | std::ios::trunc);
++        AMREX_ALWAYS_ASSERT(snapshot.good());
++        snapshot << "count " << records.size() << '\n';
++        snapshot << std::setprecision(std::numeric_limits<ParticleReal>::max_digits10);
++        for (const auto& [id, cpu, rank, lev, gid, tid, pos] : records)
++        {
++            snapshot << id << ' ' << cpu << ' ' << rank << ' '
++                     << lev << ' ' << gid << ' ' << tid;
++            for (int d = 0; d < AMREX_SPACEDIM; ++d) {
++                snapshot << ' ' << pos[d];
++            }
++            snapshot << '\n';
++        }
++        AMREX_ALWAYS_ASSERT(snapshot.good());
++    }
+ };
+
+ struct TestParams
+@@ -319,6 +393,8 @@ struct TestParams
+     int do_regrid;
+     int sort;
+     int test_level_lost = 0;
++    int invalid_probe = 0;
++    std::string snapshot_prefix;
+ };
+
+ void testRedistribute();
+@@ -327,6 +403,24 @@ int main (int argc, char* argv[])
+ {
+     amrex::Initialize(argc,argv);
+
++    ParmParse validation_pp("validation");
++    int only_assert_uniform_tile_leave_omitted = 0;
++    validation_pp.query(
++        "only_assert_uniform_tile_leave_omitted",
++        only_assert_uniform_tile_leave_omitted);
++    if (only_assert_uniform_tile_leave_omitted != 0)
++    {
++        ParmParse particles_pp("particles");
++        if (particles_pp.contains("redistribute_uniform_tile_leave")) {
++            amrex::Abort(
++                "particles.redistribute_uniform_tile_leave is not omitted");
++        }
++        amrex::Print()
++            << "AMReX semantic uniform-tile-leave omission probe: PASS\n";
++        amrex::Finalize();
++        return 0;
++    }
++
+     amrex::Print() << "Running redistribute test \n";
+     testRedistribute();
+
+@@ -349,6 +443,8 @@ void get_test_params(TestParams& params, const std::string& prefix)
+     pp.query("num_runtime_real", num_runtime_real);
+     pp.query("num_runtime_int", num_runtime_int);
+     pp.query("remove_negative", remove_negative);
++    pp.query("invalid_probe", params.invalid_probe);
++    pp.query("snapshot_prefix", params.snapshot_prefix);
+
+     params.sort = 0;
+     pp.query("sort", params.sort);
+@@ -411,8 +507,12 @@ void testRedistribute ()
+     pc.InitParticles(nppc);
+
+     pc.checkAnswer();
++    if (!params.snapshot_prefix.empty()) {
++        pc.writeSnapshot(params.snapshot_prefix + ".initial");
++    }
+
+     auto np_old = pc.TotalNumberOfParticles();
++    auto np_expected = np_old;
+
+     if (params.sort) { pc.SortParticlesByCell(); }
+
+@@ -430,6 +530,10 @@ void testRedistribute ()
+         pc.RedistributeLocal();
+         if (params.sort) { pc.SortParticlesByCell(); }
+         pc.checkAnswer();
++        if (!params.snapshot_prefix.empty()) {
++            pc.writeSnapshot(
++                params.snapshot_prefix + ".step" + std::to_string(i+1));
++        }
+     }
+
+     if (params.do_regrid)
+@@ -488,6 +592,9 @@ void testRedistribute ()
+             amrex::Print() << pc.TotalNumberOfParticles() << "\n";
+             AMREX_ALWAYS_ASSERT(np_before_level_lost == pc.TotalNumberOfParticles());
+         }
++        if (!params.snapshot_prefix.empty()) {
++            pc.writeSnapshot(params.snapshot_prefix + ".global");
++        }
+     }
+
+     if (geom[0].isAllPeriodic()) {
+@@ -495,6 +602,38 @@ void testRedistribute ()
+         AMREX_ALWAYS_ASSERT(np_old == pc.TotalNumberOfParticles());
+     }
+
+-    // the way this test is set up, if we make it here we pass
++    if (params.invalid_probe != 0)
++    {
++        AMREX_ALWAYS_ASSERT(params.invalid_probe >= 1 &&
++                            params.invalid_probe <= 4);
++        const bool use_global = params.invalid_probe >= 3;
++        const bool remove_invalid = (params.invalid_probe % 2) == 0;
++        const auto np_before_invalid = pc.TotalNumberOfParticles();
++        pc.negateEven();
++        if (use_global) {
++            pc.RedistributeGlobal(remove_invalid);
++        } else {
++            pc.RedistributeLocal(remove_invalid);
++        }
++        if (!params.snapshot_prefix.empty()) {
++            pc.writeSnapshot(params.snapshot_prefix + ".invalid");
++        }
++        if (remove_invalid) {
++            np_expected = (np_before_invalid + 1) / 2;
++            AMREX_ALWAYS_ASSERT(
++                pc.TotalNumberOfParticles() == np_expected);
++            pc.checkAnswer();
++        } else {
++            AMREX_ALWAYS_ASSERT(
++                pc.TotalNumberOfParticles(false) == np_before_invalid);
++            pc.negateEven();
++            pc.checkAnswer();
++        }
++    }
++
++    if (geom[0].isAllPeriodic()) {
++        AMREX_ALWAYS_ASSERT(
++            pc.TotalNumberOfParticles() == np_expected);
++    }
+     amrex::Print() << "pass \n";
+ }
+diff --git a/Tests/Particles/RedistributeSOA/validate_uniform_tile_leave.py b/Tests/Particles/RedistributeSOA/validate_uniform_tile_leave.py
+new file mode 100755
+index 000000000..3cfba46bb
+--- /dev/null
++++ b/Tests/Particles/RedistributeSOA/validate_uniform_tile_leave.py
+@@ -0,0 +1,1150 @@
++#!/usr/bin/env python3
++"""CPU regression harness for particles.redistribute_uniform_tile_leave.
++
++The matrix compares binaries built from clean baseline and feature checkouts in
++omitted, explicit-OFF, and ON modes. The external build manifest binds both
++commits, source trees, configured build directories, and binary hashes. The
++matrix covers local/global, single/multi-box, tiled, retained/removed invalid
++IDs, and two MPI ranks. Flag-ON runs only with one rank; a separate two-rank
++case proves the runtime guard rejects enablement. The WarpX check compares
++per-step field-content hashes for baseline, omitted, and OFF. CPU builds do not
++instantiate the GPU partition mechanism. Only Python's standard library is
++required.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++from typing import Any
++
++
++ACTIVATION_MARKER = "AMReX particle Redistribute uniform-tile-leave: ON"
++MPI_GUARD_MESSAGE = (
++    "particles.redistribute_uniform_tile_leave requires exactly one MPI rank"
++)
++CPU_WARNING_MESSAGE = (
++    "particles.redistribute_uniform_tile_leave on a non-GPU build "
++    "exercises host-side Redistribute semantics only"
++)
++Record = tuple[int, int, int, int, int, int, tuple[str, ...]]
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for block in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def git_output(repo: Path, *arguments: str) -> bytes:
++    return subprocess.check_output(
++        ["git", "-C", str(repo), *arguments],
++        stdin=subprocess.DEVNULL,
++    )
++
++
++def run_checked(
++    command: list[str],
++    cwd: Path,
++    *,
++    marker_expected: bool,
++    poison_default_init: bool,
++    timeout_seconds: int,
++    warning_expected: bool = False,
++) -> str:
++    env = dict(os.environ)
++    if poison_default_init:
++        env["AMREX_DEFAULT_INIT"] = (
++            "particles.redistribute_uniform_tile_leave=1"
++        )
++    env.pop("AMREX_DEFAULT_INIT", None)
++    env["OMP_NUM_THREADS"] = "1"
++    env["OMPI_MCA_rmaps_base_oversubscribe"] = "1"
++    stdout_path = cwd / "stdout.log"
++    stderr_path = cwd / "stderr.log"
++    try:
++        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
++            result = subprocess.run(
++                command,
++                cwd=cwd,
++                env=env,
++                stdin=subprocess.DEVNULL,
++                stdout=stdout,
++                stderr=stderr,
++                check=False,
++                timeout=timeout_seconds,
++            )
++    except subprocess.TimeoutExpired as exc:
++        raise RuntimeError(
++            f"command timed out after {timeout_seconds}s: {' '.join(command)}; "
++            f"see {stdout_path} and {stderr_path}"
++        ) from exc
++    if result.returncode != 0:
++        raise RuntimeError(
++            f"command failed with rc={result.returncode}: {' '.join(command)}; "
++            f"see {stdout_path} and {stderr_path}"
++        )
++
++    stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
++    stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
++    combined_output = stdout_text + stderr_text
++    marker_seen = ACTIVATION_MARKER in combined_output
++    if marker_seen != marker_expected:
++        raise AssertionError(
++            f"activation marker expected={marker_expected}, seen={marker_seen}: "
++            f"{stdout_path}"
++        )
++    warning_seen = CPU_WARNING_MESSAGE in combined_output
++    if warning_seen != warning_expected:
++        raise AssertionError(
++            f"host warning expected={warning_expected}, seen={warning_seen}: "
++            f"{stdout_path} and {stderr_path}"
++        )
++    return stdout_text
++
++
++def vector(value: int, dimension: int) -> str:
++    return " ".join([str(value)] * dimension)
++
++
++def intvect(value: int, dimension: int) -> str:
++    return "(" + ", ".join([str(value)] * dimension) + ")"
++
++
++def write_redistribute_input(
++    path: Path,
++    *,
++    dimension: int,
++    max_grid_size: int,
++    levels: int,
++    do_regrid: bool,
++    tiling: bool,
++    invalid_probe: int,
++    flag: bool | None,
++) -> None:
++    lines = [
++        f"redistribute.size = {intvect(16, dimension)}",
++        f"redistribute.max_grid_size = {max_grid_size}",
++        "redistribute.is_periodic = 1",
++        "redistribute.num_ppc = 1",
++        f"redistribute.move_dir = {intvect(1, dimension)}",
++        "redistribute.do_random = 0",
++        "redistribute.nsteps = 3",
++        f"redistribute.nlevs = {levels}",
++        f"redistribute.do_regrid = {1 if do_regrid else 0}",
++        "redistribute.num_runtime_real = 0",
++        "redistribute.num_runtime_int = 0",
++        "redistribute.sort = 0",
++        "redistribute.remove_negative = 1",
++        f"redistribute.invalid_probe = {invalid_probe}",
++        "redistribute.snapshot_prefix = particles",
++        f"particles.do_tiling = {1 if tiling else 0}",
++        f"particles.tile_size = {vector(2, dimension)}",
++        "amrex.use_gpu_aware_mpi = 0",
++    ]
++    if flag is not None:
++        lines.append(
++            "particles.redistribute_uniform_tile_leave = "
++            f"{1 if flag else 0}"
++        )
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++def parse_snapshot_group(
++    prefix: Path, dimension: int, expected_ranks: int
++) -> dict[str, Any]:
++    files = sorted(prefix.parent.glob(prefix.name + ".rank*"))
++    expected_files = [
++        prefix.parent / f"{prefix.name}.rank{rank:06d}"
++        for rank in range(expected_ranks)
++    ]
++    if files != expected_files:
++        raise RuntimeError(
++            f"ranked snapshot set mismatch for {prefix}: "
++            f"found={[path.name for path in files]}, "
++            f"expected={[path.name for path in expected_files]}"
++        )
++
++    records: list[Record] = []
++    declared_total = 0
++    for path in files:
++        writer_rank = int(path.name.rsplit(".rank", maxsplit=1)[1])
++        lines = path.read_text(encoding="utf-8").splitlines()
++        if not lines or not lines[0].startswith("count "):
++            raise RuntimeError(f"invalid snapshot header: {path}")
++        declared = int(lines[0].split()[1])
++        declared_total += declared
++        if declared != len(lines) - 1:
++            raise RuntimeError(
++                f"snapshot count mismatch in {path}: declared={declared}, "
++                f"records={len(lines)-1}"
++            )
++        for line in lines[1:]:
++            fields = line.split()
++            if len(fields) != 6 + dimension:
++                raise RuntimeError(
++                    f"snapshot dimensionality mismatch in {path}: {line}"
++                )
++            record: Record = (
++                int(fields[0]),
++                int(fields[1]),
++                int(fields[2]),
++                int(fields[3]),
++                int(fields[4]),
++                int(fields[5]),
++                tuple(fields[6:]),
++            )
++            if record[2] != writer_rank:
++                raise RuntimeError(
++                    f"record writer rank mismatch in {path}: {record}"
++                )
++            records.append(record)
++
++    records.sort(key=lambda record: (abs(record[0]), record[1]))
++    if declared_total != len(records):
++        raise RuntimeError(
++            f"gathered snapshot count mismatch for {prefix}: "
++            f"declared={declared_total}, records={len(records)}"
++        )
++    identities = [(abs(record[0]), record[1]) for record in records]
++    if len(set(identities)) != len(identities):
++        raise RuntimeError(f"duplicate absolute particle ID/CPU pair: {prefix}")
++
++    digest = hashlib.sha256()
++    for record in records:
++        digest.update(repr(record).encode("utf-8"))
++        digest.update(b"\n")
++    return {
++        "count": len(records),
++        "records": records,
++        "snapshot_sha256": digest.hexdigest(),
++        "rank_files": [path.name for path in files],
++    }
++
++
++def collect_snapshots(
++    case_dir: Path, dimension: int, expected_ranks: int
++) -> dict[str, dict[str, Any]]:
++    prefixes = {
++        re.sub(r"\.rank\d+$", "", path.name)
++        for path in case_dir.glob("particles.*.rank*")
++    }
++    return {
++        prefix.removeprefix("particles."): parse_snapshot_group(
++            case_dir / prefix, dimension, expected_ranks
++        )
++        for prefix in sorted(prefixes)
++    }
++
++
++def run_redistribute_case(
++    *,
++    executable: Path,
++    mpi_exec: Path,
++    case_dir: Path,
++    dimension: int,
++    max_grid_size: int,
++    levels: int,
++    do_regrid: bool,
++    tiling: bool,
++    invalid_probe: int,
++    ranks: int,
++    flag: bool | None,
++    marker_expected: bool,
++    warning_expected: bool,
++    poison_default_init: bool,
++    timeout_seconds: int,
++) -> dict[str, Any]:
++    case_dir.mkdir(parents=True, exist_ok=False)
++    input_path = case_dir / "inputs"
++    write_redistribute_input(
++        input_path,
++        dimension=dimension,
++        max_grid_size=max_grid_size,
++        levels=levels,
++        do_regrid=do_regrid,
++        tiling=tiling,
++        invalid_probe=invalid_probe,
++        flag=flag,
++    )
++    command = [str(executable), str(input_path)]
++    if ranks > 1:
++        command = [str(mpi_exec), "-n", str(ranks), *command]
++    run_checked(
++        command,
++        case_dir,
++        marker_expected=marker_expected,
++        poison_default_init=poison_default_init,
++        timeout_seconds=timeout_seconds,
++        warning_expected=warning_expected,
++    )
++    snapshots = collect_snapshots(case_dir, dimension, ranks)
++    expected_tags = {"initial", "step1", "step2", "step3"}
++    if do_regrid:
++        expected_tags.add("global")
++    if invalid_probe:
++        expected_tags.add("invalid")
++    if set(snapshots) != expected_tags:
++        raise AssertionError(
++            f"{case_dir.name}: snapshots={sorted(snapshots)}, "
++            f"expected={sorted(expected_tags)}"
++        )
++    if any(snapshot["count"] <= 0 for snapshot in snapshots.values()):
++        raise AssertionError(f"{case_dir.name}: empty particle snapshot")
++    return {
++        "snapshots": snapshots,
++        "command": command,
++    }
++
++
++def run_mpi_guard_case(
++    *,
++    executable: Path,
++    mpi_exec: Path,
++    case_dir: Path,
++    dimension: int,
++    timeout_seconds: int,
++) -> dict[str, Any]:
++    case_dir.mkdir(parents=True, exist_ok=False)
++    input_path = case_dir / "inputs"
++    write_redistribute_input(
++        input_path,
++        dimension=dimension,
++        max_grid_size=4,
++        levels=1,
++        do_regrid=False,
++        tiling=True,
++        invalid_probe=0,
++        flag=True,
++    )
++    command = [str(mpi_exec), "-n", "2", str(executable), str(input_path)]
++    env = dict(os.environ)
++    env.pop("AMREX_DEFAULT_INIT", None)
++    env["OMP_NUM_THREADS"] = "1"
++    env["OMPI_MCA_rmaps_base_oversubscribe"] = "1"
++    stdout_path = case_dir / "stdout.log"
++    stderr_path = case_dir / "stderr.log"
++    try:
++        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
++            result = subprocess.run(
++                command,
++                cwd=case_dir,
++                env=env,
++                stdin=subprocess.DEVNULL,
++                stdout=stdout,
++                stderr=stderr,
++                check=False,
++                timeout=timeout_seconds,
++            )
++    except subprocess.TimeoutExpired as exc:
++        raise RuntimeError(
++            f"MPI guard probe timed out after {timeout_seconds}s: "
++            f"{' '.join(command)}"
++        ) from exc
++
++    output = (
++        stdout_path.read_text(encoding="utf-8", errors="replace")
++        + stderr_path.read_text(encoding="utf-8", errors="replace")
++    )
++    if result.returncode == 0:
++        raise AssertionError("MPI guard probe unexpectedly succeeded")
++    if MPI_GUARD_MESSAGE not in output:
++        raise AssertionError(
++            f"MPI guard message missing; see {stdout_path} and {stderr_path}"
++        )
++    if ACTIVATION_MARKER in output:
++        raise AssertionError("activation marker printed before MPI guard abort")
++    return {
++        "command": command,
++        "returncode": result.returncode,
++        "message": MPI_GUARD_MESSAGE,
++    }
++
++
++def public_run_summary(run: dict[str, Any]) -> dict[str, Any]:
++    return {
++        "command": run["command"],
++        "snapshots": {
++            name: {
++                "count": snapshot["count"],
++                "sha256": snapshot["snapshot_sha256"],
++                "rank_files": snapshot["rank_files"],
++            }
++            for name, snapshot in run["snapshots"].items()
++        },
++    }
++
++
++def compare_runs(name: str, runs: dict[str, dict[str, Any]]) -> None:
++    reference = runs["baseline"]["snapshots"]
++    for mode in ("patched_default", "patched_off", "patched_on"):
++        if mode not in runs:
++            continue
++        candidate = runs[mode]["snapshots"]
++        if set(candidate) != set(reference):
++            raise AssertionError(f"{name}/{mode}: snapshot tag mismatch")
++        for tag in reference:
++            if candidate[tag]["records"] != reference[tag]["records"]:
++                raise AssertionError(
++                    f"{name}/{mode}: particle state differs at {tag}"
++                )
++
++
++def destination_classes(run: dict[str, Any]) -> dict[str, int]:
++    initial = {
++        (abs(record[0]), record[1]): record
++        for record in run["snapshots"]["initial"]["records"]
++    }
++    step1 = {
++        (abs(record[0]), record[1]): record
++        for record in run["snapshots"]["step1"]["records"]
++    }
++    stays = 0
++    crosses = 0
++    for identity, before in initial.items():
++        after = step1[identity]
++        before_destination = before[2:6]
++        after_destination = after[2:6]
++        if before_destination == after_destination:
++            stays += 1
++        else:
++            crosses += 1
++    return {"natural_stayers": stays, "natural_crossers": crosses}
++
++
++def validate_invalid_pair(
++    label: str,
++    keep: dict[str, dict[str, Any]],
++    remove: dict[str, dict[str, Any]],
++) -> dict[str, Any]:
++    result: dict[str, Any] = {}
++    for mode in ("baseline", "patched_default", "patched_off", "patched_on"):
++        if mode not in keep or mode not in remove:
++            continue
++        kept = keep[mode]["snapshots"]["invalid"]["records"]
++        removed = remove[mode]["snapshots"]["invalid"]["records"]
++        retained_positive = [record for record in kept if record[0] > 0]
++        negative_count = sum(record[0] < 0 for record in kept)
++        if retained_positive != removed:
++            raise AssertionError(
++                f"{label}/{mode}: remove=true did not remove exactly invalid IDs"
++            )
++        if negative_count <= 0:
++            raise AssertionError(f"{label}/{mode}: keep=false retained no invalid IDs")
++        result[mode] = {
++            "before_count": len(kept),
++            "retained_invalid_count": negative_count,
++            "after_remove_count": len(removed),
++            "exact_removed_id_set": True,
++        }
++    return result
++
++
++def set_input_parameter(text: str, key: str, value: str) -> str:
++    pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
++    replacement = f"{key} = {value}"
++    if pattern.search(text):
++        return pattern.sub(replacement, text, count=1)
++    return text.rstrip() + "\n" + replacement + "\n"
++
++
++def remove_input_parameter(text: str, key: str) -> str:
++    pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*(?:\n|$)")
++    return pattern.sub("", text)
++
++
++def write_warpx_input(source: Path, destination: Path, *, flag: bool | None) -> None:
++    text = source.read_text(encoding="utf-8")
++    flag_key = "particles.redistribute_uniform_tile_leave"
++    text = remove_input_parameter(text, flag_key)
++    overrides = {
++        "max_step": "3",
++        "amr.n_cell": "32 32",
++        "amr.max_grid_size": "16",
++        "amr.blocking_factor": "8",
++        "electrons.num_particles_per_cell_each_dim": "1 1",
++        "diag1.intervals": "1",
++        "diag1.format": "plotfile",
++        "warpx.random_seed": "42",
++        "warpx.serialize_initial_conditions": "1",
++    }
++    for key, value in overrides.items():
++        text = set_input_parameter(text, key, value)
++    if flag is not None:
++        text = set_input_parameter(
++            text,
++            flag_key,
++            "1" if flag else "0",
++        )
++    destination.write_text(text, encoding="utf-8")
++
++
++def run_semantic_omission_probe(
++    *,
++    executable: Path,
++    input_path: Path,
++    case_dir: Path,
++    timeout_seconds: int,
++) -> None:
++    case_dir.mkdir(parents=True, exist_ok=False)
++    stdout = run_checked(
++        [
++            str(executable),
++            str(input_path),
++            "validation.only_assert_uniform_tile_leave_omitted=1",
++        ],
++        case_dir,
++        marker_expected=False,
++        poison_default_init=False,
++        timeout_seconds=timeout_seconds,
++    )
++    marker = "AMReX semantic uniform-tile-leave omission probe: PASS"
++    if marker not in stdout:
++        raise AssertionError(f"semantic omission marker missing: {case_dir}")
++
++
++def run_expected_semantic_probe_failure(
++    *,
++    executable: Path,
++    input_path: Path,
++    case_dir: Path,
++    timeout_seconds: int,
++) -> None:
++    env = dict(os.environ)
++    env.pop("AMREX_DEFAULT_INIT", None)
++    env["OMP_NUM_THREADS"] = "1"
++    case_dir.mkdir(parents=True, exist_ok=False)
++    with (case_dir / "stdout.log").open("wb") as stdout, (
++        case_dir / "stderr.log"
++    ).open("wb") as stderr:
++        try:
++            result = subprocess.run(
++                [
++                    str(executable),
++                    str(input_path),
++                    "validation.only_assert_uniform_tile_leave_omitted=1",
++                ],
++                cwd=case_dir,
++                env=env,
++                stdin=subprocess.DEVNULL,
++                stdout=stdout,
++                stderr=stderr,
++                check=False,
++                timeout=timeout_seconds,
++            )
++        except subprocess.TimeoutExpired as exc:
++            raise RuntimeError(
++                f"semantic negative probe timed out: {case_dir}"
++            ) from exc
++    if result.returncode == 0:
++        raise AssertionError(
++            f"semantic negative probe false-greened: {case_dir}"
++        )
++    combined_output = (
++        (case_dir / "stdout.log").read_text(encoding="utf-8", errors="replace")
++        + (case_dir / "stderr.log").read_text(
++            encoding="utf-8", errors="replace"
++        )
++    )
++    expected = "particles.redistribute_uniform_tile_leave is not omitted"
++    if expected not in combined_output:
++        raise AssertionError(
++            f"semantic negative probe failed for the wrong reason: {case_dir}"
++        )
++
++
++def run_semantic_omission_negative_probes(
++    *,
++    executable: Path,
++    root: Path,
++    timeout_seconds: int,
++) -> None:
++    root.mkdir(parents=True, exist_ok=False)
++    probes = {
++        "commented_table": (
++            "[particles] # trailing comment\n"
++            "redistribute_uniform_tile_leave = 0\n"
++        ),
++        "same_line_definition": (
++            "max_step = 3 "
++            "particles.redistribute_uniform_tile_leave = 0\n"
++        ),
++    }
++    for name, content in probes.items():
++        probe_dir = root / name
++        input_path = root / f"{name}.inputs"
++        input_path.write_text(content, encoding="utf-8")
++        run_expected_semantic_probe_failure(
++            executable=executable,
++            input_path=input_path,
++            case_dir=probe_dir,
++            timeout_seconds=timeout_seconds,
++        )
++
++    include_dir = root / "continued_include"
++    included_path = root / "included.inputs"
++    included_path.write_text(
++        "particles.redistribute_uniform_tile_leave = 0\n",
++        encoding="utf-8",
++    )
++    include_input = root / "continued_include.inputs"
++    include_input.write_text(
++        f'FILE \\\n= "{included_path}"\n',
++        encoding="utf-8",
++    )
++    run_expected_semantic_probe_failure(
++        executable=executable,
++        input_path=include_input,
++        case_dir=include_dir,
++        timeout_seconds=timeout_seconds,
++    )
++
++
++def find_plotfiles(run_dir: Path) -> dict[int, Path]:
++    result: dict[int, Path] = {}
++    for header in run_dir.rglob("Header"):
++        plotfile = header.parent
++        if not any(plotfile.glob("Level_*/Cell_H")):
++            continue
++        match = re.search(r"(\d{6})$", plotfile.name)
++        if match:
++            step = int(match.group(1))
++            if step in (1, 2, 3):
++                if step in result:
++                    raise RuntimeError(
++                        f"multiple plotfiles for step {step} in {run_dir}"
++                    )
++                result[step] = plotfile
++    if set(result) != {1, 2, 3}:
++        raise RuntimeError(
++            f"expected plotfiles for steps 1-3 in {run_dir}, found {result}"
++        )
++    return result
++
++
++def field_content_hash(plotfile: Path) -> tuple[str, list[str]]:
++    files = [plotfile / "Header"]
++    files.extend(
++        path for path in plotfile.glob("Level_*/Cell_*") if path.is_file()
++    )
++    files = sorted(files)
++    if len(files) < 3:
++        raise RuntimeError(f"incomplete plotfile field payload: {plotfile}")
++
++    digest = hashlib.sha256()
++    relative_files: list[str] = []
++    for path in files:
++        relative = path.relative_to(plotfile).as_posix()
++        relative_files.append(relative)
++        digest.update(relative.encode("utf-8"))
++        digest.update(b"\0")
++        with path.open("rb") as stream:
++            for block in iter(lambda: stream.read(1024 * 1024), b""):
++                digest.update(block)
++    return digest.hexdigest(), relative_files
++
++
++def run_warpx_case(
++    *,
++    executable: Path,
++    omission_probe_executable: Path,
++    source_input: Path,
++    case_dir: Path,
++    flag: bool | None,
++    timeout_seconds: int,
++) -> dict[str, Any]:
++    case_dir.mkdir(parents=True, exist_ok=False)
++    input_path = case_dir / "inputs"
++    write_warpx_input(source_input, input_path, flag=flag)
++    if flag is None:
++        run_semantic_omission_probe(
++            executable=omission_probe_executable,
++            input_path=input_path,
++            case_dir=case_dir / "semantic-omission-probe",
++            timeout_seconds=timeout_seconds,
++        )
++    run_checked(
++        [str(executable), str(input_path)],
++        case_dir,
++        marker_expected=False,
++        poison_default_init=False,
++        timeout_seconds=timeout_seconds,
++    )
++    plotfiles = find_plotfiles(case_dir)
++    return {
++        "semantic_omission_proven": flag is None,
++        "steps": {
++            str(step): {
++                "plotfile": str(plotfile),
++                "field_content_sha256": field_content_hash(plotfile)[0],
++                "hashed_files": field_content_hash(plotfile)[1],
++            }
++            for step, plotfile in sorted(plotfiles.items())
++        }
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--baseline-redistribute", type=Path, required=True)
++    parser.add_argument("--patched-redistribute", type=Path, required=True)
++    parser.add_argument("--baseline-warpx", type=Path, required=True)
++    parser.add_argument("--patched-warpx", type=Path, required=True)
++    parser.add_argument("--warpx-input", type=Path, required=True)
++    parser.add_argument("--mpi-exec", type=Path, required=True)
++    parser.add_argument("--baseline-source", type=Path, required=True)
++    parser.add_argument("--patched-source", type=Path, required=True)
++    parser.add_argument("--build-manifest", type=Path, required=True)
++    parser.add_argument("--dimension", type=int, choices=(1, 2, 3), required=True)
++    parser.add_argument("--timeout-seconds", type=int, default=180)
++    parser.add_argument("--work-dir", type=Path, required=True)
++    parser.add_argument("--report", type=Path, required=True)
++    args = parser.parse_args()
++
++    for executable in (
++        args.baseline_redistribute,
++        args.patched_redistribute,
++        args.baseline_warpx,
++        args.patched_warpx,
++        args.mpi_exec,
++    ):
++        if not executable.is_file():
++            raise FileNotFoundError(executable)
++    if not args.warpx_input.is_file():
++        raise FileNotFoundError(args.warpx_input)
++    if not args.build_manifest.is_file():
++        raise FileNotFoundError(args.build_manifest)
++    if not (args.baseline_source / ".git").exists():
++        raise FileNotFoundError(args.baseline_source / ".git")
++    if not (args.patched_source / ".git").exists():
++        raise FileNotFoundError(args.patched_source / ".git")
++    if args.work_dir.exists():
++        raise FileExistsError(args.work_dir)
++
++    binary_hashes = {
++        "baseline_redistribute": sha256_file(args.baseline_redistribute),
++        "patched_redistribute": sha256_file(args.patched_redistribute),
++        "baseline_warpx": sha256_file(args.baseline_warpx),
++        "patched_warpx": sha256_file(args.patched_warpx),
++    }
++    for baseline_name, patched_name in (
++        ("baseline_redistribute", "patched_redistribute"),
++        ("baseline_warpx", "patched_warpx"),
++    ):
++        baseline_path = getattr(args, baseline_name).resolve()
++        patched_path = getattr(args, patched_name).resolve()
++        if baseline_path == patched_path:
++            raise AssertionError(
++                f"{baseline_name} and {patched_name} resolve to the same path"
++            )
++        if binary_hashes[baseline_name] == binary_hashes[patched_name]:
++            raise AssertionError(
++                f"{baseline_name} and {patched_name} have identical hashes"
++            )
++    baseline_commit = git_output(
++        args.baseline_source, "rev-parse", "--verify", "HEAD"
++    ).decode().strip()
++    patched_commit = git_output(
++        args.patched_source, "rev-parse", "--verify", "HEAD"
++    ).decode().strip()
++    if not re.fullmatch(r"[0-9a-f]{40}", baseline_commit):
++        raise AssertionError("derived baseline commit is not canonical")
++    if not re.fullmatch(r"[0-9a-f]{40}", patched_commit):
++        raise AssertionError("derived patched commit is not canonical")
++    if baseline_commit == patched_commit:
++        raise AssertionError("baseline and patched sources use the same commit")
++
++    manifest = json.loads(args.build_manifest.read_text(encoding="utf-8"))
++    if (
++        manifest.get("schema")
++        != "amrex.uniform-tile-leave.cpu-build-manifest.v4"
++    ):
++        raise AssertionError("unexpected build manifest schema")
++    if manifest.get("baseline_commit") != baseline_commit:
++        raise AssertionError("manifest baseline commit mismatch")
++    if manifest.get("patched_commit") != patched_commit:
++        raise AssertionError("manifest patched commit mismatch")
++
++    source_attestation = manifest.get("source_attestation", {})
++    if source_attestation.get("pre_post_identical") is not True:
++        raise AssertionError("build did not attest stable pre/post source")
++
++    warpx_source = Path(source_attestation.get("warpx_source", ""))
++    if not warpx_source.is_dir():
++        raise AssertionError("WarpX source attestation is missing")
++    source_repositories = {
++        "baseline": args.baseline_source,
++        "patched": args.patched_source,
++        "warpx": warpx_source,
++    }
++    for name, repository in source_repositories.items():
++        status = git_output(
++            repository,
++            "status",
++            "--porcelain=v1",
++            "--untracked-files=all",
++        )
++        if status:
++            raise AssertionError(f"{name} source tree is dirty")
++        commit = git_output(
++            repository, "rev-parse", "--verify", "HEAD"
++        ).decode().strip()
++        tree = git_output(
++            repository, "rev-parse", "--verify", "HEAD^{tree}"
++        ).decode().strip()
++        if source_attestation.get(f"{name}_commit") != commit:
++            raise AssertionError(f"{name} source commit attestation mismatch")
++        if source_attestation.get(f"{name}_tree") != tree:
++            raise AssertionError(f"{name} source tree attestation mismatch")
++
++    validator_path = (
++        args.patched_source
++        / "Tests"
++        / "Particles"
++        / "RedistributeSOA"
++        / "validate_uniform_tile_leave.py"
++    )
++    snapshot_harness_path = (
++        args.patched_source
++        / "Tests"
++        / "Particles"
++        / "RedistributeSOA"
++        / "main.cpp"
++    )
++    if source_attestation.get("validator_sha256") != sha256_file(
++        validator_path
++    ):
++        raise AssertionError("manifest validator hash mismatch")
++    if source_attestation.get("snapshot_harness_sha256") != sha256_file(
++        snapshot_harness_path
++    ):
++        raise AssertionError("manifest snapshot harness hash mismatch")
++
++    test_source = manifest.get("test_source", {})
++    test_source_path = Path(test_source.get("path", ""))
++    if test_source.get("cmake_sha256") != sha256_file(
++        test_source_path / "CMakeLists.txt"
++    ):
++        raise AssertionError("test CMake source hash mismatch")
++    if test_source.get("main_sha256") != sha256_file(
++        test_source_path / "main.cpp"
++    ):
++        raise AssertionError("test harness source hash mismatch")
++    if (test_source_path / "main.cpp").read_bytes() != (
++        snapshot_harness_path.read_bytes()
++    ):
++        raise AssertionError("test harness differs from committed source")
++    if manifest.get("fresh_build_directories") is not True:
++        raise AssertionError("build directories were not attested fresh")
++    if manifest.get("outputs_newer_than_build_marker") is not True:
++        raise AssertionError("build outputs were not freshly produced")
++
++    manifest_builds = manifest.get("builds", {})
++    expected_builds = {
++        "baseline_redistribute": (test_source_path, args.baseline_source),
++        "patched_redistribute": (test_source_path, args.patched_source),
++        "baseline_warpx": (warpx_source, args.baseline_source),
++        "patched_warpx": (warpx_source, args.patched_source),
++    }
++    for name, (home, amrex_source) in expected_builds.items():
++        entry = manifest_builds.get(name, {})
++        cache_path = Path(entry.get("cache_path", ""))
++        if not cache_path.is_file():
++            raise AssertionError(f"missing configured build cache: {name}")
++        if entry.get("cache_sha256") != sha256_file(cache_path):
++            raise AssertionError(f"configured build cache hash mismatch: {name}")
++        if Path(entry.get("home_directory", "")).resolve() != home.resolve():
++            raise AssertionError(f"configured source mismatch: {name}")
++        if Path(entry.get("amrex_source", "")).resolve() != (
++            amrex_source.resolve()
++        ):
++            raise AssertionError(f"configured AMReX source mismatch: {name}")
++        cache_text = cache_path.read_text(encoding="utf-8")
++        if (
++            f"CMAKE_HOME_DIRECTORY:INTERNAL={home.resolve()}" not in cache_text
++            or f"AMReX_SOURCE_DIR:STATIC={amrex_source.resolve()}"
++            not in cache_text
++        ):
++            raise AssertionError(f"CMake cache provenance mismatch: {name}")
++
++    manifest_binaries = manifest.get("binaries", {})
++    for name, digest in binary_hashes.items():
++        entry = manifest_binaries.get(name, {})
++        if entry.get("sha256") != digest:
++            raise AssertionError(f"manifest binary hash mismatch: {name}")
++        if Path(entry.get("path", "")).resolve() != getattr(args, name).resolve():
++            raise AssertionError(f"manifest binary path mismatch: {name}")
++    build_log = manifest.get("build_log", {})
++    build_log_path = Path(build_log.get("path", ""))
++    if not build_log_path.is_file():
++        raise AssertionError("manifest build log is missing")
++    if build_log.get("sha256") != sha256_file(build_log_path):
++        raise AssertionError("manifest build log hash mismatch")
++
++    args.work_dir.mkdir(parents=True)
++    run_semantic_omission_negative_probes(
++        executable=args.patched_redistribute,
++        root=args.work_dir / "semantic-omission-negative-probes",
++        timeout_seconds=args.timeout_seconds,
++    )
++
++    cases = {
++        "single_box_local": dict(
++            max_grid_size=16, levels=1, do_regrid=False, tiling=False,
++            invalid_probe=0, ranks=1,
++        ),
++        "multi_box_tiled_local": dict(
++            max_grid_size=4, levels=1, do_regrid=False, tiling=True,
++            invalid_probe=0, ranks=1,
++        ),
++        "global_tiled_single_rank": dict(
++            max_grid_size=4, levels=1, do_regrid=True, tiling=True,
++            invalid_probe=0, ranks=1,
++        ),
++        "mpi2_global_tiled": dict(
++            max_grid_size=4, levels=1, do_regrid=True, tiling=True,
++            invalid_probe=0, ranks=2,
++        ),
++        "invalid_local_keep": dict(
++            max_grid_size=4, levels=1, do_regrid=False, tiling=True,
++            invalid_probe=1, ranks=1,
++        ),
++        "invalid_local_remove": dict(
++            max_grid_size=4, levels=1, do_regrid=False, tiling=True,
++            invalid_probe=2, ranks=1,
++        ),
++        "invalid_global_serial_keep": dict(
++            max_grid_size=4, levels=1, do_regrid=True, tiling=True,
++            invalid_probe=3, ranks=1,
++        ),
++        "invalid_global_serial_remove": dict(
++            max_grid_size=4, levels=1, do_regrid=True, tiling=True,
++            invalid_probe=4, ranks=1,
++        ),
++        "invalid_global_keep": dict(
++            max_grid_size=4, levels=1, do_regrid=True, tiling=True,
++            invalid_probe=3, ranks=2,
++        ),
++        "invalid_global_remove": dict(
++            max_grid_size=4, levels=1, do_regrid=True, tiling=True,
++            invalid_probe=4, ranks=2,
++        ),
++    }
++    modes = {
++        "baseline": (args.baseline_redistribute, None, False, False),
++        "patched_default": (args.patched_redistribute, None, False, False),
++        "patched_off": (args.patched_redistribute, False, False, False),
++        "patched_on": (args.patched_redistribute, True, True, True),
++    }
++
++    report: dict[str, Any] = {
++        "schema": "amrex.uniform-tile-leave.cpu-validation.v4",
++        "status": "RUNNING",
++        "dimension": args.dimension,
++        "activation_marker_checks": {
++            "baseline_absent": True,
++            "patched_default_absent": True,
++            "patched_explicit_off_absent": True,
++            "patched_on_present": True,
++            "patched_on_host_warning_present": True,
++            "amrex_default_init_on_poison_removed": True,
++            "parmparse_semantic_omission_probes_passed": True,
++            "comment_table_continuation_inline_negative_probes_rejected": True,
++        },
++        "binary_provenance": {
++            "baseline_redistribute": {
++                "path": str(args.baseline_redistribute),
++                "sha256": binary_hashes["baseline_redistribute"],
++            },
++            "patched_redistribute": {
++                "path": str(args.patched_redistribute),
++                "sha256": binary_hashes["patched_redistribute"],
++            },
++            "baseline_warpx": {
++                "path": str(args.baseline_warpx),
++                "sha256": binary_hashes["baseline_warpx"],
++            },
++            "patched_warpx": {
++                "path": str(args.patched_warpx),
++                "sha256": binary_hashes["patched_warpx"],
++            },
++            "warpx_input": {
++                "path": str(args.warpx_input),
++                "sha256": sha256_file(args.warpx_input),
++            },
++            "baseline_commit": baseline_commit,
++            "patched_commit": patched_commit,
++            "baseline_tree": source_attestation["baseline_tree"],
++            "patched_tree": source_attestation["patched_tree"],
++            "source_pre_post_identical": True,
++            "build_manifest": {
++                "path": str(args.build_manifest),
++                "sha256": sha256_file(args.build_manifest),
++            },
++            "manifest_binding_enforced": True,
++            "role_distinctness_enforced": True,
++        },
++        "redistribute_cases": {},
++    }
++    raw_runs: dict[str, dict[str, dict[str, Any]]] = {}
++    total_stayers = 0
++    total_crossers = 0
++
++    for name, configuration in cases.items():
++        runs: dict[str, dict[str, Any]] = {}
++        case_modes = {
++            mode: values
++            for mode, values in modes.items()
++            if configuration["ranks"] == 1 or mode != "patched_on"
++        }
++        for (
++            mode,
++            (executable, flag, marker_expected, warning_expected),
++        ) in case_modes.items():
++            runs[mode] = run_redistribute_case(
++                executable=executable,
++                mpi_exec=args.mpi_exec,
++                case_dir=args.work_dir / f"{name}-{mode}",
++                dimension=args.dimension,
++                flag=flag,
++                marker_expected=marker_expected,
++                warning_expected=warning_expected,
++                poison_default_init=(
++                    name == "single_box_local"
++                    and mode == "patched_default"
++                ),
++                timeout_seconds=args.timeout_seconds,
++                **configuration,
++            )
++        compare_runs(name, runs)
++        raw_runs[name] = runs
++
++        classes = destination_classes(runs["baseline"])
++        total_stayers += classes["natural_stayers"]
++        total_crossers += classes["natural_crossers"]
++        boxes_per_level = math.ceil(16 / configuration["max_grid_size"]) ** (
++            args.dimension
++        )
++        report["redistribute_cases"][name] = {
++            "configuration": {
++                **configuration,
++                "boxes_per_level": boxes_per_level,
++                "total_boxes": boxes_per_level * configuration["levels"],
++                "steps": 3,
++            },
++            "destination_classes_step1": classes,
++            "baseline_equals_patched_default": True,
++            "patched_default_equals_explicit_off": True,
++            "patched_on_exercised": "patched_on" in runs,
++            "off_equals_on_order_insensitive_with_destination": (
++                True if "patched_on" in runs else None
++            ),
++            "runs": {
++                mode: public_run_summary(run) for mode, run in runs.items()
++            },
++        }
++
++    if total_stayers <= 0 or total_crossers <= 0:
++        raise AssertionError(
++            f"matrix lacks both destination classes: "
++            f"stayers={total_stayers}, crossers={total_crossers}"
++        )
++
++    report["multi_rank_on_guard"] = run_mpi_guard_case(
++        executable=args.patched_redistribute,
++        mpi_exec=args.mpi_exec,
++        case_dir=args.work_dir / "mpi2-patched-on-guard",
++        dimension=args.dimension,
++        timeout_seconds=args.timeout_seconds,
++    )
++
++    report["invalid_particle_checks"] = {
++        "local": validate_invalid_pair(
++            "local",
++            raw_runs["invalid_local_keep"],
++            raw_runs["invalid_local_remove"],
++        ),
++        "global_single_rank": validate_invalid_pair(
++            "global_single_rank",
++            raw_runs["invalid_global_serial_keep"],
++            raw_runs["invalid_global_serial_remove"],
++        ),
++        "global_mpi2": validate_invalid_pair(
++            "global_mpi2",
++            raw_runs["invalid_global_keep"],
++            raw_runs["invalid_global_remove"],
++        ),
++    }
++
++    warpx_runs = {
++        "baseline": run_warpx_case(
++            executable=args.baseline_warpx,
++            omission_probe_executable=args.patched_redistribute,
++            source_input=args.warpx_input,
++            case_dir=args.work_dir / "warpx-baseline",
++            flag=None,
++            timeout_seconds=args.timeout_seconds,
++        ),
++        "patched_default": run_warpx_case(
++            executable=args.patched_warpx,
++            omission_probe_executable=args.patched_redistribute,
++            source_input=args.warpx_input,
++            case_dir=args.work_dir / "warpx-patched-default",
++            flag=None,
++            timeout_seconds=args.timeout_seconds,
++        ),
++        "patched_off": run_warpx_case(
++            executable=args.patched_warpx,
++            omission_probe_executable=args.patched_redistribute,
++            source_input=args.warpx_input,
++            case_dir=args.work_dir / "warpx-patched-off",
++            flag=False,
++            timeout_seconds=args.timeout_seconds,
++        ),
++    }
++    baseline_hashes = {
++        step: payload["field_content_sha256"]
++        for step, payload in warpx_runs["baseline"]["steps"].items()
++    }
++    for mode in ("patched_default", "patched_off"):
++        candidate_hashes = {
++            step: payload["field_content_sha256"]
++            for step, payload in warpx_runs[mode]["steps"].items()
++        }
++        if candidate_hashes != baseline_hashes:
++            raise AssertionError(
++                f"WarpX {mode} field content differs from baseline"
++            )
++    report["warpx_flag_off_noop"] = {
++        "configuration": "32x32 cells, 4 boxes, 1024 particles",
++        "steps": 3,
++        "baseline_equals_patched_default": True,
++        "patched_default_equals_explicit_off": True,
++        "runs": warpx_runs,
++    }
++    report["aggregate_destination_classes"] = {
++        "natural_stayers": total_stayers,
++        "natural_crossers": total_crossers,
++    }
++    report["status"] = "PASS"
++    args.report.parent.mkdir(parents=True, exist_ok=True)
++    args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps(report, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    try:
++        raise SystemExit(main())
++    except Exception as exc:
++        print(f"FAILED: {exc}", file=sys.stderr)
++        raise
