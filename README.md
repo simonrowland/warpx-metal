@@ -56,7 +56,9 @@ The backend includes reliability controls for heavy runs:
 - Long jobs can run as checkpointed process generations with
   `scripts/10-run-warpx-resilient.py`. Each generation creates fresh Metal
   device/queue state, and a completion timeout automatically retries from the
-  last checkpoint that was verified after a clean child-process exit.
+  last checkpoint that was verified after a clean child-process exit. An
+  optional SP CPU fallback permanently demotes a wedged run into an isolated
+  CPU checkpoint namespace without killing the live Metal process.
 
 The supervisor is the production-safe client workaround for the macOS driver
 defect: it never replays uncertain GPU state inside the affected process.
@@ -68,6 +70,10 @@ Example for a 10,000-step 2D run, using 100-step process generations:
 ./scripts/10-run-warpx-resilient.py \
   --max-step 10000 \
   --chunk-steps 100 \
+  --startup-grace-seconds 600 \
+  --cpu-fallback-executable /path/to/warpx.2d.NOMPI.OMP.SP.PSP.EB \
+  --build-identity-manifest /path/to/build-pair.json \
+  --cpu-work-dir /path/to/preprovisioned-cpu-run \
   --work-dir /path/to/run \
   extern/warpx/build-acpp/bin/warpx.2d.NOMPI.SYCL.SP.PSP.EB \
   /path/to/inputs
