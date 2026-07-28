@@ -15,14 +15,19 @@ standard PIC workloads on Apple Silicon GPUs.
 
 - WarpX PIC workloads execute on Apple GPUs through AMReX SYCL and AdaptiveCpp
   SSCP-generated Metal.
-- Validation has been run across three Apple Silicon generations: M3 Ultra,
-  M4 Max, and M5 Max.
-- The current source patch set is synchronized to the field-validated source
-  tree, with debug-only instrumentation removed.
+- The inherited Metal port baseline was cross-chip field-validated in June 2026
+  on M3 Ultra, M4 Max, and M5 Max at source identity
+  `952811fb5486adab8b1cdb6d961912a896988401` (commit message: "Add validated
+  Apple-Metal GPU WarpX port"). Raw per-run logs from that campaign are not in
+  this package; the numbers live in [`VALIDATION.md`](VALIDATION.md).
+- Later handoff deltas (parser-momentum host backfill, RZ `J_ext`, process
+  supervisor, uniform tile-leave, startup memory guard) have the narrower
+  validation boundaries stated in their individual reports; they have not all
+  been re-run across those three systems.
 
 ## Validation
 
-Current validation is field-level, not only run-completion based:
+The June cross-chip baseline was field-level, not only run-completion based:
 
 - Langmuir oscillation: GPU and CPU fields (`Ex`, `jx`) agree to about `1e-6`
   at both 1 and 4 particles per cell, and particle counts match.
@@ -35,8 +40,10 @@ Current validation is field-level, not only run-completion based:
   conserved charge, energy, momentum, and particle count within the validated
   tolerances.
 
-These checks cover both functional agreement and physics-level behavior for the
-standard PIC benchmark suite used during validation.
+These checks cover functional agreement and physics-level behavior for the
+standard PIC benchmark suite used during the June baseline campaign. See each
+report under [`reports/`](reports/) for what later package deltas do and do not
+claim.
 
 ## Reliability
 
@@ -60,9 +67,12 @@ The backend includes reliability controls for heavy runs:
   optional SP CPU fallback permanently demotes a wedged run into an isolated
   CPU checkpoint namespace without killing the live Metal process.
 
-The supervisor is the production-safe client workaround for the macOS driver
-defect: it never replays uncertain GPU state inside the affected process.
-Checkpoint frequency controls the recovery window and I/O overhead.
+The supervisor is candidate recovery tooling for the macOS driver defect: it
+never replays uncertain GPU state inside the affected process. CPU checkpoint
+continuity, deterministic watchdog paths, failure classification, and negative
+controls are verified. A live Metal wedge → demote → complete run remains
+outstanding, so production recovery is not claimed. Checkpoint frequency
+controls the recovery window and I/O overhead.
 
 Example for a 10,000-step 2D run, using 100-step process generations:
 
@@ -82,27 +92,80 @@ Example for a 10,000-step 2D run, using 100-step process generations:
 See [Metal process-isolated recovery](reports/metal-process-isolated-recovery.md)
 for recovery semantics and tuning.
 
+## Handoff Assembly
+
+Deliver the **single** composite ref `handoff-package`. Do not assemble from
+two refs and do not cherry-pick `aec5dce`.
+
+That tree already contains the full patch set for this handoff, including
+`patches/warpx/0003-correct-macos-memory-guard-available-memory.patch` (same
+blob `4a7ff442b6c7a575480f8c9cf91158cc9f607cdb` as the independent
+`fix-startup-memory-guard` tip `aec5dce7823dffb4acf9147f993ed72ea332d3e8`).
+Cherry-picking `aec5dce` would only re-open a divergent memory-guard *report*
+without changing the code patch.
+
+Do not start from `origin/main` / `a4943c2dc7b4d641101cdf8e0cac761e09856ad8`:
+that tip is the pre-package base and does not contain the handoff deltas.
+
+```sh
+# After fetching the delivered handoff-package ref:
+git switch --create warpx-metal-handoff handoff-package
+git rev-parse --verify HEAD
+# Sanity: HEAD must be a descendant of the pre-doc-fix composite that first
+# closed the patch set (still a real object in this repository):
+git merge-base --is-ancestor d750544496a7c2ee7fd946eeecc48b3e5c8a4507 HEAD
+git cat-file -t d750544496a7c2ee7fd946eeecc48b3e5c8a4507   # commit
+# Buildable tree is this checkout. Do not cherry-pick aec5dce.
+```
+
+The packaging tip that includes these corrected handoff instructions is the
+tip of `handoff-package` at send time (see the review-fix result for the
+exact full SHA recorded when this recipe was last verified).
+
+Ancestor notes (for orientation only; not assembly steps):
+
+- `e7498b1` (`uniform-tile-leave`) and `8d0e418` (`jext-batch`) are ancestors.
+- `910c3d4` (`parser-device-pointer-fix`) generalized the parser-momentum
+  host backfill and is an ancestor of `d750544`.
+- `d750544496a7c2ee7fd946eeecc48b3e5c8a4507` is the pre-doc-fix composite
+  that first closed the ten pre-handoff defects; later `handoff-package` tips
+  may add documentation-only review fixes on top.
+- `aec5dce` is a side branch off `e7498b1` whose **code** patch is already
+  present from `d750544` onward; its **report** prose is intentionally not
+  preferred.
+
 ## Remaining Notes
 
 - GPU atomic deposition is not expected to be run-to-run bitwise deterministic;
   this is standard for GPU PIC. Validated comparisons use physics observables
   and CPU agreement.
-- Particle sorting is enabled (default `sort_intervals = 4`). The earlier
-  sort corruption traced to the decoupled-lookback scan's 64-bit atomics,
-  which Metal lacks; the Metal path now uses the multipass scan and sorting
-  validates cleanly (exact particle counts, energies within atomic-deposition
-  tolerance).
-- On the single-precision path, parser execution uses host-side momentum
-  evaluation for particle injection so GPU and CPU setup match exactly.
+- Particle sorting is conservatively forced off on the AdaptiveCpp/HipSYCL
+  SYCL GPU path because the packaged WarpX guard treats the Metal sort path as
+  particle-attribute-corrupting. The AMReX multipass scan fixes remain in the
+  package, but they do not remove that delivered guard.
+- On the single-precision path, the packaged parser-momentum path is a **host
+  backfill workaround**, not a general device-runtime fix. The accepted matrix
+  covers unboosted initial `AddPlasma` only. Boosted or continuous injection,
+  momentum-dependent user attributes, parsed `NFluxPerCell` / `AddPlasmaFlux`,
+  and the RCYLINDER/RSPHERE coordinate branches remain unvalidated. See
+  [the parser-momentum report](reports/addplasma-parser-momentum-device-zero.md).
 
 ## Bugfix Reports
 
 Detailed reports describe the failure mechanism, correction, validation scope,
 and remaining limitations for the keeper fixes:
 
-- [AddPlasma parser-momentum out-of-bounds access](reports/addplasma-parser-momentum-oob.md)
+- [Metal AddPlasma parser-momentum device-zero workaround](reports/addplasma-parser-momentum-device-zero.md)
 - [AdaptiveCpp Metal device-to-host completion hardening](reports/adaptivecpp-d2h-shared-event-completion.md)
 - [AdaptiveCpp Metal in-order readback and bounded completion](reports/adaptivecpp-metal-inorder-readback.md)
+- [AdaptiveCpp Metal source-identity backend payload](reports/adaptivecpp-metal-source-identity.md)
+- [AdaptiveCpp Metal asynchronous error fail-closed state](reports/adaptivecpp-metal-async-error-failclosed.md)
+- [AdaptiveCpp Metal timeout fail-closed state](reports/adaptivecpp-metal-timeout-failclosed.md)
+- [AMReX Metal PIC RNG and reduction compatibility](reports/amrex-metal-pic-rng-reduction-fixes.md)
+- [WarpX Metal particle-sort guard](reports/warpx-metal-particle-sort-guard.md)
+- [Cartesian impressed-current coupling](reports/impressed-current-j-ext.md)
+- [RZ impressed-current coupling](reports/rz-impressed-current-j-ext.md)
+- [Uniform full-tile-leave redistribution](reports/uniform-tile-leave.md)
 - [Metal process-isolated checkpoint recovery](reports/metal-process-isolated-recovery.md)
 - [macOS system-memory crashguard accounting](reports/macos-memory-crashguard.md)
 

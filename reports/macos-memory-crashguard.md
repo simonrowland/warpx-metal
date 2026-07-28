@@ -66,6 +66,21 @@ gate. Requiring both deltas and two consecutive intervals reduces sensitivity
 to isolated counter movement while retaining a bounded response to sustained
 pressure.
 
+## Startup fraction-gate correction
+
+The pre-initialization startup guard now treats the used-memory fraction as
+actionable only when Darwin also reports memory pressure at warning level (2)
+or higher. A machine at normal level (1) no longer aborts merely because an
+unrelated application holds RAM, while warning and critical pressure still
+retain the fraction-based safety check. The independent critical-pressure path
+continues to abort regardless of the configured fraction.
+
+For installations that predate this correction, the interim workaround is:
+
+```sh
+WARPX_MAX_MEM_FRACTION=0.95
+```
+
 ## Fail-close behavior
 
 On Apple platforms, failure to obtain physical memory, host page size, or VM
@@ -87,10 +102,16 @@ compiles the non-Apple path as a portability gate.
 
 ## Validation and limitations
 
-The accounting and guard behavior were verified on Apple M3 Ultra hardware
-running macOS 26.5.2, including the observed 16,384-byte host page size. The
-published formula, pressure threshold, two-sample gate, and failure behavior
-were also checked directly against the packaged patch.
+Earlier accounting and guard behavior, before the startup fraction-gate
+correction described above, was verified on Apple M3 Ultra hardware running
+macOS 26.5.2, including the observed 16,384-byte host page size.
+
+Verification of the current startup fraction-gate correction is limited to
+clean application on the pinned WarpX source plus focused source inspection:
+normal pressure plus a high used fraction continues, warning pressure plus a
+high used fraction aborts, and critical pressure aborts independently. The
+corrected gate was not executed on Apple hardware during this package
+verification.
 
 This is a coarse host-memory safety guard, not a predictor for all Metal driver
 or compiler behavior. Fixed thresholds can miss shorter pressure bursts, and

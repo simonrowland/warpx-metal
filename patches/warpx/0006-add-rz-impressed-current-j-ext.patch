@@ -1,0 +1,2431 @@
+diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
+index a7375f1c..3c91e03d 100644
+--- a/Source/Evolve/WarpXEvolve.cpp
++++ b/Source/Evolve/WarpXEvolve.cpp
+@@ -63,6 +63,7 @@
+ #include <cstdint>
+ #include <cstdlib>
+ #include <iomanip>
++#include <limits>
+ #include <memory>
+ #include <ostream>
+ #include <sstream>
+@@ -753,11 +754,341 @@ WarpX::AddExternalCurrent (amrex::Real time)
+ {
+     if (!m_p_ext_field_params->J_ext_grid_enabled) { return; }
+ 
+-#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++#if defined(WARPX_DIM_RZ)
++    using ablastr::fields::Direction;
++    using warpx::fields::FieldType;
++
++    // RZ stores each cylindrical field component as
++    //
++    //   F(r,theta,z) = F_0(r,z)
++    //     + sum_{m=1}^{M-1} [F_{m,re}(r,z) cos(m theta)
++    //                       + F_{m,im}(r,z) sin(m theta)].
++    //
++    // current_fp component 0 is m=0; 2*m-1 and 2*m are the cosine and
++    // sine coefficients for m>0.  This is the same normalization used by
++    // RZ particle deposition/gather: a_m=(1/pi) integral F cos(m theta)dtheta
++    // and b_m=(1/pi) integral F sin(m theta)dtheta.  The uniform trapezoidal
++    // DFT is exact for a parser band-limited to retained modes.  N_theta
++    // defaults to 4*M so the runtime gate can also inspect discarded
++    // modes M..2*M-1 instead of silently projecting an RMF to zero.
++    //
++    // The public parsers remain Cartesian.  At each LIVE current_fp stagger,
++    // evaluate them on the physical ring x=r cos(theta), y=r sin(theta), then
++    // rotate into (J_r,J_theta,J_z) before projecting onto WarpX's modes:
++    //   J_r     =  J_x cos(theta) + J_y sin(theta)
++    //   J_theta = -J_x sin(theta) + J_y cos(theta)
++    //   J_z     =  J_z.
++    // This is load-bearing for an m=1 RMF: treating parser Jx/Jy as Jr/Jtheta
++    // or writing mode 0 only changes the antenna rather than representing it.
++    //
++    // A time-varying B-only drive does no particle work, so an impressed
++    // current must drive Ampere's E update.  Placement remains S(Jp)+A inside SyncCurrentAndRho,
++    // before the single ApplyJfieldBoundary and at t^(n+1/2).
++    auto const dx = Geom(0).CellSizeArray();
++    const amrex::RealBox& real_box = Geom(0).ProbDomain();
++    const int nmodes = n_rz_azimuthal_modes;
++    const int requested_ntheta = m_p_ext_field_params->J_ext_rz_n_theta;
++    const int ntheta =
++        (requested_ntheta > 0) ? requested_ntheta : 4 * nmodes;
++    const int expected_ncomp = 2 * nmodes - 1;
++    const auto jx_parser = m_p_ext_field_params->Jfield_parser_executor[0];
++    const auto jy_parser = m_p_ext_field_params->Jfield_parser_executor[1];
++    const auto jz_parser = m_p_ext_field_params->Jfield_parser_executor[2];
++
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        nmodes >= 2,
++        "warpx.J_ext_grid_init_style in RZ requires "
++        "warpx.n_rz_azimuthal_modes >= 2; the flagship Cartesian RMF parser "
++        "is m=1 and projects to zero when only mode 0 is retained");
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        ntheta >= 4 * nmodes && (ntheta % 2) == 0,
++        "warpx.J_ext_rz_n_theta must be even and >= "
++        "4*n_rz_azimuthal_modes so discarded angular modes are fail-closed");
++
++    // Fail at the parser/deposition boundary, before one invalid value can
++    // contaminate current_fp and Ampere's solve.  Premise: every sampled
++    // parser value is an SI current density [A/m^2].  Algebra: finiteness is
++    // invariant under the Cartesian-to-cylindrical rotation and finite DFT
++    // sums, so checking the three Cartesian values on every live stagger is
++    // necessary and sufficient before deposition.  Dimension check: this is
++    // a predicate, hence dimensionless.  Sanity: 1/sqrt(x^2+y^2) at a nodal
++    // axis trips, while every finite manufactured oracle value passes.
++    int parser_nonfinite = 0;
++    for (int idim = 0; idim < 3; ++idim) {
++        amrex::MultiFab* current =
++            m_fields.get(FieldType::current_fp, Direction{idim}, 0);
++        const amrex::IntVect nodal = current->ixType().toIntVect();
++        for (amrex::MFIter mfi(*current, amrex::TilingIfNotGPU());
++             mfi.isValid(); ++mfi) {
++            const amrex::Box box = mfi.tilebox(nodal);
++            amrex::ReduceOps<amrex::ReduceOpMax> reduce_op;
++            amrex::ReduceData<int> reduce_data(reduce_op);
++            using ReduceTuple = typename decltype(reduce_data)::Type;
++            reduce_op.eval(
++                box, reduce_data,
++                [=] AMREX_GPU_DEVICE (
++                    int i, int j, int k) -> ReduceTuple {
++                    amrex::ignore_unused(k);
++                    const amrex::Real r =
++                        static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++                        + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++                    const amrex::Real z =
++                        static_cast<amrex::Real>(j) * dx[1] + real_box.lo(1)
++                        + (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++                    int invalid = 0;
++                    for (int itheta = 0; itheta < ntheta; ++itheta) {
++                        const amrex::Real theta =
++                            2._rt * MathConst::pi
++                            * static_cast<amrex::Real>(itheta)
++                            / static_cast<amrex::Real>(ntheta);
++                        const amrex::Real x = r * std::cos(theta);
++                        const amrex::Real y = r * std::sin(theta);
++                        const amrex::Real jx = jx_parser(x, y, z, time);
++                        const amrex::Real jy = jy_parser(x, y, z, time);
++                        const amrex::Real jz = jz_parser(x, y, z, time);
++                        invalid = invalid
++                            || !std::isfinite(jx)
++                            || !std::isfinite(jy)
++                            || !std::isfinite(jz);
++                    }
++                    return {invalid};
++                });
++            parser_nonfinite = amrex::max(
++                parser_nonfinite, amrex::get<0>(reduce_data.value()));
++        }
++    }
++    amrex::ParallelDescriptor::ReduceIntMax(parser_nonfinite);
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        parser_nonfinite == 0,
++        "parsed RZ J_ext produced NaN/Inf before deposition; refusing to "
++        "contaminate current_fp or the Maxwell solve");
++
++    std::array<std::unique_ptr<amrex::MultiFab>,3> jext_source;
++    for (int idim = 0; idim < 3; ++idim) {
++        amrex::MultiFab* current =
++            m_fields.get(FieldType::current_fp, Direction{idim}, 0);
++        jext_source[idim] = std::make_unique<amrex::MultiFab>(
++            current->boxArray(), current->DistributionMap(),
++            current->nComp(), current->nGrowVect());
++        jext_source[idim]->setVal(0._rt);
++        const amrex::IntVect nodal = current->ixType().toIntVect();
++        const int cylindrical_component = idim;
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            current->nComp() == expected_ncomp,
++            "RZ J_ext current_fp component count does not match "
++            "2*n_rz_azimuthal_modes-1");
++
++        for (amrex::MFIter mfi(*current, amrex::TilingIfNotGPU());
++             mfi.isValid(); ++mfi) {
++            const amrex::Box box = mfi.tilebox(nodal);
++            auto const current_arr = jext_source[idim]->array(mfi);
++            amrex::ParallelFor(
++                box,
++                [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept {
++                    amrex::ignore_unused(k);
++                    const amrex::Real r =
++                        static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++                        + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++                    const amrex::Real z =
++                        static_cast<amrex::Real>(j) * dx[1] + real_box.lo(1)
++                        + (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++
++                    // Evaluate the expensive parsed vector once per ring
++                    // angle and accumulate all retained coefficients. A
++                    // thread owns one spatial cell, so these component writes
++                    // cannot race.
++                    for (int itheta = 0; itheta < ntheta; ++itheta) {
++                        const amrex::Real theta =
++                            2._rt * MathConst::pi
++                            * static_cast<amrex::Real>(itheta)
++                            / static_cast<amrex::Real>(ntheta);
++                        const amrex::Real costheta = std::cos(theta);
++                        const amrex::Real sintheta = std::sin(theta);
++                        const amrex::Real x = r * costheta;
++                        const amrex::Real y = r * sintheta;
++                        const amrex::Real jx = jx_parser(x, y, z, time);
++                        const amrex::Real jy = jy_parser(x, y, z, time);
++                        const amrex::Real jz = jz_parser(x, y, z, time);
++                        amrex::Real jcyl = jz;
++                        if (cylindrical_component == 0) {
++                            jcyl = jx * costheta + jy * sintheta;
++                        } else if (cylindrical_component == 1) {
++                            jcyl = -jx * sintheta + jy * costheta;
++                        }
++                        const amrex::Real scaled =
++                            jcyl / static_cast<amrex::Real>(ntheta);
++                        current_arr(i, j, 0, 0) += scaled;
++                        for (int mode = 1; mode < nmodes; ++mode) {
++                            const amrex::Real mode_theta =
++                                static_cast<amrex::Real>(mode) * theta;
++                            current_arr(i, j, 0, 2 * mode - 1) +=
++                                2._rt * scaled * std::cos(mode_theta);
++                            current_arr(i, j, 0, 2 * mode) +=
++                                2._rt * scaled * std::sin(mode_theta);
++                        }
++                    }
++                });
++        }
++
++        // OverrideSync is required for nodal valid copies and periodic
++        // endpoints; apply it independently to every retained mode.
++        jext_source[idim]->FillBoundaryAndSync(Geom(0).periodicity());
++    }
++
++    // Premise: finite parser samples can still overflow during rotation, DFT
++    // accumulation, or synchronization.  Algebra: is_finite covers every
++    // component and grow cell that the following Add consumes; ReduceIntMin
++    // makes one bad value on any rank fail before any rank mutates current_fp.
++    // Dimension check: finiteness is a dimensionless predicate over A/m^2.
++    // Sanity: finite manufactured sources return one; a scratch-only NaN/Inf
++    // mutation aborts here even though the parser preflight was finite.
++    int all_deposited_finite = 1;
++    for (int idim = 0; idim < 3; ++idim) {
++        all_deposited_finite = all_deposited_finite
++            && jext_source[idim]->is_finite(
++                0, expected_ncomp, jext_source[idim]->nGrowVect(), true);
++    }
++    amrex::ParallelDescriptor::ReduceIntMin(all_deposited_finite);
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        all_deposited_finite == 1,
++        "parsed RZ J_ext produced NaN/Inf in deposited coefficients after "
++        "projection/synchronization; refusing to modify current_fp");
++
++    // Preserve the physical S(Jp)+A ordering while retaining A separately for
++    // causally-live guards. Both operands are A/m^2, so addition is
++    // dimensionally exact; A=0 is the bit-identity limiting case.
++    for (int idim = 0; idim < 3; ++idim) {
++        amrex::MultiFab* current =
++            m_fields.get(FieldType::current_fp, Direction{idim}, 0);
++        amrex::MultiFab::Add(
++            *current, *jext_source[idim], 0, 0, expected_ncomp,
++            current->nGrowVect());
++    }
++
++    // Independent RZ mode/stagger oracle for the zero-particle regression
++    // family J_cart=(sin(pi*z),0,x) on z in [-1,1].  Analytically:
++    //   Jr=sin(pi*z) cos(theta)       -> Jr[m=1,cos]=sin(pi*z)
++    //   Jtheta=-sin(pi*z) sin(theta)  -> Jtheta[m=1,sin]=-sin(pi*z)
++    //   Jz=r cos(theta)       -> Jz[m=1,cos]=r.
++    // All other retained coefficients vanish.  The sine is periodic across
++    // the regression's z seam, so OverrideSync cannot invalidate the oracle.
++    // Literal Yee half-offsets below are transcribed from AllocLevelMFs, not
++    // derived from the injection kernel; hard asserts bind them to each live
++    // ixType before use.
++    if (m_p_ext_field_params->J_ext_self_check_analytic) {
++        constexpr int expected_nodal[3][2] = {
++            {0, 1}, // Jr:     CELL r, NODE z
++            {1, 1}, // Jtheta: NODE r, NODE z
++            {1, 0}  // Jz:     NODE r, CELL z
++        };
++        constexpr amrex::Real half_offset[3][2] = {
++            {0.5_rt, 0.0_rt},
++            {0.0_rt, 0.0_rt},
++            {0.0_rt, 0.5_rt}
++        };
++        amrex::Real max_abs_err = 0._rt;
++        amrex::Real max_abs_ref = 0._rt;
++
++        for (int idim = 0; idim < 3; ++idim) {
++            amrex::MultiFab* current =
++                jext_source[idim].get();
++            const amrex::IntVect nodal = current->ixType().toIntVect();
++            WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++                nodal[0] == expected_nodal[idim][0]
++                    && nodal[1] == expected_nodal[idim][1],
++                "RZ J_ext stagger oracle disagrees with live current_fp ixType");
++
++            for (amrex::MFIter mfi(*current, false); mfi.isValid(); ++mfi) {
++                const amrex::Box check_box =
++                    amrex::convert(mfi.validbox(), nodal);
++                auto const arr = current->const_array(mfi);
++                const int component_direction = idim;
++                const amrex::Real half_r = half_offset[idim][0];
++                const amrex::Real half_z = half_offset[idim][1];
++                amrex::ReduceOps<
++                    amrex::ReduceOpMax, amrex::ReduceOpMax> reduce_op;
++                amrex::ReduceData<
++                    amrex::Real, amrex::Real> reduce_data(reduce_op);
++                using ReduceTuple = typename decltype(reduce_data)::Type;
++                reduce_op.eval(
++                    check_box, reduce_data,
++                    [=] AMREX_GPU_DEVICE (
++                        int i, int j, int k) -> ReduceTuple {
++                        amrex::ignore_unused(k);
++                        const amrex::Real r =
++                            (static_cast<amrex::Real>(i)
++                                + half_r)
++                                * dx[0] + real_box.lo(0);
++                        const amrex::Real z =
++                            (static_cast<amrex::Real>(j)
++                                + half_z)
++                                * dx[1] + real_box.lo(1);
++                        amrex::Real local_err = 0._rt;
++                        amrex::Real local_ref = 0._rt;
++                        for (int n = 0; n < expected_ncomp; ++n) {
++                            amrex::Real ref = 0._rt;
++                            if (component_direction == 0 && n == 1) {
++                                ref = std::sin(MathConst::pi * z);
++                            } else if (
++                                component_direction == 1 && n == 2) {
++                                ref = -std::sin(MathConst::pi * z);
++                            } else if (
++                                component_direction == 2 && n == 1) {
++                                ref = r;
++                            }
++                            local_err = amrex::max(
++                                local_err,
++                                amrex::Math::abs(arr(i, j, 0, n) - ref));
++                            local_ref = amrex::max(
++                                local_ref, amrex::Math::abs(ref));
++                        }
++                        return {local_err, local_ref};
++                    });
++                const auto values = reduce_data.value();
++                max_abs_err =
++                    amrex::max(max_abs_err, amrex::get<0>(values));
++                max_abs_ref =
++                    amrex::max(max_abs_ref, amrex::get<1>(values));
++            }
++        }
++        amrex::ParallelDescriptor::ReduceRealMax(max_abs_err);
++        amrex::ParallelDescriptor::ReduceRealMax(max_abs_ref);
++        constexpr amrex::Real real_eps =
++            std::numeric_limits<amrex::Real>::epsilon();
++        const amrex::Real tol =
++            50._rt * real_eps * amrex::max(1._rt, max_abs_ref);
++        amrex::Print() << "J_ext RZ analytic self-check: max_abs_err="
++                       << max_abs_err
++                       << " max_abs_ref=" << max_abs_ref
++                       << " tol=" << tol
++                       << " oracle=Jcart(sin(pi*z),0,x)-literal-RZ-stagger\n";
++        if (max_abs_err > tol) {
++            std::stringstream ss;
++            ss << "J_ext RZ analytic self-check failed: max_abs_err="
++               << max_abs_err << " > tol=" << tol;
++            WARPX_ABORT_WITH_MESSAGE(ss.str());
++        }
++    }
++
++    // Boundary treatment is applied exactly once by SyncCurrentAndRho after
++    // this returns.  The sampled cylindrical div_h gate below uses the same
++    // deposited source-only DFT, mode ordering and live ixType positions.
++    {
++        const int interval = m_p_ext_field_params->J_ext_div_check_interval;
++        const int step = istep[0];
++        if (step == 0 || (step % interval) == 0) {
++            std::array<amrex::MultiFab*,3> deposited_jext = {
++                jext_source[0].get(),
++                jext_source[1].get(),
++                jext_source[2].get()};
++            CheckExternalCurrentDivergence(time, &deposited_jext);
++        }
++    }
++#elif defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+     amrex::ignore_unused(time);
+     WARPX_ABORT_WITH_MESSAGE(
+-        "J_ext_grid_init_style is not supported in RZ "
+-        "geometry; azimuthal-mode decomposition of an impressed current is not implemented");
++        "J_ext_grid_init_style is not supported in one-dimensional "
++        "cylindrical or spherical geometry");
+ #else
+     using ablastr::fields::Direction;
+     using warpx::fields::FieldType;
+@@ -997,11 +1328,800 @@ WarpX::AddExternalCurrent (amrex::Real time)
+ }
+ 
+ void
+-WarpX::CheckExternalCurrentDivergence (amrex::Real time)
++WarpX::CheckExternalCurrentDivergence (
++    amrex::Real time,
++    std::array<amrex::MultiFab*,3> const* deposited_jext)
+ {
+     if (!m_p_ext_field_params->J_ext_grid_enabled) { return; }
+ 
+-#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++#if defined(WARPX_DIM_RZ)
++    using ablastr::fields::Direction;
++    using warpx::fields::FieldType;
++
++    // Cylindrical Yee-adjoint divergence of the impressed current, collocated
++    // with WarpX's nodal rho and evaluated in the solver's retained Fourier
++    // basis.  Every component position comes from the LIVE current_fp ixType.
++    //
++    // Premise
++    //   With no rho_ext, discrete continuity requires div_h(J_ext)=0.  RZ
++    //   current_fp contains J_r(CELL,NODE), J_theta(NODE,NODE), and
++    //   J_z(NODE,CELL), with mode 0 real and mode m>0 stored as cosine/sine.
++    //
++    // Algebra (the same operator as ComputeDivECylindrical)
++    //   div J = (1/r) d(r J_r)/dr + (1/r) dJ_theta/dtheta + dJ_z/dz.
++    //   At nodal (r_i,z_j), off axis:
++    //     D_r(rJ_r)/r = [r_(i+1/2)J_r(i)-r_(i-1/2)J_r(i-1)]/(r_i dr)
++    //     D_z J_z     = [J_z(j)-J_z(j-1)]/dz.
++    //   If F_m = F_re cos(m theta)+F_im sin(m theta), then
++    //     (d_theta F)_re = +m F_im, (d_theta F)_im = -m F_re.
++    //   On axis, WarpX regularizes m=0 as 4 J_r(i=0)/dr + D_z J_z
++    //   and sets the higher-mode divergence components to zero.
++    //
++    // Units
++    //   J is A/m^2; each term is A/m^3.  The reported residual
++    //   |div_h J| h_min / max|J| is dimensionless.
++    //
++    // Limiting case
++    //   Uniform Cartesian J_y decomposes to J_r=J_y sin(theta) and
++    //   J_theta=J_y cos(theta), both m=1.  Off axis the radial term
++    //   +J_y sin(theta)/r cancels -m J_theta,re/r exactly; mode 0 is zero.
++    //   A wrong mode normalization, missing theta term, Cartesian divergence,
++    //   or hard-coded staggering therefore leaves an O(1/r) residual.
++    constexpr amrex::Real J_floor = 1.0e-30_rt;
++    constexpr int coarse_stride = 8;
++
++    auto const dx = Geom(0).CellSizeArray();
++    const amrex::RealBox& real_box = Geom(0).ProbDomain();
++    const int nmodes = n_rz_azimuthal_modes;
++    const int requested_ntheta = m_p_ext_field_params->J_ext_rz_n_theta;
++    const int ntheta =
++        (requested_ntheta > 0) ? requested_ntheta : 4 * nmodes;
++    const int max_source_mode =
++        m_p_ext_field_params->J_ext_rz_max_source_mode;
++    const int reference_max_mode =
++        amrex::max(max_source_mode, nmodes - 1);
++    // Premise: the deck declares B=max_source_mode, the largest cylindrical
++    // Fourier mode after vector rotation. A finite sampler cannot prove an
++    // unbounded parser spectrum, so B is part of the fail-closed contract.
++    // Algebra: K=max(B,M-1), and an odd N_ref=2K+1 DFT has unique modes 0..K;
++    // every declared and retained coefficient is therefore unaliased.
++    // Dimensions: indices/sample counts are dimensionless; coefficients remain
++    // A/m^2. Sanity: B=8 gives N_ref=17, resolving the old m=4,7,8 aliases;
++    // B=1 gives three-point exact recovery of a band-limited RMF.
++    const int audit_ntheta = 2 * reference_max_mode + 1;
++    const int ncomp = 2 * nmodes - 1;
++    const auto jx_parser = m_p_ext_field_params->Jfield_parser_executor[0];
++    const auto jy_parser = m_p_ext_field_params->Jfield_parser_executor[1];
++    const auto jz_parser = m_p_ext_field_params->Jfield_parser_executor[2];
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        deposited_jext != nullptr,
++        "RZ J_ext physics guards require source-only deposited MultiFabs");
++    amrex::MultiFab* deposited_jr = (*deposited_jext)[0];
++    amrex::MultiFab* deposited_jt = (*deposited_jext)[1];
++    amrex::MultiFab* deposited_jz = (*deposited_jext)[2];
++    const amrex::IntVect n_jr =
++        deposited_jr->ixType().toIntVect();
++    const amrex::IntVect n_jt =
++        deposited_jt->ixType().toIntVect();
++    const amrex::IntVect n_jz =
++        deposited_jz->ixType().toIntVect();
++
++    auto rz_position = [&](const amrex::IntVect& nodal, int i, int j) {
++        const amrex::Real r =
++            static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++            + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++        const amrex::Real z =
++            static_cast<amrex::Real>(j) * dx[1] + real_box.lo(1)
++            + (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++        return std::array<amrex::Real,2>{r, z};
++    };
++
++    auto source_mode_value = [&](int cylindrical_component,
++                          const amrex::IntVect& nodal,
++                          int i, int j, int component) {
++        const auto pos = rz_position(nodal, i, j);
++        const amrex::Real r = pos[0];
++        const amrex::Real z = pos[1];
++        const int mode = (component + 1) / 2;
++        const bool sine_component =
++            (component > 0) && ((component % 2) == 0);
++        amrex::Real coefficient = 0._rt;
++        for (int itheta = 0; itheta < audit_ntheta; ++itheta) {
++            const amrex::Real theta =
++                2._rt * MathConst::pi * static_cast<amrex::Real>(itheta)
++                / static_cast<amrex::Real>(audit_ntheta);
++            const amrex::Real costheta = std::cos(theta);
++            const amrex::Real sintheta = std::sin(theta);
++            const amrex::Real x = r * costheta;
++            const amrex::Real y = r * sintheta;
++            const amrex::Real jx = jx_parser(x, y, z, time);
++            const amrex::Real jy = jy_parser(x, y, z, time);
++            const amrex::Real jz = jz_parser(x, y, z, time);
++            amrex::Real jcyl = jz;
++            if (cylindrical_component == 0) {
++                jcyl = jx * costheta + jy * sintheta;
++            } else if (cylindrical_component == 1) {
++                jcyl = -jx * sintheta + jy * costheta;
++            }
++            amrex::Real basis = 1._rt;
++            if (mode > 0) {
++                const amrex::Real mode_theta =
++                    static_cast<amrex::Real>(mode) * theta;
++                basis = 2._rt * (
++                    sine_component
++                        ? std::sin(mode_theta)
++                        : std::cos(mode_theta));
++            }
++            coefficient += basis * jcyl;
++        }
++        return coefficient / static_cast<amrex::Real>(audit_ntheta);
++    };
++
++    const int step = istep[0];
++    const int interval = m_p_ext_field_params->J_ext_div_check_interval;
++    const int stride = (step == 0) ? 1 : coarse_stride;
++    const int tick = (step == 0 || interval <= 0) ? 0 : (step / interval);
++    const int phase_r = tick % coarse_stride;
++    const int phase_z = (tick / coarse_stride) % coarse_stride;
++    const amrex::Box domain = Geom(0).Domain();
++    const auto lo = domain.smallEnd();
++    const auto hi = domain.bigEnd();
++    const amrex::IntVect hi_node = hi + amrex::IntVect::TheUnitVector();
++    const amrex::Real h_min = amrex::min(dx[0], dx[1]);
++    amrex::Real max_abs_div = 0._rt;
++    amrex::Real max_abs_J = 0._rt;
++    amrex::Real max_abs_discarded = 0._rt;
++    amrex::Real max_axis_residual = 0._rt;
++
++    // Authoritative deposited-current divergence.  Premise and algebra are
++    // the same cylindrical Yee operator derived above, but every operand now
++    // comes from the source-only MultiFab that was actually added to
++    // current_fp.  Units remain (A/m^2)/m=A/m^3.  Multiplying by h_min and
++    // dividing by max|J| is dimensionless.  The uniform Cartesian Jy limiting
++    // case cancels radial and azimuthal terms to roundoff; a write-path
++    // component/sign/index mutation leaves an O(J/r) residual.
++    amrex::Real deposited_max_abs_div = 0._rt;
++    amrex::Real deposited_max_abs_J = 0._rt;
++    amrex::Box deposited_domain = amrex::convert(domain, n_jt);
++    deposited_domain.setSmall(1, lo[1] + 1);
++    deposited_domain.setBig(0, hi[0]);
++    deposited_domain.setBig(1, hi[1]);
++    for (amrex::MFIter mfi(*deposited_jt, amrex::TilingIfNotGPU());
++         mfi.isValid(); ++mfi) {
++        amrex::Box check_box = mfi.tilebox(n_jt) & deposited_domain;
++        if (!check_box.ok()) { continue; }
++        auto const jr = deposited_jr->const_array(mfi);
++        auto const jt = deposited_jt->const_array(mfi);
++        auto const jz = deposited_jz->const_array(mfi);
++        amrex::ReduceOps<
++            amrex::ReduceOpMax, amrex::ReduceOpMax> reduce_op;
++        amrex::ReduceData<
++            amrex::Real, amrex::Real> reduce_data(reduce_op);
++        using ReduceTuple = typename decltype(reduce_data)::Type;
++        reduce_op.eval(
++            check_box, reduce_data,
++            [=] AMREX_GPU_DEVICE (
++                int i, int j, int k) -> ReduceTuple {
++                amrex::ignore_unused(k);
++                if (((i - lo[0] - phase_r) % stride) != 0
++                    || ((j - lo[1] - 1 - phase_z) % stride) != 0) {
++                    return {0._rt, 0._rt};
++                }
++                const amrex::Real r_node =
++                    real_box.lo(0) + static_cast<amrex::Real>(i) * dx[0];
++                amrex::Real local_div = 0._rt;
++                amrex::Real local_J = 0._rt;
++                for (int component = 0; component < ncomp; ++component) {
++                    const amrex::Real jr_right = jr(i, j, 0, component);
++                    const amrex::Real jt_here = jt(i, j, 0, component);
++                    const amrex::Real jz_right = jz(i, j, 0, component);
++                    const amrex::Real jz_left = jz(i, j - 1, 0, component);
++                    amrex::Real divh = 0._rt;
++                    if (r_node == 0._rt) {
++                        if (component == 0) {
++                            divh = 4._rt * jr_right / dx[0]
++                                + (jz_right - jz_left) / dx[1];
++                        }
++                    } else {
++                        const amrex::Real jr_left =
++                            jr(i - 1, j, 0, component);
++                        const amrex::Real r_right =
++                            r_node + 0.5_rt * dx[0];
++                        const amrex::Real r_left =
++                            r_node - 0.5_rt * dx[0];
++                        divh =
++                            (r_right * jr_right - r_left * jr_left)
++                                / (r_node * dx[0])
++                            + (jz_right - jz_left) / dx[1];
++                        local_J = amrex::max(
++                            local_J, amrex::Math::abs(jr_left));
++                        if (component > 0) {
++                            const int mode = (component + 1) / 2;
++                            if ((component % 2) == 1) {
++                                const amrex::Real jt_im =
++                                    jt(i, j, 0, component + 1);
++                                divh += static_cast<amrex::Real>(mode)
++                                    * jt_im / r_node;
++                                local_J = amrex::max(
++                                    local_J, amrex::Math::abs(jt_im));
++                            } else {
++                                const amrex::Real jt_re =
++                                    jt(i, j, 0, component - 1);
++                                divh -= static_cast<amrex::Real>(mode)
++                                    * jt_re / r_node;
++                                local_J = amrex::max(
++                                    local_J, amrex::Math::abs(jt_re));
++                            }
++                        }
++                    }
++                    local_div = amrex::max(
++                        local_div, amrex::Math::abs(divh));
++                    local_J = amrex::max(
++                        local_J, amrex::Math::abs(jr_right));
++                    local_J = amrex::max(
++                        local_J, amrex::Math::abs(jt_here));
++                    local_J = amrex::max(
++                        local_J, amrex::Math::abs(jz_right));
++                    local_J = amrex::max(
++                        local_J, amrex::Math::abs(jz_left));
++                }
++                return {local_div, local_J};
++            });
++        const auto values = reduce_data.value();
++        deposited_max_abs_div = amrex::max(
++            deposited_max_abs_div, amrex::get<0>(values));
++        deposited_max_abs_J = amrex::max(
++            deposited_max_abs_J, amrex::get<1>(values));
++    }
++
++    // Near-axis regularity from deposited coefficients, before the solver's
++    // exact-axis regularization hides invalid limits.  For a smooth scalar
++    // mode f_m, f_m(r)=C r^m+O(r^(m+2)); hence
++    // f_m(dr)-2^-m f_m(2dr)=O(dr^(m+2)).  Cylindrical transverse mode m has
++    // leading r^(m-1); m=0 is odd O(r), and m=1 is even.  Extrapolating the
++    // latter from r=dr/2,3dr/2 gives f(0)=(9 f_1/2-f_3/2)/8+O(dr^4).
++    // All residuals are A/m^2 and become dimensionless after /max|J|.
++    // Sanity: uniform Jy satisfies the m=1 pair exactly; bounded Jz=cos(theta)
++    // and a guarded 1/r swirl leave O(J) residuals.
++    amrex::Real deposited_axis_residual = 0._rt;
++    amrex::Box axis_box = amrex::convert(domain, n_jt);
++    axis_box.setSmall(0, lo[0]);
++    axis_box.setBig(0, lo[0]);
++    for (amrex::MFIter mfi(*deposited_jt, false);
++         mfi.isValid(); ++mfi) {
++        amrex::Box check_box = mfi.validbox() & axis_box;
++        if (!check_box.ok()) { continue; }
++        auto const jr = deposited_jr->const_array(mfi);
++        auto const jt = deposited_jt->const_array(mfi);
++        auto const jz = deposited_jz->const_array(mfi);
++        amrex::ReduceOps<amrex::ReduceOpMax> reduce_op;
++        amrex::ReduceData<amrex::Real> reduce_data(reduce_op);
++        using ReduceTuple = typename decltype(reduce_data)::Type;
++        reduce_op.eval(
++            check_box, reduce_data,
++            [=] AMREX_GPU_DEVICE (
++                int i, int j, int k) -> ReduceTuple {
++                amrex::ignore_unused(k);
++                amrex::Real residual = 0._rt;
++                residual = amrex::max(
++                    residual, amrex::Math::abs(
++                        jr(i, j, 0, 0) - jr(i + 1, j, 0, 0) / 3._rt));
++                residual = amrex::max(
++                    residual, amrex::Math::abs(jt(i, j, 0, 0)));
++                residual = amrex::max(
++                    residual, amrex::Math::abs(
++                        jt(i + 1, j, 0, 0)
++                        - jt(i + 2, j, 0, 0) / 2._rt));
++                if (ncomp >= 3) {
++                    const amrex::Real jr_re_axis =
++                        (9._rt * jr(i, j, 0, 1)
++                            - jr(i + 1, j, 0, 1)) / 8._rt;
++                    const amrex::Real jr_im_axis =
++                        (9._rt * jr(i, j, 0, 2)
++                            - jr(i + 1, j, 0, 2)) / 8._rt;
++                    residual = amrex::max(
++                        residual, amrex::Math::abs(
++                            jt(i, j, 0, 1) - jr_im_axis));
++                    residual = amrex::max(
++                        residual, amrex::Math::abs(
++                            jt(i, j, 0, 2) + jr_re_axis));
++                }
++                for (int mode = 1; mode < nmodes; ++mode) {
++                    amrex::Real z_factor = 1._rt;
++                    for (int p = 0; p < mode; ++p) { z_factor *= 0.5_rt; }
++                    amrex::Real transverse_jr_factor = 1._rt;
++                    amrex::Real transverse_jt_factor = 1._rt;
++                    for (int p = 1; p < mode; ++p) {
++                        transverse_jr_factor /= 3._rt;
++                        transverse_jt_factor *= 0.5_rt;
++                    }
++                    for (int component = 2 * mode - 1;
++                         component <= 2 * mode; ++component) {
++                        residual = amrex::max(
++                            residual,
++                            amrex::Math::abs(jz(i, j, 0, component)));
++                        residual = amrex::max(
++                            residual, amrex::Math::abs(
++                                jz(i + 1, j, 0, component)
++                                - z_factor * jz(i + 2, j, 0, component)));
++                        if (mode >= 2) {
++                            residual = amrex::max(
++                                residual,
++                                amrex::Math::abs(jt(i, j, 0, component)));
++                            residual = amrex::max(
++                                residual, amrex::Math::abs(
++                                    jr(i, j, 0, component)
++                                    - transverse_jr_factor
++                                        * jr(i + 1, j, 0, component)));
++                            residual = amrex::max(
++                                residual, amrex::Math::abs(
++                                    jt(i + 1, j, 0, component)
++                                    - transverse_jt_factor
++                                        * jt(i + 2, j, 0, component)));
++                        }
++                    }
++                }
++                return {residual};
++            });
++        deposited_axis_residual = amrex::max(
++            deposited_axis_residual,
++            amrex::get<0>(reduce_data.value()));
++    }
++
++    // Premise: the high-resolution DFT specifies retained source coefficients;
++    // source-only MultiFabs hold what was actually written. Comparing them
++    // makes this gate causal to normalization, sign, component and mode-index
++    // deposition faults. Algebra:
++    //   E=max|J_deposited-J_reference|,
++    //   rho_ret=E/max(|J_deposited|,|J_reference|,J_floor).
++    // Separately D=max_{m>=M}|J_reference,m| and
++    // rho_disc=D/max(|J_deposited|,|J_reference|,D,J_floor).
++    // Dimensions: all amplitudes are A/m^2; both ratios are dimensionless.
++    // Sanity: a correct band-limited deposit agrees to roundoff, a global
++    // retained sign flip gives rho_ret=2, and a pure discarded mode gives
++    // rho_disc=1.
++    amrex::Real reference_max_abs = 0._rt;
++    amrex::Real reference_deposited_max_abs = 0._rt;
++    amrex::Real retained_max_abs_error = 0._rt;
++    amrex::Real declared_discarded_max_abs = 0._rt;
++    for (int idim = 0; idim < 3; ++idim) {
++        amrex::MultiFab* source = (*deposited_jext)[idim];
++        const amrex::IntVect nodal = source->ixType().toIntVect();
++        const int cylindrical_component = idim;
++        for (amrex::MFIter mfi(*source, amrex::TilingIfNotGPU());
++             mfi.isValid(); ++mfi) {
++            const amrex::Box box = mfi.tilebox(nodal);
++            auto const deposited = source->const_array(mfi);
++            amrex::ReduceOps<
++                amrex::ReduceOpMax, amrex::ReduceOpMax,
++                amrex::ReduceOpMax, amrex::ReduceOpMax> reduce_op;
++            amrex::ReduceData<
++                amrex::Real, amrex::Real,
++                amrex::Real, amrex::Real> reduce_data(reduce_op);
++            using ReduceTuple = typename decltype(reduce_data)::Type;
++            reduce_op.eval(
++                box, reduce_data,
++                [=] AMREX_GPU_DEVICE (
++                    int i, int j, int k) -> ReduceTuple {
++                    amrex::ignore_unused(k);
++                    const amrex::Real r =
++                        static_cast<amrex::Real>(i) * dx[0] + real_box.lo(0)
++                        + (1._rt - nodal[0]) * dx[0] * 0.5_rt;
++                    const amrex::Real z =
++                        static_cast<amrex::Real>(j) * dx[1] + real_box.lo(1)
++                        + (1._rt - nodal[1]) * dx[1] * 0.5_rt;
++                    amrex::Real local_reference = 0._rt;
++                    amrex::Real local_deposited = 0._rt;
++                    amrex::Real local_error = 0._rt;
++                    amrex::Real local_discarded = 0._rt;
++                    for (int mode = 0; mode <= reference_max_mode; ++mode) {
++                        amrex::Real coefficient_re = 0._rt;
++                        amrex::Real coefficient_im = 0._rt;
++                        for (int itheta = 0; itheta < audit_ntheta; ++itheta) {
++                            const amrex::Real theta =
++                                2._rt * MathConst::pi
++                                * static_cast<amrex::Real>(itheta)
++                                / static_cast<amrex::Real>(audit_ntheta);
++                            const amrex::Real costheta = std::cos(theta);
++                            const amrex::Real sintheta = std::sin(theta);
++                            const amrex::Real x = r * costheta;
++                            const amrex::Real y = r * sintheta;
++                            const amrex::Real jx = jx_parser(x, y, z, time);
++                            const amrex::Real jy = jy_parser(x, y, z, time);
++                            const amrex::Real jz = jz_parser(x, y, z, time);
++                            amrex::Real jcyl = jz;
++                            if (cylindrical_component == 0) {
++                                jcyl = jx * costheta + jy * sintheta;
++                            } else if (cylindrical_component == 1) {
++                                jcyl = -jx * sintheta + jy * costheta;
++                            }
++                            if (mode == 0) {
++                                coefficient_re += jcyl;
++                            } else {
++                                const amrex::Real mode_theta =
++                                    static_cast<amrex::Real>(mode) * theta;
++                                coefficient_re +=
++                                    2._rt * jcyl * std::cos(mode_theta);
++                                coefficient_im +=
++                                    2._rt * jcyl * std::sin(mode_theta);
++                            }
++                        }
++                        coefficient_re /= static_cast<amrex::Real>(audit_ntheta);
++                        coefficient_im /= static_cast<amrex::Real>(audit_ntheta);
++                        local_reference = amrex::max(
++                            local_reference, amrex::Math::abs(coefficient_re));
++                        local_reference = amrex::max(
++                            local_reference, amrex::Math::abs(coefficient_im));
++                        if (mode < nmodes) {
++                            const int re_component =
++                                (mode == 0) ? 0 : 2 * mode - 1;
++                            const amrex::Real deposited_re =
++                                deposited(i, j, 0, re_component);
++                            local_deposited = amrex::max(
++                                local_deposited,
++                                amrex::Math::abs(deposited_re));
++                            local_error = amrex::max(
++                                local_error,
++                                amrex::Math::abs(
++                                    deposited_re - coefficient_re));
++                            if (mode > 0) {
++                                const int im_component = 2 * mode;
++                                const amrex::Real deposited_im =
++                                    deposited(i, j, 0, im_component);
++                                local_deposited = amrex::max(
++                                    local_deposited,
++                                    amrex::Math::abs(deposited_im));
++                                local_error = amrex::max(
++                                    local_error,
++                                    amrex::Math::abs(
++                                        deposited_im - coefficient_im));
++                            }
++                        } else if (mode <= max_source_mode) {
++                            local_discarded = amrex::max(
++                                local_discarded,
++                                amrex::Math::abs(coefficient_re));
++                            local_discarded = amrex::max(
++                                local_discarded,
++                                amrex::Math::abs(coefficient_im));
++                        }
++                    }
++                    return {
++                        local_reference, local_deposited,
++                        local_error, local_discarded};
++                });
++            const auto values = reduce_data.value();
++            reference_max_abs = amrex::max(
++                reference_max_abs, amrex::get<0>(values));
++            reference_deposited_max_abs = amrex::max(
++                reference_deposited_max_abs, amrex::get<1>(values));
++            retained_max_abs_error = amrex::max(
++                retained_max_abs_error, amrex::get<2>(values));
++            declared_discarded_max_abs = amrex::max(
++                declared_discarded_max_abs, amrex::get<3>(values));
++        }
++    }
++
++    // The source gate runs before the one physical-boundary operator. Check
++    // only nodal residuals whose Jr/Jz stencil operands are both valid source
++    // cells: axis..last radial cell and first..last interior z node. The
++    // antenna contract separately requires boundary/PML standoff.
++    for (int j = lo[1] + 1 + phase_z; j <= hi[1]; j += stride) {
++        for (int i = lo[0] + phase_r; i <= hi[0]; i += stride) {
++            const amrex::Real r_node = rz_position(n_jt, i, j)[0];
++            for (int component = 0; component < ncomp; ++component) {
++                const amrex::Real jr_right =
++                    source_mode_value(0, n_jr, i, j, component);
++                const amrex::Real jt_here =
++                    source_mode_value(1, n_jt, i, j, component);
++                const amrex::Real jz_right =
++                    source_mode_value(2, n_jz, i, j, component);
++                const amrex::Real jz_left =
++                    source_mode_value(2, n_jz, i, j - 1, component);
++                amrex::Real divh = 0._rt;
++
++                if (r_node == 0._rt) {
++                    if (component == 0) {
++                        divh = 4._rt * jr_right / dx[0]
++                            + (jz_right - jz_left) / dx[1];
++                    }
++                    // Match ComputeDivECylindrical: higher-mode div is
++                    // regularized to zero at the axis.
++                } else {
++                    const amrex::Real jr_left =
++                        source_mode_value(0, n_jr, i - 1, j, component);
++                    const amrex::Real r_right =
++                        rz_position(n_jr, i, j)[0];
++                    const amrex::Real r_left =
++                        rz_position(n_jr, i - 1, j)[0];
++                    divh =
++                        (r_right * jr_right - r_left * jr_left)
++                            / (r_node * dx[0])
++                        + (jz_right - jz_left) / dx[1];
++                    max_abs_J = amrex::max(max_abs_J, std::abs(jr_left));
++
++                    if (component > 0) {
++                        const int mode = (component + 1) / 2;
++                        if ((component % 2) == 1) {
++                            const amrex::Real jt_im =
++                                source_mode_value(1, n_jt, i, j, component + 1);
++                            divh += static_cast<amrex::Real>(mode)
++                                * jt_im / r_node;
++                            max_abs_J =
++                                amrex::max(max_abs_J, std::abs(jt_im));
++                        } else {
++                            const amrex::Real jt_re =
++                                source_mode_value(1, n_jt, i, j, component - 1);
++                            divh -= static_cast<amrex::Real>(mode)
++                                * jt_re / r_node;
++                            max_abs_J =
++                                amrex::max(max_abs_J, std::abs(jt_re));
++                        }
++                    }
++                }
++                max_abs_div = amrex::max(max_abs_div, std::abs(divh));
++                max_abs_J = amrex::max(max_abs_J, std::abs(jr_right));
++                max_abs_J = amrex::max(max_abs_J, std::abs(jt_here));
++                max_abs_J = amrex::max(max_abs_J, std::abs(jz_right));
++                max_abs_J = amrex::max(max_abs_J, std::abs(jz_left));
++            }
++
++            // Represented-bandwidth gate.  The injection retains
++            // modes 0..M-1; with N_theta>=4*M the same quadrature also exposes
++            // modes M..2*M-1.  A nonzero discarded coefficient means the
++            // selected solver basis would silently remove/change the drive.
++            for (int mode = nmodes; mode <= max_source_mode; ++mode) {
++                const int re_component = 2 * mode - 1;
++                const int im_component = 2 * mode;
++                for (int idim = 0; idim < 3; ++idim) {
++                    const amrex::IntVect& nodal =
++                        (idim == 0) ? n_jr : ((idim == 1) ? n_jt : n_jz);
++                    max_abs_discarded = amrex::max(
++                        max_abs_discarded,
++                        std::abs(source_mode_value(
++                            idim, nodal, i, j, re_component)));
++                    max_abs_discarded = amrex::max(
++                        max_abs_discarded,
++                        std::abs(source_mode_value(
++                            idim, nodal, i, j, im_component)));
++                }
++            }
++        }
++    }
++
++    // The divergence solver forces higher-mode div to zero on axis, so check
++    // vector regularity separately before that regularization can hide an
++    // invalid/singular parser.  A finite Cartesian vector at r=0 has only
++    // transverse m=1 content and obeys
++    // Jtheta_re=Jr_im, Jtheta_im=-Jr_re; Jz has mode 0 only.
++    {
++        const int i_axis = lo[0];
++        for (int j = lo[1]; j <= hi_node[1]; ++j) {
++            const amrex::Real jr_re =
++                source_mode_value(0, n_jt, i_axis, j, 1);
++            const amrex::Real jr_im =
++                source_mode_value(0, n_jt, i_axis, j, 2);
++            const amrex::Real jt_re =
++                source_mode_value(1, n_jt, i_axis, j, 1);
++            const amrex::Real jt_im =
++                source_mode_value(1, n_jt, i_axis, j, 2);
++            max_axis_residual = amrex::max(
++                max_axis_residual, std::abs(jt_re - jr_im));
++            max_axis_residual = amrex::max(
++                max_axis_residual, std::abs(jt_im + jr_re));
++            max_axis_residual = amrex::max(
++                max_axis_residual,
++                std::abs(source_mode_value(0, n_jt, i_axis, j, 0)));
++            max_axis_residual = amrex::max(
++                max_axis_residual,
++                std::abs(source_mode_value(1, n_jt, i_axis, j, 0)));
++            for (int component = 1; component < ncomp; ++component) {
++                if (component > 2) {
++                    max_axis_residual = amrex::max(
++                        max_axis_residual,
++                        std::abs(source_mode_value(
++                            0, n_jt, i_axis, j, component)));
++                    max_axis_residual = amrex::max(
++                        max_axis_residual,
++                        std::abs(source_mode_value(
++                            1, n_jt, i_axis, j, component)));
++                }
++            }
++        }
++        // Jz is cell-centered in z, unlike the transverse currents. Check
++        // its axis regularity at its own live z stagger.
++        for (int j = lo[1]; j <= hi[1]; ++j) {
++            for (int component = 1; component < ncomp; ++component) {
++                max_axis_residual = amrex::max(
++                    max_axis_residual,
++                    std::abs(source_mode_value(
++                        2, n_jz, i_axis, j, component)));
++            }
++        }
++    }
++
++    // The parser-based loop above remains only the independent high-resolution
++    // bandwidth audit.  The div and regularity verdicts are overwritten by
++    // reductions over the source-only deposited MultiFabs, so injection-only
++    // mutations can drive these gates red.
++    max_abs_div = deposited_max_abs_div;
++    max_abs_J = deposited_max_abs_J;
++    max_abs_discarded = declared_discarded_max_abs;
++    max_axis_residual = deposited_axis_residual;
++    amrex::ParallelDescriptor::ReduceRealMax(max_abs_div);
++    amrex::ParallelDescriptor::ReduceRealMax(max_abs_J);
++    amrex::ParallelDescriptor::ReduceRealMax(max_abs_discarded);
++    amrex::ParallelDescriptor::ReduceRealMax(max_axis_residual);
++    amrex::ParallelDescriptor::ReduceRealMax(reference_max_abs);
++    amrex::ParallelDescriptor::ReduceRealMax(reference_deposited_max_abs);
++    amrex::ParallelDescriptor::ReduceRealMax(retained_max_abs_error);
++
++    // Premise: per-sample parser/rotation/basis roundoff is bounded by
++    // 128*epsilon times the global scale; summation follows
++    // gamma_n=n*epsilon/(1-n*epsilon). Algebra: nonzero modes normalize by
++    // 2/N, so tau_dft(N)=2*(gamma_(N+8)+128 epsilon); comparing independent
++    // deposition/reference DFTs adds both budgets plus 8 epsilon for
++    // store/load/subtraction. Dimensions: every tau is dimensionless.
++    // Sanity: tolerance grows with N and precision, while a sign flip has an
++    // O(1) residual and remains many orders larger in DP and SP.
++    constexpr amrex::Real epsilon =
++        std::numeric_limits<amrex::Real>::epsilon();
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        (ntheta + 8) * epsilon < 1._rt
++            && (audit_ntheta + 8) * epsilon < 1._rt,
++        "RZ J_ext DFT quadrature is too large for a finite roundoff bound");
++    const auto gamma_n = [=](int count) {
++        const amrex::Real n_eps =
++            static_cast<amrex::Real>(count) * epsilon;
++        return n_eps / (1._rt - n_eps);
++    };
++    const auto dft_tolerance = [=](int count) {
++        return 2._rt * (gamma_n(count + 8) + 128._rt * epsilon);
++    };
++    const amrex::Real retained_rel_tol =
++        dft_tolerance(ntheta) + dft_tolerance(audit_ntheta)
++        + 8._rt * epsilon;
++    const amrex::Real retained_scale = amrex::max(
++        amrex::max(reference_max_abs, reference_deposited_max_abs), J_floor);
++    const amrex::Real retained_rel =
++        retained_max_abs_error / retained_scale;
++
++    // Signed deposited-mode evidence for the flagship pure-Cartesian-Jy
++    // contract. WarpX's native DFT gives Jr[m=1,im]=Jy and
++    // Jtheta[m=1,re]=Jy [A/m^2]; every other retained coefficient is zero.
++    // Min/max preserve sign and amplitude, unlike quadratic FieldEnergy.
++    // Sanity: Jy=+1.25 reports (+1.25,+1.25,forbidden=0); either a global
++    // sign flip or a Jtheta-only flip changes a signed bound and goes red.
++    const amrex::Real jr_m1_re_min = deposited_jr->min(1);
++    const amrex::Real jr_m1_re_max = deposited_jr->max(1);
++    const amrex::Real jr_m1_im_min = deposited_jr->min(2);
++    const amrex::Real jr_m1_im_max = deposited_jr->max(2);
++    const amrex::Real jt_m1_re_min = deposited_jt->min(1);
++    const amrex::Real jt_m1_re_max = deposited_jt->max(1);
++    const amrex::Real jt_m1_im_min = deposited_jt->min(2);
++    const amrex::Real jt_m1_im_max = deposited_jt->max(2);
++    const amrex::Real jz_m1_re_min = deposited_jz->min(1);
++    const amrex::Real jz_m1_re_max = deposited_jz->max(1);
++    const amrex::Real jz_m1_im_min = deposited_jz->min(2);
++    const amrex::Real jz_m1_im_max = deposited_jz->max(2);
++    amrex::Real deposited_norm = 0._rt;
++    amrex::Real uniform_jy_forbidden_max = 0._rt;
++    amrex::Real tracka_forbidden_max = 0._rt;
++    for (int idim = 0; idim < 3; ++idim) {
++        amrex::MultiFab* source = (*deposited_jext)[idim];
++        for (int component = 0; component < ncomp; ++component) {
++            const amrex::Real component_abs = amrex::max(
++                std::abs(source->min(component)),
++                std::abs(source->max(component)));
++            deposited_norm = amrex::max(deposited_norm, component_abs);
++            if (!((idim == 0 && component == 2)
++                || (idim == 1 && component == 1))) {
++                uniform_jy_forbidden_max = amrex::max(
++                    uniform_jy_forbidden_max, component_abs);
++            }
++            if (component != 1 && component != 2) {
++                tracka_forbidden_max = amrex::max(
++                    tracka_forbidden_max, component_abs);
++            }
++        }
++    }
++    // max_digits10 is the shortest decimal precision that round-trips every
++    // finite Real; a private stream preserves the caller's Print formatting.
++    // The values remain A/m^2. Sanity: a DP TrackA golden compared at a
++    // 4096-epsilon relative budget must not fail from 10-digit log truncation.
++    std::stringstream deposited_gate_message;
++    deposited_gate_message
++        << std::setprecision(std::numeric_limits<amrex::Real>::max_digits10)
++        << "J_ext RZ deposited-gate: max_abs=" << deposited_norm
++        << " jr_m1_re_min=" << jr_m1_re_min
++        << " jr_m1_re_max=" << jr_m1_re_max
++        << " jr_m1_im_min=" << jr_m1_im_min
++        << " jr_m1_im_max=" << jr_m1_im_max
++        << " jt_m1_re_min=" << jt_m1_re_min
++        << " jt_m1_re_max=" << jt_m1_re_max
++        << " jt_m1_im_min=" << jt_m1_im_min
++        << " jt_m1_im_max=" << jt_m1_im_max
++        << " jz_m1_re_min=" << jz_m1_re_min
++        << " jz_m1_re_max=" << jz_m1_re_max
++        << " jz_m1_im_min=" << jz_m1_im_min
++        << " jz_m1_im_max=" << jz_m1_im_max
++        << " uniform_jy_forbidden_max=" << uniform_jy_forbidden_max
++        << " tracka_forbidden_max=" << tracka_forbidden_max;
++    amrex::Print() << deposited_gate_message.str() << "\n";
++    // Separate contracts: div is the discrete continuity residual; bandwidth
++    // is source projection loss; axis is a near-axis smoothness residual.
++    constexpr amrex::Real div_rel_tol = 1.0e-4_rt;
++    constexpr amrex::Real bandwidth_rel_tol = 1.0e-4_rt;
++    constexpr amrex::Real axis_rel_tol = 1.0e-4_rt;
++    const amrex::Real rel =
++        max_abs_div * h_min / amrex::max(max_abs_J, J_floor);
++    const amrex::Real bandwidth_rel =
++        max_abs_discarded / amrex::max(
++            amrex::max(reference_max_abs, reference_deposited_max_abs),
++            amrex::max(max_abs_discarded, J_floor));
++    const amrex::Real axis_rel =
++        max_axis_residual / amrex::max(max_abs_J, J_floor);
++    amrex::Print() << "J_ext RZ div-gate: max|div_h J_ext|=" << max_abs_div
++                   << " max|J_ext|=" << max_abs_J
++                   << " h_min=" << h_min
++                   << " r=|div|*h/|J|=" << rel
++                   << " rel_tol=" << div_rel_tol
++                   << " nmodes=" << nmodes
++                   << " ntheta=" << ntheta
++                   << " stride=" << stride
++                   << " phase=(" << phase_r << "," << phase_z << ")\n";
++    amrex::Print() << "J_ext RZ mode-gate: max|J_retained|=" << max_abs_J
++                   << " max|J_discarded|=" << max_abs_discarded
++                   << " discarded/retained=" << bandwidth_rel
++                   << " audit_ntheta=" << audit_ntheta
++                   << " retained_max_abs_error=" << retained_max_abs_error
++                   << " retained_reference_max_abs=" << reference_max_abs
++                   << " retained_deposited_max_abs="
++                   << reference_deposited_max_abs
++                   << " retained_relative=" << retained_rel
++                   << " retained_rel_tol=" << retained_rel_tol
++                   << " max_axis_residual=" << max_axis_residual
++                   << " axis_relative=" << axis_rel
++                   << " nmodes=" << nmodes
++                   << " ntheta=" << ntheta << "\n";
++    if (rel > div_rel_tol) {
++        std::stringstream ss;
++        ss << "warpx.J_ext_grid_init_style cylindrical discrete "
++           << "div(J_ext) check failed: max|div_h J_ext|=" << max_abs_div
++           << " max|J_ext|=" << max_abs_J
++           << " relative residual r=|div|*h/|J|=" << rel
++           << " exceeds rel_tol=" << div_rel_tol
++           << " (RZ deck contract: Cartesian parsers must decompose to a "
++           << "discrete-solenoidal cylindrical source in retained modes)";
++        WARPX_ABORT_WITH_MESSAGE(ss.str());
++    }
++    if (bandwidth_rel > bandwidth_rel_tol) {
++        std::stringstream ss;
++        ss << "warpx.J_ext_grid_init_style RZ angular bandwidth check failed: "
++           << "max discarded/retained coefficient=" << bandwidth_rel
++           << " exceeds rel_tol=" << bandwidth_rel_tol
++           << "; increase warpx.n_rz_azimuthal_modes (current M="
++           << nmodes << ", retained modes 0.." << (nmodes - 1) << ")";
++        WARPX_ABORT_WITH_MESSAGE(ss.str());
++    }
++    if (retained_rel > retained_rel_tol) {
++        std::stringstream ss;
++        ss << "warpx.J_ext_grid_init_style RZ retained coefficient mismatch: "
++           << "deposited/reference relative residual=" << retained_rel
++           << " exceeds precision/quadrature rel_tol=" << retained_rel_tol
++           << " (deposited source-only MultiFab differs from independent "
++           << audit_ntheta << "-point reference DFT)";
++        WARPX_ABORT_WITH_MESSAGE(ss.str());
++    }
++    if (axis_rel > axis_rel_tol) {
++        std::stringstream ss;
++        ss << "warpx.J_ext_grid_init_style RZ axis-regularity check failed: "
++           << "relative residual=" << axis_rel
++           << " exceeds rel_tol=" << axis_rel_tol
++           << " (finite Cartesian parser must yield only regular m=1 "
++           << "transverse content and m=0 Jz at r=0)";
++        WARPX_ABORT_WITH_MESSAGE(ss.str());
++    }
++#elif defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+     amrex::ignore_unused(time);
+     return;
+ #else
+diff --git a/Source/Initialization/ExternalField.H b/Source/Initialization/ExternalField.H
+index 48caaf13..d8fb6648 100644
+--- a/Source/Initialization/ExternalField.H
++++ b/Source/Initialization/ExternalField.H
+@@ -62,13 +62,24 @@ struct ExternalFieldParams
+     //! Whether a parsed impressed current is added to the full-EM current
+     bool J_ext_grid_enabled = false;
+ 
+-    //! Discrete Yee-adjoint div(J_ext) gate interval (0 disables; default 100).
+-    //! Step 0 is dense (stride 1); later checks use stride 8 with phase offset.
++    //! Discrete Yee-adjoint div(J_ext) gate interval (default 100).
++    //! Parsed RZ J_ext requires a positive interval: no configuration may
++    //! silently disable its coupled div/mode/regularity physics guards.
+     int J_ext_div_check_interval = 100;
+ 
+     //! If true, after injection abort unless current_fp matches J_ext to SP tol (zero-Jp tests)
+     bool J_ext_self_check_analytic = false;
+ 
++    //! RZ angular quadrature count (0 => 4*n_rz_azimuthal_modes).
++    //! Must be even and at least 4*M so the first-step bandwidth gate can
++    //! inspect the discarded modes M..2*M-1.
++    int J_ext_rz_n_theta = 0;
++
++    //! Highest cylindrical Fourier mode present after Cartesian-vector rotation.
++    //! Required for parsed RZ J_ext: finite sampling cannot infer an unbounded
++    //! parser spectrum, so the declaration is part of the fail-closed contract.
++    int J_ext_rz_max_source_mode = -1;
++
+     //! User-defined parser to initialize x-component of the magnetic field on the grid
+     std::unique_ptr<amrex::Parser> Bxfield_parser;
+     //! User-defined parser to initialize y-component of the magnetic field on the grid
+diff --git a/Source/Initialization/ExternalField.cpp b/Source/Initialization/ExternalField.cpp
+index 9cdc6783..9833be7b 100644
+--- a/Source/Initialization/ExternalField.cpp
++++ b/Source/Initialization/ExternalField.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <algorithm>
+ #include <functional>
++#include <limits>
+ #include <numeric>
+ #include <vector>
+ 
+@@ -87,9 +88,31 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
+         J_ext_grid_s == "parse_j_ext_grid_function",
+         "warpx.J_ext_grid_init_style supports only parse_J_ext_grid_function");
+     J_ext_grid_enabled = J_ext_grid_s == "parse_j_ext_grid_function";
+-    // Default ON: check every 100 steps. 0 disables the runtime div(J_ext) gate.
++    // Default ON: check every 100 steps.
+     pp_warpx.query("J_ext_div_check_interval", J_ext_div_check_interval);
+     pp_warpx.query("J_ext_self_check_analytic", J_ext_self_check_analytic);
++    pp_warpx.query("J_ext_rz_n_theta", J_ext_rz_n_theta);
++    pp_warpx.query("J_ext_rz_max_source_mode", J_ext_rz_max_source_mode);
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        J_ext_rz_n_theta >= 0,
++        "warpx.J_ext_rz_n_theta must be non-negative (0 selects 4*M)");
++#if defined(WARPX_DIM_RZ)
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        !J_ext_grid_enabled || J_ext_div_check_interval > 0,
++        "warpx.J_ext_div_check_interval must be positive when parsed RZ "
++        "J_ext is enabled; zero/negative would disable all RZ physics guards");
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        !J_ext_grid_enabled || J_ext_rz_max_source_mode >= 0,
++        "parsed RZ J_ext requires non-negative "
++        "warpx.J_ext_rz_max_source_mode (largest cylindrical mode after "
++        "Cartesian-vector rotation)");
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        !J_ext_grid_enabled
++            || J_ext_rz_max_source_mode
++                <= (std::numeric_limits<int>::max() - 1) / 2,
++        "warpx.J_ext_rz_max_source_mode is too large for the reference "
++        "quadrature");
++#endif
+ 
+     //
+     //  Constant external field
+@@ -197,7 +220,10 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
+     //   warpx.J_ext_grid_init_style = parse_J_ext_grid_function
+     //   warpx.Jx/Jy/Jz_external_grid_function(x,y,z,t) = ...
+     // Coordinate convention mirrors ComputeExternalFieldOnGridUsingParser:
+-    //   3D: (x,y,z); 2D XZ: (x,0,z); 1D Z: (0,0,z).  RZ is fail-closed.
++    //   3D: (x,y,z); 2D XZ: (x,0,z); 1D Z: (0,0,z).
++    //   RZ: Cartesian parsers are sampled on x=r*cos(theta), y=r*sin(theta),
++    //       rotated into (Jr,Jtheta,Jz), and projected onto WarpX's retained
++    //       real/cosine + imaginary/sine azimuthal-mode representation.
+     // J_ext is injected INSIDE SyncCurrentAndRho after filter+SumBoundary and
+     // before the single ApplyJfieldBoundary (S(Jp)+A, one BC pass). Diagnostics:
+     // current_fp = Jp_filtered + J_ext (no separate J_ext channel yet).
+@@ -207,10 +233,10 @@ ExternalFieldParams::ExternalFieldParams(const amrex::ParmParse& pp_warpx)
+     // runtime nodal div_h gate aborts when r = |div|*h/|J| exceeds 1e-4.
+     //
+     if (J_ext_grid_enabled) {
+-#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++#if defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+         WARPX_ABORT_WITH_MESSAGE(
+-            "J_ext_grid_init_style is not supported in RZ "
+-            "geometry; azimuthal-mode decomposition of an impressed current is not implemented");
++            "J_ext_grid_init_style is not supported in one-dimensional "
++            "cylindrical or spherical geometry");
+ #endif
+         std::string str_Jx_ext_grid_function;
+         std::string str_Jy_ext_grid_function;
+diff --git a/Source/WarpX.H b/Source/WarpX.H
+index 20d25451..3d1d9c5c 100644
+--- a/Source/WarpX.H
++++ b/Source/WarpX.H
+@@ -706,8 +706,14 @@ public:
+     /** Add the parsed, time-centered impressed current to level-0 current_fp. */
+     void AddExternalCurrent (amrex::Real time);
+ 
+-    /** Sampled Yee discrete-divergence check of J_ext; aborts if out of tolerance. */
+-    void CheckExternalCurrentDivergence (amrex::Real time);
++    /**
++     * Sampled Yee discrete-divergence check of J_ext; aborts if out of
++     * tolerance. RZ passes the source-only deposited MultiFabs so the gate
++     * observes the write path without confusing particle current with J_ext.
++     */
++    void CheckExternalCurrentDivergence (
++        amrex::Real time,
++        std::array<amrex::MultiFab*,3> const* deposited_jext = nullptr);
+ 
+     void SyncRho ();
+ 
+diff --git a/Source/WarpX.cpp b/Source/WarpX.cpp
+index b2686302..36656b93 100644
+--- a/Source/WarpX.cpp
++++ b/Source/WarpX.cpp
+@@ -531,10 +531,10 @@ WarpX::WarpX ()
+     }
+ 
+     if (m_p_ext_field_params->J_ext_grid_enabled) {
+-#if defined(WARPX_DIM_RZ) || defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
++#if defined(WARPX_DIM_RCYLINDER) || defined(WARPX_DIM_RSPHERE)
+         WARPX_ABORT_WITH_MESSAGE(
+-            "J_ext_grid_init_style is not supported in RZ "
+-            "geometry; azimuthal-mode decomposition of an impressed current is not implemented");
++            "J_ext_grid_init_style is not supported in one-dimensional "
++            "cylindrical or spherical geometry");
+ #endif
+         WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
+             max_level == 0,
+diff --git a/tests/jext/DIAGNOSTICS-SEMANTICS.md b/tests/jext/DIAGNOSTICS-SEMANTICS.md
+index 3679c620..d5c5606d 100644
+--- a/tests/jext/DIAGNOSTICS-SEMANTICS.md
++++ b/tests/jext/DIAGNOSTICS-SEMANTICS.md
+@@ -1,4 +1,4 @@
+-# Diagnostics semantics with J_ext
++# Diagnostics semantics with J_ext (P2 — document only)
+ 
+ When `warpx.J_ext_grid_init_style = parse_J_ext_grid_function` is enabled:
+ 
+diff --git a/tests/jext/README.md b/tests/jext/README.md
+index 1cf866c1..044468aa 100644
+--- a/tests/jext/README.md
++++ b/tests/jext/README.md
+@@ -4,7 +4,10 @@
+ - `warpx.J_ext_grid_init_style = parse_J_ext_grid_function`
+ - `warpx.Jx/Jy/Jz_external_grid_function(x,y,z,t)` — parsers always 4-arg.
+   Coordinates mirror external E/B grid parsers:
+-  - 3D: (x,y,z); 2D XZ: (x,0,z); 1D Z: (0,0,z). RZ fail-closed.
++  - 3D: (x,y,z); 2D XZ: (x,0,z); 1D Z: (0,0,z).
++  - RZ: the same Cartesian parser is sampled at
++    `(x,y,z)=(r cos(theta),r sin(theta),z)`, rotated to
++    `(Jr,Jtheta,Jz)`, and projected onto WarpX's real RZ basis.
+ - J_ext is injected **inside** `SyncCurrentAndRho` after filter+SumBoundary and
+   **before** the single `ApplyJfieldBoundary` on the total current (S(Jp)+A).
+   A second per-step boundary apply is intentionally absent: the operator is
+@@ -13,15 +16,37 @@
+   boundary-count Print).
+ - Diagnostics: `current_fp = Jp_filtered + J_ext` (no separate channel yet).
+ - J_ext must be discrete-solenoidal; runtime Yee `div_h` sample aborts if
+-  relative residual `|div|*h/|J| > 1e-4` (default every 100 steps;
+-  `warpx.J_ext_div_check_interval=0` disables).
++  relative residual `|div|*h/|J| > 1e-4` (default every 100 steps).
+   Continuum-curl antennas need `k_max h ≲ 0.13` (~47 cells/wavelength) because
+   `r ~ O((kh)^3)` under the gate's `·h` normalization.
+ - Boundary PML allowed with antenna–PML standoff; `do_pml_in_domain=1` abort.
+-- Unsupported: RZ, AMR (`max_level>0`), Vay deposition, current centering,
++- RZ requires `warpx.n_rz_azimuthal_modes >= 2`. Component 0 is mode 0;
++  components `2m-1,2m` are the real/cosine and imaginary/sine coefficients.
++  Parsed RZ J_ext also requires a positive `warpx.J_ext_div_check_interval`
++  (zero/negative rejected at parse time so coupled div/mode/axis guards cannot
++  be silently disabled) and a declared `warpx.J_ext_rz_max_source_mode`
++  (largest cylindrical Fourier mode after Cartesian-vector rotation).
++  `warpx.J_ext_rz_n_theta=0` selects `4*M` angular samples; an explicit value
++  must be even and at least `4*M`. A high-resolution declared-bandwidth audit,
++  retained deposited/reference comparison, and near-axis regularity check fail
++  closed on unresolved, mis-deposited, or non-regular sources. Parser NaN/Inf
++  is rejected before `current_fp` is modified.
++- RZ divergence is checked mode-by-mode using
++  `(1/r)d(r Jr)/dr + (1/r)d(Jtheta)/dtheta + d(Jz)/dz`, including WarpX's
++  cosine/sine coupling signs and its special axis stencil. All locations come
++  from each live current `ixType()`.
++- Unsupported: AMR (`max_level>0`), Vay deposition, current centering,
+   hybrid/collocated grid, moving window, EB, implicit solvers.
+ 
+ ## Discriminating div-gate decks
++- **RZ** `solenoidal_antenna_rz`: uniform Cartesian `Jy`, represented as the
++  coupled `m=1` pair `Jr_imag=Jtheta_real`. The radial metric term cancels the
++  `-m Jtheta_real/r` term, so a Cartesian or mode-0-only check fails.
++- **RZ flagship shape** `tracka_rmf_antenna_rz`: resolved dimensionless copy
++  of the production `curl(M)` parser algebra, including all `Jx/Jy/Jz`
++  expressions, a non-axis-aligned RMF phase, two steps, and finite field
++  energy. It must remain within the cylindrical discrete-divergence gate and
++  contain no discarded mode at `M=2`.
+ - **2D** `solenoidal_antenna_2d`: x–z curl pair (Jx, Jz).
+ - **3D** `solenoidal_antenna_3d`: x–y curl pair (Jx, Jy); plus
+   `solenoidal_antenna_yz_3d`: y–z curl pair exercising **Jz** collocation
+@@ -36,6 +61,10 @@ per-component half-offset tables transcribed from `WarpX.cpp` AllocLevelMFs
+ (not live `ixType()`, not an algebraic re-expression of the injection fac).
+ Host `assert_stagger_table_and_spot` hard-asserts the table; the analytic
+ multifab Jy=1.25 family hard-asserts the baked amplitude.
++For RZ, the periodic manufactured family `Jcart=(sin(pi*z),0,x)` has
++`Jr_1_real=sin(pi*z)`, `Jtheta_1_imag=-sin(pi*z)`, and `Jz_1_real=r`. Its
++oracle uses literal RZ Yee half-offsets and asserts those offsets against each
++live `ixType()`.
+ 
+ ## Periodic seam
+ `periodic_seam_3d` uses an odd function of z (`sin(0.5*pi*z)`). The C++
+@@ -52,6 +81,12 @@ Runner parses `diags/reducedfiles/fieldenergy.txt` and asserts
+ driven final `W` within **±20% of analytic 0.127062 J** and undriven
+ `|W| < 1e-12 J`. Derivation is in the deck comments. A 4× over-injection
+ (`W→0.508`) fails.
++The RZ pair uses a uniform Cartesian `Jy` in a `2*pi m^3` cylinder and expects
++positive `U=W_src=3.494263e-6 J` within ±1%; its undriven control must remain
++below `1e-16 J`. The expected value includes WarpX's exact RZ modal
++`FieldEnergy` weights plus the one Neumann radial current-boundary treatment,
++so it is a discrete ledger rather than a continuum back-fit. This exercises
++Ampere injection and the full `m=1` basis.
+ 
+ ## Runner
+ `./tests/jext/run_jext_regression.sh <warpx_exe> [logdir]`
+diff --git a/tests/jext/inputs/analytic_multifab_rz b/tests/jext/inputs/analytic_multifab_rz
+new file mode 100644
+index 00000000..bccf8756
+--- /dev/null
++++ b/tests/jext/inputs/analytic_multifab_rz
+@@ -0,0 +1,29 @@
++max_step = 1
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# Independent mode/stagger oracle family:
++# J_cart=(sin(pi*z),0,x) is periodic across z=[-1,1] and gives
++# Jr_1_real=sin(pi*z), Jtheta_1_imag=-sin(pi*z), Jz_1_real=r.
++warpx.Jx_external_grid_function(x,y,z,t) = "sin(pi*z)"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "x"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 1
++warpx.J_ext_div_check_interval = 1
++warpx.J_ext_self_check_analytic = 1
+diff --git a/tests/jext/inputs/assert_mode0_only_rz b/tests/jext/inputs/assert_mode0_only_rz
+new file mode 100644
+index 00000000..be667b6a
+--- /dev/null
++++ b/tests/jext/inputs/assert_mode0_only_rz
+@@ -0,0 +1,25 @@
++max_step = 1
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 1
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# Flagship-shaped m=1 source. It must fail closed with M=1, not project to 0.
++warpx.Jx_external_grid_function(x,y,z,t) = "z"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "x"
++warpx.J_ext_rz_max_source_mode = 1
++warpx.J_ext_div_check_interval = 1
+diff --git a/tests/jext/inputs/bandwidth_abort_rz b/tests/jext/inputs/bandwidth_abort_rz
+new file mode 100644
+index 00000000..25f75080
+--- /dev/null
++++ b/tests/jext/inputs/bandwidth_abort_rz
+@@ -0,0 +1,27 @@
++max_step = 1
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# Jz=x^2-y^2=r^2 cos(2 theta) is pure m=2. M=2 retains only m=0,1,
++# so the first-step discarded-mode check must abort instead of null-driving.
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "x*x-y*y"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 2
++warpx.J_ext_div_check_interval = 1
+diff --git a/tests/jext/inputs/energy_driven_rz b/tests/jext/inputs/energy_driven_rz
+new file mode 100644
+index 00000000..5ea6a9a0
+--- /dev/null
++++ b/tests/jext/inputs/energy_driven_rz
+@@ -0,0 +1,40 @@
++max_step = 4
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++my_constants.J0 = 1.0e3
++my_constants.t_ramp = 2.0e-12
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "J0*min(1.0,t/t_ramp)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 1
++warpx.J_ext_div_check_interval = 1
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
++# Vacuum analytic ledger:
++# t_half/dt=(0.5,1.5,2.5,3.5), ramp=(0.25,0.75,1,1), sum=3.
++# E_y(final)=-J0*(3*dt)/epsilon0; B stays zero for uniform Cartesian Jy.
++# V=pi*R^2*L=2*pi m^3, so
++# Continuum U=0.5*epsilon0*E^2*V=3.193329e-6 J. This deck deliberately
++# exercises the one Neumann radial J boundary operator. Etheta is nodal in r:
++# its outer-node current doubles, and FieldEnergy also assigns the axis the
++# cylindrical pi*dr/4 weight. With nr=16 the exact multimode diagnostic factor
++# is (1 + 1.1884765625)/2 = 1.09423828125, so
++# U=W_src=3.494263e-6 J (magnetic residue is below 4e-6 of total).
+diff --git a/tests/jext/inputs/energy_undriven_rz b/tests/jext/inputs/energy_undriven_rz
+new file mode 100644
+index 00000000..88afaad7
+--- /dev/null
++++ b/tests/jext/inputs/energy_undriven_rz
+@@ -0,0 +1,30 @@
++max_step = 4
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++my_constants.J0 = 0.0
++my_constants.t_ramp = 2.0e-12
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "J0*min(1.0,t/t_ramp)"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 1
++warpx.J_ext_div_check_interval = 1
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/inputs/monopole_abort_rz b/tests/jext/inputs/monopole_abort_rz
+new file mode 100644
+index 00000000..87e13e78
+--- /dev/null
++++ b/tests/jext/inputs/monopole_abort_rz
+@@ -0,0 +1,26 @@
++max_step = 1
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# div(J)=d(z)/dz=1: must abort the cylindrical gate.
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jz_external_grid_function(x,y,z,t) = "z"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 0
++warpx.J_ext_div_check_interval = 1
+diff --git a/tests/jext/inputs/red/axis_bounded_cos_rz b/tests/jext/inputs/red/axis_bounded_cos_rz
+new file mode 100644
+index 00000000..5f89e7dc
+--- /dev/null
++++ b/tests/jext/inputs/red/axis_bounded_cos_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++warpx.Jz_external_grid_function(x,y,z,t)="if(sqrt(x*x+y*y)>0.0,x/sqrt(x*x+y*y),0.0)"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=1
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/axis_guarded_swirl_rz b/tests/jext/inputs/red/axis_guarded_swirl_rz
+new file mode 100644
+index 00000000..5606f8ee
+--- /dev/null
++++ b/tests/jext/inputs/red/axis_guarded_swirl_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="if(x*x+y*y>0.0,-y/(x*x+y*y),0.0)"
++warpx.Jy_external_grid_function(x,y,z,t)="if(x*x+y*y>0.0,x/(x*x+y*y),0.0)"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=0
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/common-rz.txt b/tests/jext/inputs/red/common-rz.txt
+new file mode 100644
+index 00000000..b0f8f138
+--- /dev/null
++++ b/tests/jext/inputs/red/common-rz.txt
+@@ -0,0 +1,3 @@
++Documentation-only: red inputs duplicate the tiny 16x32 CPU RZ harness because
++WarpX ParmParse inputs have no include directive. Each deck is deliberately
++invalid and must never be added to the normal green suite.
+diff --git a/tests/jext/inputs/red/interval_negative_rz b/tests/jext/inputs/red/interval_negative_rz
+new file mode 100644
+index 00000000..489d0be9
+--- /dev/null
++++ b/tests/jext/inputs/red/interval_negative_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=8 8
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="1.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=1
++warpx.J_ext_div_check_interval=-1
+diff --git a/tests/jext/inputs/red/interval_zero_rz b/tests/jext/inputs/red/interval_zero_rz
+new file mode 100644
+index 00000000..fb907a63
+--- /dev/null
++++ b/tests/jext/inputs/red/interval_zero_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=8 8
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="1.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=1
++warpx.J_ext_div_check_interval=0
+diff --git a/tests/jext/inputs/red/mode_m4_rz b/tests/jext/inputs/red/mode_m4_rz
+new file mode 100644
+index 00000000..1c15e436
+--- /dev/null
++++ b/tests/jext/inputs/red/mode_m4_rz
+@@ -0,0 +1,23 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++amr.max_grid_size=16
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++algo.current_deposition=direct
++warpx.use_filter=0
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++# Re[(x+i y)^4]: regular, divergence-free, and above retained M=2.
++warpx.Jz_external_grid_function(x,y,z,t)="x*x*x*x-6*x*x*y*y+y*y*y*y"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=4
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/mode_m7_rz b/tests/jext/inputs/red/mode_m7_rz
+new file mode 100644
+index 00000000..60a63dd6
+--- /dev/null
++++ b/tests/jext/inputs/red/mode_m7_rz
+@@ -0,0 +1,21 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++amr.max_grid_size=16
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++# Re[(x+i y)^7], previously aliased by Ntheta=8.
++warpx.Jz_external_grid_function(x,y,z,t)="x*x*x*x*x*x*x-21*x*x*x*x*x*y*y+35*x*x*x*y*y*y*y-7*x*y*y*y*y*y*y"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=7
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/mode_m8_rz b/tests/jext/inputs/red/mode_m8_rz
+new file mode 100644
+index 00000000..3a45e74a
+--- /dev/null
++++ b/tests/jext/inputs/red/mode_m8_rz
+@@ -0,0 +1,21 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++amr.max_grid_size=16
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++# Re[(x+i y)^8], exactly at the old deposition alias period.
++warpx.Jz_external_grid_function(x,y,z,t)="x*x*x*x*x*x*x*x-28*x*x*x*x*x*x*y*y+70*x*x*x*x*y*y*y*y-28*x*x*y*y*y*y*y*y+y*y*y*y*y*y*y*y"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=8
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/negative_jy_rz b/tests/jext/inputs/red/negative_jy_rz
+new file mode 100644
+index 00000000..386ec02a
+--- /dev/null
++++ b/tests/jext/inputs/red/negative_jy_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="-1000.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=1
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/parser_inf_rz b/tests/jext/inputs/red/parser_inf_rz
+new file mode 100644
+index 00000000..1eb0363c
+--- /dev/null
++++ b/tests/jext/inputs/red/parser_inf_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=8 8
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="1.0/(x-x)"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=1
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/parser_nan_rz b/tests/jext/inputs/red/parser_nan_rz
+new file mode 100644
+index 00000000..7013694c
+--- /dev/null
++++ b/tests/jext/inputs/red/parser_nan_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=8 8
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="sqrt(-1.0)"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=1
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/solenoidal_zero_rz b/tests/jext/inputs/red/solenoidal_zero_rz
+new file mode 100644
+index 00000000..34e94654
+--- /dev/null
++++ b/tests/jext/inputs/red/solenoidal_zero_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=0
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/red/tracka_zero_rz b/tests/jext/inputs/red/tracka_zero_rz
+new file mode 100644
+index 00000000..34e94654
+--- /dev/null
++++ b/tests/jext/inputs/red/tracka_zero_rz
+@@ -0,0 +1,19 @@
++max_step=1
++amr.n_cell=16 32
++amr.max_level=0
++geometry.dims=RZ
++geometry.prob_lo=0.0 -1.0
++geometry.prob_hi=1.0 1.0
++boundary.field_lo=none periodic
++boundary.field_hi=neumann periodic
++warpx.n_rz_azimuthal_modes=2
++warpx.const_dt=1e-12
++algo.maxwell_solver=yee
++warpx.grid_type=staggered
++warpx.J_ext_grid_init_style=parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t)="0.0"
++warpx.Jy_external_grid_function(x,y,z,t)="0.0"
++warpx.Jz_external_grid_function(x,y,z,t)="0.0"
++warpx.J_ext_rz_n_theta=8
++warpx.J_ext_rz_max_source_mode=0
++warpx.J_ext_div_check_interval=1
+diff --git a/tests/jext/inputs/solenoidal_antenna_1d b/tests/jext/inputs/solenoidal_antenna_1d
+index 07c45c63..98e1cd65 100644
+--- a/tests/jext/inputs/solenoidal_antenna_1d
++++ b/tests/jext/inputs/solenoidal_antenna_1d
+@@ -16,7 +16,7 @@ algo.current_deposition = direct
+ warpx.use_filter = 0
+ warpx.grid_type = staggered
+ warpx.J_ext_grid_init_style = parse_J_ext_grid_function
+-# 1D reduced div uses ONLY Jz and cannot discriminate nodal staggering.
++# 1D reduced div uses ONLY Jz and cannot regression-lock nodal stagger sampling.
+ warpx.Jx_external_grid_function(x,y,z,t) = "sin(pi*z)"
+ warpx.Jy_external_grid_function(x,y,z,t) = "cos(pi*z)"
+ warpx.Jz_external_grid_function(x,y,z,t) = "1.5"
+diff --git a/tests/jext/inputs/solenoidal_antenna_rz b/tests/jext/inputs/solenoidal_antenna_rz
+new file mode 100644
+index 00000000..e69cb265
+--- /dev/null
++++ b/tests/jext/inputs/solenoidal_antenna_rz
+@@ -0,0 +1,28 @@
++max_step = 1
++amr.n_cell = 16 32
++amr.max_level = 0
++amr.max_grid_size = 8
++amr.blocking_factor = 8
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++# Uniform Cartesian Jy is a discriminating m=1 cylindrical source:
++# Jr_1_imag=1.25 and Jtheta_1_real=1.25. The radial metric term cancels
++# the -m*Jtheta_real/r term; Cartesian or mode-0-only div checks fail.
++warpx.Jx_external_grid_function(x,y,z,t) = "0.0"
++warpx.Jy_external_grid_function(x,y,z,t) = "1.25"
++warpx.Jz_external_grid_function(x,y,z,t) = "0.0"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 1
++warpx.J_ext_div_check_interval = 1
+diff --git a/tests/jext/inputs/tracka_rmf_antenna_rz b/tests/jext/inputs/tracka_rmf_antenna_rz
+new file mode 100644
+index 00000000..02ba5152
+--- /dev/null
++++ b/tests/jext/inputs/tracka_rmf_antenna_rz
+@@ -0,0 +1,41 @@
++max_step = 2
++amr.n_cell = 128 256
++amr.max_level = 0
++amr.max_grid_size = 64
++amr.blocking_factor = 32
++geometry.dims = RZ
++geometry.prob_lo = 0.0 -1.0
++geometry.prob_hi = 1.0 1.0
++boundary.field_lo = none periodic
++boundary.field_hi = neumann periodic
++warpx.n_rz_azimuthal_modes = 2
++warpx.const_dt = 1.0e-12
++warpx.cfl = 0.5
++warpx.verbose = 1
++algo.maxwell_solver = yee
++algo.current_deposition = direct
++warpx.use_filter = 0
++warpx.grid_type = staggered
++
++# Dimensionless, resolved copy of the flagship trackA curl(M) antenna shape.
++# It preserves the production parser algebra and its exact m=1 content while
++# keeping the smoke small. The shell and axial lobes have >=12 cells/sigma.
++# The mirrored radial Gaussian G(r-r_ant)+G(r+r_ant) is even at r=0, so
++# G(sqrt(x^2+y^2)) is Cartesian-smooth; its second term is <3e-18 at the
++# resolved ring and does not change the antenna there.
++my_constants.M0 = 1.0e3
++my_constants.r_ant = 0.45
++my_constants.sigma = 0.10
++my_constants.z_ant = 0.35
++my_constants.L_ax = 0.18
++my_constants.phi = 0.37
++warpx.J_ext_grid_init_style = parse_J_ext_grid_function
++warpx.Jx_external_grid_function(x,y,z,t) = "(-M0*(exp(-0.5*((sqrt(x*x+y*y)-r_ant)*(sqrt(x*x+y*y)-r_ant))/(sigma*sigma))+exp(-0.5*((sqrt(x*x+y*y)+r_ant)*(sqrt(x*x+y*y)+r_ant))/(sigma*sigma)))*(-(z-z_ant)/(L_ax*L_ax)*exp(-0.5*((z-z_ant)*(z-z_ant))/(L_ax*L_ax))+(z+z_ant)/(L_ax*L_ax)*exp(-0.5*((z+z_ant)*(z+z_ant))/(L_ax*L_ax)))*sin(phi))"
++warpx.Jy_external_grid_function(x,y,z,t) = "(M0*(exp(-0.5*((sqrt(x*x+y*y)-r_ant)*(sqrt(x*x+y*y)-r_ant))/(sigma*sigma))+exp(-0.5*((sqrt(x*x+y*y)+r_ant)*(sqrt(x*x+y*y)+r_ant))/(sigma*sigma)))*(-(z-z_ant)/(L_ax*L_ax)*exp(-0.5*((z-z_ant)*(z-z_ant))/(L_ax*L_ax))+(z+z_ant)/(L_ax*L_ax)*exp(-0.5*((z+z_ant)*(z+z_ant))/(L_ax*L_ax)))*cos(phi))"
++warpx.Jz_external_grid_function(x,y,z,t) = "(M0*(exp(-0.5*((z-z_ant)*(z-z_ant))/(L_ax*L_ax))-exp(-0.5*((z+z_ant)*(z+z_ant))/(L_ax*L_ax)))*(if(sqrt(x*x+y*y)>0.0,((-(sqrt(x*x+y*y)-r_ant)/(sigma*sigma)*exp(-0.5*((sqrt(x*x+y*y)-r_ant)*(sqrt(x*x+y*y)-r_ant))/(sigma*sigma))-(sqrt(x*x+y*y)+r_ant)/(sigma*sigma)*exp(-0.5*((sqrt(x*x+y*y)+r_ant)*(sqrt(x*x+y*y)+r_ant))/(sigma*sigma)))*x/sqrt(x*x+y*y)),0.0)*sin(phi)-if(sqrt(x*x+y*y)>0.0,((-(sqrt(x*x+y*y)-r_ant)/(sigma*sigma)*exp(-0.5*((sqrt(x*x+y*y)-r_ant)*(sqrt(x*x+y*y)-r_ant))/(sigma*sigma))-(sqrt(x*x+y*y)+r_ant)/(sigma*sigma)*exp(-0.5*((sqrt(x*x+y*y)+r_ant)*(sqrt(x*x+y*y)+r_ant))/(sigma*sigma)))*y/sqrt(x*x+y*y)),0.0)*cos(phi)))"
++warpx.J_ext_rz_n_theta = 8
++warpx.J_ext_rz_max_source_mode = 1
++warpx.J_ext_div_check_interval = 1
++warpx.reduced_diags_names = fieldenergy
++fieldenergy.type = FieldEnergy
++fieldenergy.intervals = 1
+diff --git a/tests/jext/jext_contracts.sh b/tests/jext/jext_contracts.sh
+new file mode 100644
+index 00000000..7cff921b
+--- /dev/null
++++ b/tests/jext/jext_contracts.sh
+@@ -0,0 +1,78 @@
++# Shared deposited-artifact verdicts for green and broken-by-design suites.
++# Caller must set DEPOSIT_REL_TOL from the executable precision contract.
++check_deposited_contract() {
++  local log="$1" kind="$2" expected="$3" label="$4"
++  local line
++  line=$(grep "J_ext RZ deposited-gate:" "$log" | tail -1 || true)
++  if [ -z "$line" ]; then
++    echo "  [FAIL] $label missing deposited-current marker"
++    return 1
++  fi
++  local max_abs jr_re_min jr_re_max jr_min jr_max
++  local jt_min jt_max jt_im_min jt_im_max
++  local jz_re_min jz_re_max jz_im_min jz_im_max
++  local forbidden tracka_forbidden
++  max_abs=$(echo "$line" | sed -n 's/.*max_abs=\([0-9.eE+-]*\).*/\1/p')
++  jr_re_min=$(echo "$line" | sed -n 's/.*jr_m1_re_min=\([0-9.eE+-]*\).*/\1/p')
++  jr_re_max=$(echo "$line" | sed -n 's/.*jr_m1_re_max=\([0-9.eE+-]*\).*/\1/p')
++  jr_min=$(echo "$line" | sed -n 's/.*jr_m1_im_min=\([0-9.eE+-]*\).*/\1/p')
++  jr_max=$(echo "$line" | sed -n 's/.*jr_m1_im_max=\([0-9.eE+-]*\).*/\1/p')
++  jt_min=$(echo "$line" | sed -n 's/.*jt_m1_re_min=\([0-9.eE+-]*\).*/\1/p')
++  jt_max=$(echo "$line" | sed -n 's/.*jt_m1_re_max=\([0-9.eE+-]*\).*/\1/p')
++  jt_im_min=$(echo "$line" | sed -n 's/.*jt_m1_im_min=\([0-9.eE+-]*\).*/\1/p')
++  jt_im_max=$(echo "$line" | sed -n 's/.*jt_m1_im_max=\([0-9.eE+-]*\).*/\1/p')
++  jz_re_min=$(echo "$line" | sed -n 's/.*jz_m1_re_min=\([0-9.eE+-]*\).*/\1/p')
++  jz_re_max=$(echo "$line" | sed -n 's/.*jz_m1_re_max=\([0-9.eE+-]*\).*/\1/p')
++  jz_im_min=$(echo "$line" | sed -n 's/.*jz_m1_im_min=\([0-9.eE+-]*\).*/\1/p')
++  jz_im_max=$(echo "$line" | sed -n 's/.*jz_m1_im_max=\([0-9.eE+-]*\).*/\1/p')
++  forbidden=$(echo "$line" | sed -n 's/.*uniform_jy_forbidden_max=\([0-9.eE+-]*\).*/\1/p')
++  tracka_forbidden=$(echo "$line" | sed -n 's/.*tracka_forbidden_max=\([0-9.eE+-]*\).*/\1/p')
++  if [ "$kind" = "uniform_jy" ]; then
++    if ! python3 -c "
++import sys
++vals = [float('$jr_min'), float('$jr_max'), float('$jt_min'), float('$jt_max')]
++expected = float('$expected')
++tol = float('$DEPOSIT_REL_TOL') * max(1.0, abs(expected))
++ok = all(abs(v-expected) <= tol for v in vals)
++ok = ok and float('$forbidden') <= tol
++sys.exit(0 if ok else 1)
++"; then
++      echo "  [FAIL] $label deposited pure-Jy contract: expected=$expected rel_tol=$DEPOSIT_REL_TOL; $line"
++      return 1
++    fi
++    echo "    deposited pure-Jy: expected=$expected rel_tol=$DEPOSIT_REL_TOL; $line"
++  elif [ "$kind" = "tracka_m1" ]; then
++    if ! python3 -c "
++import math, sys
++actual = [
++ float('$jr_re_min'), float('$jr_re_max'),
++ float('$jr_min'), float('$jr_max'),
++ float('$jt_min'), float('$jt_max'),
++ float('$jt_im_min'), float('$jt_im_max'),
++ float('$jz_re_min'), float('$jz_re_max'),
++ float('$jz_im_min'), float('$jz_im_max')]
++golden = [
++ -1322.0311235647291, 1218.3475248347622,
++ -3141.1787591104153, 3408.498806436707,
++ -3139.7411706506186, 3406.938876574342,
++ -1217.7899372295856, 1321.4260842363508,
++ -2191.385050295506, 2191.385050295506,
++ -5649.892196361566, 5649.892196361566]
++rel = float('$DEPOSIT_REL_TOL')
++ok = all(math.isfinite(v) for v in actual)
++ok = ok and all(abs(v-g) <= rel*max(1.0,abs(g))
++                for v,g in zip(actual,golden))
++scale = max(abs(g) for g in golden)
++ok = ok and float('$max_abs') >= 1000.0
++ok = ok and float('$tracka_forbidden') <= rel*scale
++sys.exit(0 if ok else 1)
++"; then
++      echo "  [FAIL] $label deposited TrackA signed m=1 ledger: rel_tol=$DEPOSIT_REL_TOL; $line"
++      return 1
++    fi
++    echo "    deposited TrackA signed m=1 ledger: rel_tol=$DEPOSIT_REL_TOL; $line"
++  else
++    echo "  [FAIL] unknown deposited contract $kind"
++    return 1
++  fi
++}
+diff --git a/tests/jext/red-patches/postdeposit-nonfinite.patch b/tests/jext/red-patches/postdeposit-nonfinite.patch
+new file mode 100644
+index 00000000..e607ec08
+--- /dev/null
++++ b/tests/jext/red-patches/postdeposit-nonfinite.patch
+@@ -0,0 +1,13 @@
++diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
++--- a/Source/Evolve/WarpXEvolve.cpp
+++++ b/Source/Evolve/WarpXEvolve.cpp
++@@ -942,6 +942,9 @@ void WarpX::AddExternalCurrent (amrex::Real time)
++     // Dimension check: finiteness is a dimensionless predicate over A/m^2.
++     // Sanity: finite manufactured sources return one; a scratch-only NaN/Inf
++     // mutation aborts here even though the parser preflight was finite.
+++    jext_source[0]->setVal(
+++        std::numeric_limits<amrex::Real>::quiet_NaN(), 0, 1,
+++        jext_source[0]->nGrowVect());
++     int all_deposited_finite = 1;
++     for (int idim = 0; idim < 3; ++idim) {
++         all_deposited_finite = all_deposited_finite
+diff --git a/tests/jext/red-patches/retained-sign-flip.patch b/tests/jext/red-patches/retained-sign-flip.patch
+new file mode 100644
+index 00000000..abf35bc0
+--- /dev/null
++++ b/tests/jext/red-patches/retained-sign-flip.patch
+@@ -0,0 +1,16 @@
++diff --git a/Source/Evolve/WarpXEvolve.cpp b/Source/Evolve/WarpXEvolve.cpp
++--- a/Source/Evolve/WarpXEvolve.cpp
+++++ b/Source/Evolve/WarpXEvolve.cpp
++@@ -953,5 +953,11 @@ void WarpX::AddExternalCurrent (amrex::Real time)
++         all_deposited_finite == 1,
++         "parsed RZ J_ext produced NaN/Inf in deposited coefficients after "
++         "projection/synchronization; refusing to modify current_fp");
++-
+++    // RED-TEST MUTATION ONLY: flip every deposited cylindrical coefficient.
+++    // Expected live gate: retained deposited/reference mismatch or signed
+++    // pure-Jy contract failure (Jr_im,Jtheta_re become -Jy).
+++    for (int idim = 0; idim < 3; ++idim) {
+++        jext_source[idim]->mult(
+++            -1._rt, 0, expected_ncomp, jext_source[idim]->nGrow());
+++    }
++     // Preserve the physical S(Jp)+A ordering while retaining A separately for
+diff --git a/tests/jext/run_jext_regression.sh b/tests/jext/run_jext_regression.sh
+index b696a8c0..cfcc328e 100755
+--- a/tests/jext/run_jext_regression.sh
++++ b/tests/jext/run_jext_regression.sh
+@@ -9,6 +9,32 @@ INDIR="$(cd "$(dirname "$0")/inputs" && pwd)"
+ PASS=0
+ FAIL=0
+ SKIP=0
++EXE_BASE="$(basename "$EXE")"
++
++# Roundoff contracts are executable-precision constants, never fits to observed
++# residuals.  The analytic oracle permits 8192 DP or 256 SP ulps for parser,
++# libm, rotation, DFT, sync and stagger arithmetic; the deposited ledger permits
++# 4096 DP or 256 SP ulps.  These dimensionless ulp budgets cover the named
++# operation chains; a sign/component mutation is O(1), far outside either.
++case ".$EXE_BASE." in
++  *.DP.*)
++    PRECISION=dp; EPS=2.220446049250313e-16
++    ROUND_R=1.8189894035458565e-12; DEPOSIT_REL_TOL=9.094947017729282e-13 ;;
++  *.SP.*)
++    PRECISION=sp; EPS=1.1920928955078125e-7
++    ROUND_R=3.0517578125e-5; DEPOSIT_REL_TOL=3.0517578125e-5 ;;
++  *) echo "Cannot infer DP/SP precision from executable basename $EXE_BASE"; exit 2 ;;
++esac
++
++# Geometry is an exact token in WarpX's basename. Parent directories are not
++# evidence: an RZ-labelled build root may contain Cartesian executables.
++case ".$EXE_BASE." in
++  *.rz.*) DIM=rz ;;
++  *.1d.*) DIM=1d ;;
++  *.2d.*) DIM=2d ;;
++  *.3d.*) DIM=3d ;;
++  *) echo "Cannot infer dim from executable basename $EXE_BASE"; exit 2 ;;
++esac
+ 
+ parse_final_energy() {
+   local f="$1"
+@@ -35,12 +61,17 @@ plotfile_field_sha() {
+   done | shasum -a 256 | awk '{print $1}'
+ }
+ 
++. "$(dirname "$0")/jext_contracts.sh"
++
+ run_ok() {
+   local name="$1" input="$2"
+   local require_self="${3:-0}"
+   local require_div="${4:-0}"
+   local max_r="${5:-}"
+   local require_seam="${6:-0}"
++  local require_mode="${7:-0}"
++  local deposited_kind="${8:-}"
++  local deposited_expected="${9:-0}"
+   local log="$LOGDIR/${name}.log"
+   local rundir="$LOGDIR/run_${name}"
+   rm -rf "$rundir"
+@@ -49,21 +80,23 @@ run_ok() {
+   if (cd "$rundir" && "$EXE" "$input") >"$log" 2>&1; then
+     local ok=1
+     if [ "$require_self" = "1" ]; then
+-      if ! grep -q "J_ext analytic self-check: max_abs_err=" "$log"; then
++      if ! grep -Eq "J_ext( RZ)? analytic self-check: max_abs_err=" "$log"; then
+         echo "  [FAIL] $name missing analytic self-check marker"; ok=0
+       else
+-        err=$(grep "J_ext analytic self-check: max_abs_err=" "$log" | tail -1)
++        err=$(grep -E "J_ext( RZ)? analytic self-check: max_abs_err=" "$log" | tail -1)
+         echo "    self-check: $err"
+-        if ! grep -q "oracle=JextStaggerOracle" "$log"; then
++        if [ "$DIM" = "rz" ] && ! grep -Fq "oracle=Jcart(sin(pi*z),0,x)-literal-RZ-stagger" "$log"; then
++          echo "  [FAIL] $name RZ self-check did not use the independent literal-stagger oracle"; ok=0
++        elif [ "$DIM" != "rz" ] && ! grep -q "oracle=JextStaggerOracle" "$log"; then
+           echo "  [FAIL] $name self-check did not use JextStaggerOracle"; ok=0
+         fi
+       fi
+     fi
+     if [ "$require_div" = "1" ]; then
+-      if ! grep -q "J_ext div-gate:" "$log"; then
++      if ! grep -Eq "J_ext( RZ)? div-gate:" "$log"; then
+         echo "  [FAIL] $name missing div-gate marker"; ok=0
+       else
+-        dg=$(grep "J_ext div-gate:" "$log" | tail -1)
++        dg=$(grep -E "J_ext( RZ)? div-gate:" "$log" | tail -1)
+         echo "    div-gate: $dg"
+         if [ -n "$max_r" ]; then
+           r=$(echo "$dg" | sed -n 's/.*r=|div|\*h\/|J|=\([0-9.eE+-]*\).*/\1/p')
+@@ -73,6 +106,18 @@ run_ok() {
+         fi
+       fi
+     fi
++    if [ "$require_mode" = "1" ]; then
++      if ! grep -q "J_ext RZ mode-gate:" "$log"; then
++        echo "  [FAIL] $name missing RZ mode-gate marker"; ok=0
++      else
++        mg=$(grep "J_ext RZ mode-gate:" "$log" | tail -1)
++        echo "    mode-gate: $mg"
++      fi
++    fi
++    if [ -n "$deposited_kind" ]; then
++      if ! check_deposited_contract "$log" "$deposited_kind" \
++          "$deposited_expected" "$name"; then ok=0; fi
++    fi
+     if [ "$require_seam" = "1" ]; then
+       if ! grep -q "J_ext periodic-seam: comp=" "$log"; then
+         echo "  [FAIL] $name missing periodic-seam marker"; ok=0
+@@ -148,53 +193,81 @@ run_energy_pair() {
+   fi
+   local fe_d="$rd/diags/reducedfiles/fieldenergy.txt"
+   local fe_u="$ru/diags/reducedfiles/fieldenergy.txt"
++  if [ "$dim" = "rz" ]; then
++    if ! check_deposited_contract "$log_d" uniform_jy 1000 \
++        "$driven"; then ok=0; fi
++  fi
+   local Wd Wu
++  local W_expect rel_band W_undriven_max
+   Wd=$(parse_final_energy "$fe_d")
+   Wu=$(parse_final_energy "$fe_u")
+   echo "    driven final W=$Wd  undriven final W=$Wu"
+   if [ "$Wd" = "MISSING" ] || [ "$Wd" = "EMPTY" ]; then echo "  [FAIL] missing driven fieldenergy"; ok=0; fi
+   if [ "$Wu" = "MISSING" ] || [ "$Wu" = "EMPTY" ]; then echo "  [FAIL] missing undriven fieldenergy"; ok=0; fi
+-  # Two-sided energy band around analytic 0.127062 J (±20%).
+-  # Derivation (checked in energy_driven_* deck comments + here):
+-  #   unit domain, no particles, Jy=1e4*min(1,t/1e-10), dt=5e-12, 40 steps
+-  #   tf=2e-10; ∫J dt = 1e4*(1e-10/2)+1e4*1e-10 = 1.5e-6
+-  #   E_y = 1.5e-6/ε0 ≈ 1.69414e5 V/m
+-  #   W = ½ ε0 E² · V = 0.127062 J  (V=1 every dim)
+-  #   ±20% band: [0.10165, 0.15247] — a 4× over-injection (W→0.508) FAILS;
+-  #   undriven |W| < 1e-12 (exact 0 with J≡0, no particles).
++  if [ "$dim" = "rz" ]; then
++    # RZ multimode energy smoke:
++    #   Cartesian Jy=1e3*min(1,t/2e-12), dt=1e-12, four half-time samples
++    #   sum to 3e-9 A s/m². E_y=-3e-9/epsilon0 and V=2*pi m³.
++    #   Continuum U=3.193329e-6 J. The single Neumann radial current
++    #   boundary doubles outer-node Jtheta; WarpX's RZ FieldEnergy weights
++    #   the Etheta axis by pi*dr/4. For nr=16 the exact diagnostic factor is
++    #   (1+1.1884765625)/2=1.09423828125, hence U=W_src=3.494263e-6 J.
++    W_expect=3.494263e-6
++    rel_band=0.01
++    W_undriven_max=1e-16
++  else
++    # Cartesian energy smoke:
++    #   unit domain, Jy=1e4*min(1,t/1e-10), dt=5e-12, 40 steps
++    #   integral(J dt)=1.5e-6; E_y=1.5e-6/epsilon0;
++    #   U=W_src=0.127062 J. A 4x over-injection fails.
++    W_expect=0.127062
++    rel_band=0.20
++    W_undriven_max=1e-12
++  fi
+   if [ "$ok" = "1" ]; then
+     if ! python3 -c "
+ import sys
+ Wd=float('$Wd'); Wu=float('$Wu')
+-W_expect=0.127062
+-rel_band=0.20
+-ok = (abs(Wd/W_expect - 1.0) <= rel_band) and (abs(Wu) < 1e-12)
++W_expect=float('$W_expect')
++rel_band=float('$rel_band')
++ok = (Wd > 0.0) and (abs(Wd/W_expect - 1.0) <= rel_band) and (abs(Wu) < float('$W_undriven_max'))
+ sys.exit(0 if ok else 1)
+ "; then
+-      echo "  [FAIL] energy assert: need |Wd/0.127062-1|<=0.20 and |Wu|<1e-12; got Wd=$Wd Wu=$Wu"; ok=0
++      echo "  [FAIL] energy assert: need Wd>0, |Wd/$W_expect-1|<=$rel_band and |Wu|<$W_undriven_max; got Wd=$Wd Wu=$Wu"; ok=0
+     fi
+   fi
+   if [ "$ok" = "1" ]; then
+-    echo "  [PASS] energy_pair_${dim} (driven W=$Wd within ±20% of 0.127062; |undriven|=$Wu < 1e-12)"; PASS=$((PASS+1))
++    echo "  [PASS] energy_pair_${dim} (driven W=$Wd within relative band $rel_band of $W_expect; |undriven|=$Wu < $W_undriven_max)"; PASS=$((PASS+1))
+   else
+     FAIL=$((FAIL+1))
+   fi
+ }
+ 
+-case "$EXE" in
+-  *1d*|*1D*) DIM=1d ;;
+-  *2d*|*2D*) DIM=2d ;;
+-  *3d*|*3D*) DIM=3d ;;
+-  *) echo "Cannot infer dim from exe name $EXE"; exit 2 ;;
+-esac
+ 
+-run_ok "analytic_multifab_${DIM}" "$INDIR/analytic_multifab_${DIM}" 1 1 "1e-6"
+-run_ok "filter_identity_${DIM}" "$INDIR/filter_identity_${DIM}" 1 1 "1e-6"
+-# Discriminating decks: observed r ~ 6e-8; use 1e-6 (not vacuous 1e-4 == in-code tol).
++if [ "$DIM" = "rz" ]; then
++  run_ok "analytic_multifab_rz" "$INDIR/analytic_multifab_rz" 1 1 "$ROUND_R" 0 1
++  run_ok "solenoidal_antenna_rz" "$INDIR/solenoidal_antenna_rz" 0 1 "$ROUND_R" 0 1 uniform_jy 1.25
++  run_ok "tracka_rmf_antenna_rz" "$INDIR/tracka_rmf_antenna_rz" 0 1 "1e-4" 0 1 tracka_m1 0
++  run_energy_pair rz
++  run_assert "monopole_abort_rz" "$INDIR/monopole_abort_rz" \
++    "J_ext_grid_init_style.{0,200}cylindrical discrete.{0,200}(div|exceeds)"
++  run_assert "bandwidth_abort_rz" "$INDIR/bandwidth_abort_rz" \
++    "J_ext_grid_init_style.{0,200}RZ angular bandwidth.{0,200}(failed|exceeds)"
++  run_assert "assert_mode0_only_rz" "$INDIR/assert_mode0_only_rz" \
++    "n_rz_azimuthal_modes.{0,200}(>=|at least).{0,100}2"
++  echo ""
++  echo "RESULT: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
++  if [ "$FAIL" -gt 0 ]; then exit 1; fi
++  exit 0
++fi
++
++run_ok "analytic_multifab_${DIM}" "$INDIR/analytic_multifab_${DIM}" 1 1 "$ROUND_R"
++run_ok "filter_identity_${DIM}" "$INDIR/filter_identity_${DIM}" 1 1 "$ROUND_R"
++# Discriminating decks use the same precision-derived roundoff contract.
+ if [ "$DIM" = "1d" ]; then
+-  run_ok "solenoidal_antenna_${DIM}" "$INDIR/solenoidal_antenna_${DIM}" 1 1 "1e-6"
++  run_ok "solenoidal_antenna_${DIM}" "$INDIR/solenoidal_antenna_${DIM}" 1 1 "$ROUND_R"
+ else
+-  run_ok "solenoidal_antenna_${DIM}" "$INDIR/solenoidal_antenna_${DIM}" 1 1 "1e-6"
++  run_ok "solenoidal_antenna_${DIM}" "$INDIR/solenoidal_antenna_${DIM}" 1 1 "$ROUND_R"
+ fi
+ run_energy_pair "$DIM"
+ run_assert "monopole_abort_${DIM}" "$INDIR/monopole_abort_${DIM}" \
+@@ -206,7 +279,7 @@ if [ "$DIM" = "2d" ]; then
+   # Feature-off bit-identity: SHA256 of plotfile field data (same binary,
+   # with vs without J_ext keys; ≥3 steps; PEC). Dropped FieldEnergy ±2.2%
+   # floored comparison and the tautological count=1 gauge.
+-  echo "[BIT-ID] plotfile field SHA256 noop vs jext_zero"
++  echo "[P0-BITID] plotfile field SHA256 noop vs jext_zero"
+   sha_a=$(plotfile_field_sha "$LOGDIR/run_pec_plasma_noop_2d")
+   sha_b=$(plotfile_field_sha "$LOGDIR/run_pec_jext_zero_2d")
+   echo "    noop sha=$sha_a"
+diff --git a/tests/jext/run_jext_rz_red_tests.sh b/tests/jext/run_jext_rz_red_tests.sh
+new file mode 100755
+index 00000000..89db6ef6
+--- /dev/null
++++ b/tests/jext/run_jext_rz_red_tests.sh
+@@ -0,0 +1,66 @@
++#!/usr/bin/env bash
++# Broken-by-design RZ J_ext guard tests. CPU only.
++# Injection-only mutations live in red-patches/ and are exercised separately.
++set -euo pipefail
++EXE="${1:?RZ WarpX executable}"
++LOGDIR="${2:-$(dirname "$0")/logs-red}"
++INDIR="$(cd "$(dirname "$0")/inputs/red" && pwd)"
++mkdir -p "$LOGDIR"
++PASS=0
++FAIL=0
++EXE_BASE="$(basename "$EXE")"
++case ".$EXE_BASE." in
++  *.DP.*) DEPOSIT_REL_TOL=9.094947017729282e-13 ;;
++  *.SP.*) DEPOSIT_REL_TOL=3.0517578125e-5 ;;
++  *) echo "Cannot infer DP/SP precision from executable basename $EXE_BASE"; exit 2 ;;
++esac
++. "$(dirname "$0")/jext_contracts.sh"
++
++expect_abort() {
++  local name="$1" input="$2" reason="$3"
++  local log="$LOGDIR/${name}.log" rundir="$LOGDIR/run_${name}"
++  rm -rf "$rundir"; mkdir -p "$rundir"
++  echo "[RED] $name"
++  if (cd "$rundir" && OMP_NUM_THREADS=1 "$EXE" "$input") >"$log" 2>&1; then
++    echo "  [FAIL] broken deck completed"; FAIL=$((FAIL+1)); return
++  fi
++  if grep -Eiq "$reason" "$log"; then
++    echo "  [PASS] gate went red"; PASS=$((PASS+1))
++  else
++    echo "  [FAIL] wrong abort reason"; tail -n 8 "$log"
++    FAIL=$((FAIL+1))
++  fi
++}
++
++expect_marker_break() {
++  local name="$1" input="$2" kind="$3" expected="$4"
++  local log="$LOGDIR/${name}.log" rundir="$LOGDIR/run_${name}"
++  rm -rf "$rundir"; mkdir -p "$rundir"
++  echo "[RED] $name"
++  if ! (cd "$rundir" && OMP_NUM_THREADS=1 "$EXE" "$input") >"$log" 2>&1; then
++    echo "  [FAIL] deck aborted before deposited-contract check"
++    tail -n 8 "$log"; FAIL=$((FAIL+1)); return
++  fi
++  if check_deposited_contract "$log" "$kind" "$expected" "$name"; then
++    echo "  [FAIL] broken deposited contract remained green"
++    FAIL=$((FAIL+1))
++  else
++    echo "  [PASS] production deposited contract went red"; PASS=$((PASS+1))
++  fi
++}
++
++expect_abort mode_m4 "$INDIR/mode_m4_rz" "angular bandwidth"
++expect_abort mode_m7 "$INDIR/mode_m7_rz" "angular bandwidth"
++expect_abort mode_m8 "$INDIR/mode_m8_rz" "angular bandwidth"
++expect_abort interval_zero "$INDIR/interval_zero_rz" "must be positive"
++expect_abort interval_negative "$INDIR/interval_negative_rz" "must be positive"
++expect_abort parser_nan "$INDIR/parser_nan_rz" "NaN/Inf before deposition"
++expect_abort parser_inf "$INDIR/parser_inf_rz" "NaN/Inf before deposition"
++expect_abort axis_bounded_cos "$INDIR/axis_bounded_cos_rz" "axis-regularity"
++expect_abort axis_guarded_swirl "$INDIR/axis_guarded_swirl_rz" "axis-regularity"
++expect_marker_break solenoidal_zero "$INDIR/solenoidal_zero_rz" uniform_jy 1.25
++expect_marker_break tracka_zero "$INDIR/tracka_zero_rz" tracka_m1 0
++expect_marker_break energy_negative "$INDIR/negative_jy_rz" uniform_jy 1000
++
++echo "RED-RESULT: PASS=$PASS FAIL=$FAIL"
++if [ "$FAIL" -ne 0 ]; then exit 1; fi

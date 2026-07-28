@@ -117,13 +117,15 @@ apply_patch "${AMREX_SOURCE_DIR}" \
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0001-metal-source-identity.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
-    "${ROOT_DIR}/patches/warpx/0002-fix-addplasma-metal-parser-momentum-oob.patch"
+    "${ROOT_DIR}/patches/warpx/0002-work-around-metal-parser-momentum-device-zero.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0003-correct-macos-memory-guard-available-memory.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0004-metal-disable-particle-sort-override.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0005-add-impressed-current-j-ext.patch"
+apply_patch "${WARPX_SOURCE_DIR}" \
+    "${ROOT_DIR}/patches/warpx/0006-add-rz-impressed-current-j-ext.patch"
 
 (( PATCH_COUNT > 0 )) || fail "no patches were applied"
 git -C "${AMREX_SOURCE_DIR}" diff --check

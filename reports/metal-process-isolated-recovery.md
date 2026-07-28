@@ -154,15 +154,16 @@ The deterministic supervisor tests cover:
 - durable CPU-demotion discovery on a second invocation; and
 - fail-closed primary/fallback backend and precision identity checks.
 
-An end-to-end Metal run using the real 2D WarpX executable completed in
-two-step process generations, produced verified checkpoints at steps 2 and 4,
-then a second supervisor invocation discovered step 4 and restarted through
-step 6.
-
-An additional two-species Metal PIC run completed through two process
-generations, committing a particle checkpoint at step 5, recreating the process
-and Metal runtime, restarting both species from that checkpoint, and committing
-step 10.
+No retained artifact demonstrates an end-to-end Metal checkpoint/restart run.
+Phase-1 verification performed no GPU execution and used CPU backends only. It
+proved backend-agnostic checkpoint continuity across the NOACC-SP → OMP-SP seam:
+exact time and step continuity; all 2,048 particles with zero count or weight
+delta; and `Ex`, `Ey`, `Ez`, `Bx`, `By`, and `Bz` agreement at zero absolute
+and relative tolerance. Negative controls also held, including immediate
+failure without demotion for an ordinary non-Metal error, completion of a
+401-second silent healthy startup without demotion, and loud rejection of a
+precision-mismatched checkpoint. The live wedge → demote → complete path is not
+yet demonstrated.
 
 This architecture does not repair Apple's driver. It converts the driver defect
 into bounded lost work with a correctness-preserving restart, which is the

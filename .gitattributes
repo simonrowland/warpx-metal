@@ -1,0 +1,3 @@
+# Patch payloads must remain byte-exact so they apply to their pinned upstream
+# bases. Validate whitespace in the applied source trees, not in payload bytes.
+patches/** -whitespace

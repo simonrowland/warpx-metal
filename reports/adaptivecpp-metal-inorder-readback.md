@@ -2,10 +2,10 @@
 
 ## Findings
 
-AdaptiveCpp exposed the Metal backend through `multi_queue_executor`. On the
-tested M4 Pro this created one memcpy lane and 64 kernel lanes. Consecutive
-operations from a SYCL queue could therefore be submitted to different
-`metal_inorder_queue` instances:
+Upstream collaborator `lulzx` reported that AdaptiveCpp exposed the Metal
+backend through `multi_queue_executor` and, on his M4 Pro, created one memcpy
+lane and 64 kernel lanes. Consecutive operations from a SYCL queue could
+therefore be submitted to different `metal_inorder_queue` instances:
 
 ```text
 kernel N   -> kernel lane K
@@ -17,9 +17,10 @@ USM operations did not add DAG requirements between those lanes. The memcpy
 lane consequently had no producer command buffer to wait for, and a readback
 could observe the previous kernel's value.
 
-A targeted stress test made the ordering bug deterministic enough to observe:
-before this fix, repeated kernel/readback pairs returned iteration `N-1` during
-iteration `N` after tens of iterations.
+In the same contributor report, a targeted stress test made the ordering bug
+deterministic enough to observe: before this fix, repeated kernel/readback pairs
+returned iteration `N-1` during iteration `N` after tens of iterations. The
+repository retains the test source but not a raw M4 Pro run log.
 
 That AdaptiveCpp ordering defect is distinct from the completion-loss observed
 under sustained particle redistribution on macOS 26.5.x/M3 Ultra. Evidence from
@@ -58,9 +59,15 @@ forever. A timed-out buffer is never treated as valid readback data.
 
 ## Validation
 
-- `rt-backend-metal` compiles and links after the change.
+The following Apple M4 Pro results were reported by the upstream contributor
+who supplied this correction in commit
+`4c521045a014ecc417acdbf12a9e8688a6c2b189`; they are not measurements made or
+independently reproduced by this package maintainer. No raw run log is retained
+in this repository:
+
+- `rt-backend-metal` compiled and linked after the change.
 - Existing device query, buffer vector-add, shared-USM, and atomic reduction
-  tests pass on Apple M4 Pro.
+  tests passed.
 - `tests/sycl/d2h_stress_test.cpp` completed 10,000 consecutive
   private-device kernel → host-readback iterations with exact expected values.
 - Before the single-lane correction, the same stress test reproduced stale

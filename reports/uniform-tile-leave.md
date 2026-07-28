@@ -35,18 +35,22 @@ tolerance-based physics observables, not bitwise particle-order hashes.
 
 ## Validation
 
-The SYCL/Metal flag-ON path completed a 2,000-of-2,000-iteration soak. A paired
-flag-OFF drift guard reproduced the characteristic stall at iteration 29.
-Measured throughput was 1.597 times the flag-OFF path.
+The SYCL/Metal flag-ON path completed a 2,000-of-2,000-iteration soak on the
+**targeted redistribute-dominated stall reproducer**, not a production-class
+long-horizon physics deck. A paired flag-OFF drift guard on the same workload
+reproduced the characteristic stall at iteration 29. Measured throughput was
+1.597 times the flag-OFF path. Production-class long-horizon validation
+remains pending.
 
 Post-patch system-level validation outside the packaged AMReX test harness
 compared per-component field max-absolute and relative-L2 values. Flag-ON
 deviations were approximately the same scale as the flag-OFF platform residual.
 The comparison did not isolate a feature-caused field regression, but it is not
-a clean parity result and does not establish bitwise equivalence. The packaged
-CPU tests separately covered default-absent, explicit-OFF, flag-ON destination
-equivalence, invalid-particle behavior, and the rank guard; they do not
-establish field-level flag-ON parity.
+a clean parity result and does not establish flag-ON field equivalence or
+bitwise equivalence. The packaged CPU tests separately covered default-absent,
+explicit-OFF, flag-ON destination equivalence, invalid-particle behavior, and
+the rank guard; they do not establish field-level flag-ON parity. Multi-rank
+GPU remains entirely unvalidated.
 
 The multi-rank enablement guard was exercised and aborted with return code 6.
 

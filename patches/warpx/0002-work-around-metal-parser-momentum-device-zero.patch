@@ -5,7 +5,7 @@ diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particl
      amrex::Real applyBallisticCorrection(const XDim3& pos, const InjectorMomentum* inj_mom,
                                    amrex::Real gamma_boost, amrex::Real beta_boost, amrex::Real t) noexcept
      {
-+        if (gamma_boost == 1._rt && beta_boost == 0._rt) {
++        if (gamma_boost == 1._rt && beta_boost == 0._rt && t == 0._rt) {
 +            return pos.z;
 +        }
 +
@@ -17,7 +17,7 @@ diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particl
                      }
  
 -                    u = inj_mom->getMomentum(pos.x, pos.y, z0, engine);
-+#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL)
 +                    if (sycl_parser_momentum) {
 +                        u = XDim3{0._rt, 0._rt, 0._rt};
 +                    } else
@@ -33,7 +33,7 @@ diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particl
  
                      // get the full momentum, including thermal motion
 -                    u = inj_mom->getMomentum(pos.x, pos.y, 0._rt, engine);
-+#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL) && defined(WARPX_DIM_XZ)
++#if defined(AMREX_USE_GPU) && defined(AMREX_USE_SYCL)
 +                    if (sycl_parser_momentum) {
 +                        u = XDim3{0._rt, 0._rt, 0._rt};
 +                    } else

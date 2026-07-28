@@ -252,10 +252,10 @@ index b2cf3b29..384fa349 100644
  
  void
 diff --git a/Source/main.cpp b/Source/main.cpp
-index 0d9cbf8f..b97059ea 100644
+index 0d9cbf8f..fc881a85 100644
 --- a/Source/main.cpp
 +++ b/Source/main.cpp
-@@ -13,10 +13,165 @@
+@@ -13,10 +13,170 @@
  #include <ablastr/profiler/ProfilerWrapper.H>
  #include <ablastr/utils/timer/Timer.H>
  
@@ -377,10 +377,15 @@ index 0d9cbf8f..b97059ea 100644
 +            const auto over_fraction =
 +                static_cast<long double>(used_bytes) >=
 +                static_cast<long double>(physical_bytes) * max_fraction;
++            // System-wide used memory can be high because another application
++            // holds RAM. Treat the fraction as actionable only when Darwin also
++            // reports warning (2) or critical (4) pressure.
++            const auto fraction_pressure = over_fraction &&
++                has_pressure_level && pressure_level >= 2;
 +            // Darwin values: 1 normal, 2 warning, 4 critical. Abort only on
 +            // CRITICAL; WARN is routine on macOS.
 +            const auto abnormal_pressure = has_pressure_level && pressure_level >= 4;
-+            if (!over_fraction && !abnormal_pressure) {
++            if (!fraction_pressure && !abnormal_pressure) {
 +                return;
 +            }
 +

@@ -23,10 +23,16 @@ Run the build flow from the repository root:
 The scripts clone upstream source trees into `extern/`, apply the patch sets in
 `patches/`, and install local build products into `opt/`.
 
-## Validated Results
+## Validated Results (June 2026 inherited baseline)
 
-Validation was performed on Apple M3 Ultra, Apple M4 Max, and Apple M5 Max
-systems.
+The numbers below are from the June 2026 cross-chip campaign that landed with
+source identity `952811fb5486adab8b1cdb6d961912a896988401` ("Add validated
+Apple-Metal GPU WarpX port"). They describe that inherited Metal port baseline
+on Apple M3 Ultra, Apple M4 Max, and Apple M5 Max. They are **not** a claim
+that every later handoff delta at `handoff-package` /
+`d750544496a7c2ee7fd946eeecc48b3e5c8a4507` has been re-run across those three
+systems. Raw per-run artifacts from the campaign are not retained in this
+package; later deltas state their own narrower scopes in `reports/`.
 
 - Deterministic GPU-to-CPU crosstest: maximum relative error `1.68e-6` over 100 steps.
 - Statistical RNG deck: moment differences around `1e-18`.
@@ -35,26 +41,33 @@ systems.
 - Particle energy: `3.25e-7` vs CPU.
 - Particle count: exact over 100 steps.
 - x/y momentum: exact over 100 steps.
-- On-chip GPU-to-CPU equivalence: validated on all three systems.
+- On-chip GPU-to-CPU equivalence: validated on all three systems for that baseline.
 
 ## Post-Merge Revalidation (Apple M4 Pro, 2026-07-19)
 
-The full stack was rebuilt from a clean state after merging PR #1 with the
-review follow-up fixes (AdaptiveCpp pinned to develop@`3733a56`, AMReX/WarpX
-pinned to their 26.06 revisions, MSL 3.2 fallback restored, install prefix
-wiped before reinstall, corrected 64-bit atomic emulation, multipass SYCL
-scan with the two-word `BlockStatus` on Metal, and the reworked memory
-guard). Results on Apple M4 Pro (12 CPU cores, 16 GPU cores, 24 GB):
+Upstream collaborator `lulzx` reported the following results from his Apple M4
+Pro (12 CPU cores, 16 GPU cores, 24 GB). This package retains the written
+report but no raw run log, and the package maintainer did not reproduce these
+measurements independently.
+
+The collaborator rebuilt the full stack from a clean state after merging PR #1
+with the review follow-up fixes (AdaptiveCpp pinned to develop@`3733a56`,
+AMReX/WarpX pinned to their 26.06 revisions, MSL 3.2 fallback restored, install
+prefix wiped before reinstall, corrected 64-bit atomic emulation, multipass
+SYCL scan with the two-word `BlockStatus` on Metal, and the reworked memory
+guard):
 
 - SYCL smoke tests (`02-validate-metal.sh`): 4/4 pass
   (device query, vector add, USM, reduction).
 - AMReX HeatEquation on Metal GPU (`04-validate-amrex.sh`): PASS.
 - **WarpX Langmuir 2D: 40/40 steps complete on Metal GPU.**
 - **WarpX Langmuir 3D: 20/20 steps complete on Metal GPU.**
-- **Particle sorting re-enabled and validated**: Langmuir 2D with
-  `sort_intervals = 4` matches the sorting-off run exactly on particle count
-  (131,072 over 40 steps) and within `1.6e-7` on particle energy; the former
-  sort-disable override has been removed from the WarpX patch set.
+- **Historical contributor sorting result, not the delivered configuration**:
+  an earlier Langmuir 2D run with `sort_intervals = 4` matched the sorting-off
+  run exactly on particle count (131,072 over 40 steps) and within `1.6e-7` on
+  particle energy. The current package subsequently reinstated a conservative
+  WarpX guard that forces sorting off on the AdaptiveCpp/HipSYCL SYCL GPU path,
+  so this measurement does not validate the delivered sorting configuration.
 
 Two silent-corruption classes were found and eliminated during this
 revalidation:
