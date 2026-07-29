@@ -20,10 +20,10 @@ standard PIC workloads on Apple Silicon GPUs.
   `952811fb5486adab8b1cdb6d961912a896988401` (commit message: "Add validated
   Apple-Metal GPU WarpX port"). Raw per-run logs from that campaign are not in
   this package; the numbers live in [`VALIDATION.md`](VALIDATION.md).
-- Later handoff deltas (parser-momentum host backfill, RZ `J_ext`, process
-  supervisor, uniform tile-leave, startup memory guard) have the narrower
-  validation boundaries stated in their individual reports; they have not all
-  been re-run across those three systems.
+- Later handoff deltas (parser-momentum SSCP device-executor fix, RZ `J_ext`,
+  process supervisor, uniform tile-leave, startup memory guard) have the
+  narrower validation boundaries stated in their individual reports; they have
+  not all been re-run across those three systems.
 
 ## Validation
 
@@ -126,7 +126,12 @@ Ancestor notes (for orientation only; not assembly steps):
 
 - `e7498b1` (`uniform-tile-leave`) and `8d0e418` (`jext-batch`) are ancestors.
 - `910c3d4` (`parser-device-pointer-fix`) generalized the parser-momentum
-  host backfill and is an ancestor of `d750544`.
+  host backfill and is an ancestor of `d750544`. That host backfill was later
+  retired in favour of the AMReX `ParserExecutor` SSCP runtime target-dispatch
+  fix (`patches/amrex-post/0006-fix-parserexecutor-sscp-device-executor.patch`,
+  using `__acpp_if_target_{host,device}` rather than a compile-time device
+  preference); WarpX `0002` was removed and the public series keeps the number
+  gap rather than renumbering mid-adoption.
 - `d750544496a7c2ee7fd946eeecc48b3e5c8a4507` is the pre-doc-fix composite
   that first closed the ten pre-handoff defects; later `handoff-package` tips
   may add documentation-only review fixes on top.
@@ -143,11 +148,16 @@ Ancestor notes (for orientation only; not assembly steps):
   SYCL GPU path because the packaged WarpX guard treats the Metal sort path as
   particle-attribute-corrupting. The AMReX multipass scan fixes remain in the
   package, but they do not remove that delivered guard.
-- On the single-precision path, the packaged parser-momentum path is a **host
-  backfill workaround**, not a general device-runtime fix. The accepted matrix
-  covers unboosted initial `AddPlasma` only. Boosted or continuous injection,
-  momentum-dependent user attributes, parsed `NFluxPerCell` / `AddPlasmaFlux`,
-  and the RCYLINDER/RSPHERE coordinate branches remain unvalidated. See
+- On the single-precision Metal path, AdaptiveCpp SSCP leaves
+  `__SYCL_DEVICE_ONLY__` unset, so unpatched AMReX `ParserExecutor` evaluates
+  its host executor inside GPU kernels and nested particle injectors can read
+  zero momentum. The package uses AdaptiveCpp runtime target selectors
+  (`__acpp_if_target_device` / `__acpp_if_target_host`) under unified
+  host/device passes so host and device each keep their own bytecode — not a
+  compile-time device-preferred fallback. The Cartesian call-ordinal asymmetry
+  remains an open secondary question; the SSCP fix cures both species
+  everywhere without depending on it. Acceptance still covers unboosted
+  initial `AddPlasma` only. See
   [the parser-momentum report](reports/addplasma-parser-momentum-device-zero.md).
 
 ## Bugfix Reports
@@ -155,7 +165,7 @@ Ancestor notes (for orientation only; not assembly steps):
 Detailed reports describe the failure mechanism, correction, validation scope,
 and remaining limitations for the keeper fixes:
 
-- [Metal AddPlasma parser-momentum device-zero workaround](reports/addplasma-parser-momentum-device-zero.md)
+- [Metal AddPlasma parser-momentum SSCP device-executor fix](reports/addplasma-parser-momentum-device-zero.md)
 - [AdaptiveCpp Metal device-to-host completion hardening](reports/adaptivecpp-d2h-shared-event-completion.md)
 - [AdaptiveCpp Metal in-order readback and bounded completion](reports/adaptivecpp-metal-inorder-readback.md)
 - [AdaptiveCpp Metal source-identity backend payload](reports/adaptivecpp-metal-source-identity.md)

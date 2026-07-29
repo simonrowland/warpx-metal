@@ -1,79 +1,88 @@
-# Metal AddPlasma parser-momentum device-zero workaround
+# Metal AddPlasma parser-momentum SSCP device-executor fix
 
 ## Summary
 
 On the single-precision Metal/SYCL path, device evaluation of
-`parse_momentum_function` through `InjectorMomentumParser` can write zero
+`parse_momentum_function` through `InjectorMomentumParser` could write zero
 momentum during `AddPlasma`. Particle count, position, per-particle weight, and
-total weight remain correct. The defect is visible in the initial particle dump
-before deposition.
+total weight remained correct. The defect was visible in the initial particle
+dump before deposition.
 
-The measured failure is dimension-dependent on the single-precision Metal path:
+The measured failure was dimension-dependent on the single-precision Metal path:
 
 - **1D and 3D:** call ordinal, not species identity — the first parsed
-  `AddPlasma` call is zero and the second is analytically correct, including
-  when species order is reversed. This is a measured call-order observation,
-  not a fully explained mechanism: a minimal nested-host reproducer zeros
-  *every* call and does not yet account for why the second Cartesian call
-  survives.
-- **RZ:** all tested parsed species are zero (not first-only).
-- **XZ:** clean because this port already carried an XZ-only host re-evaluation
-  path that masks the device defect.
+  `AddPlasma` call was zero and the second was analytically correct, including
+  when species order was reversed. This remains a measured call-order
+  observation, not a fully explained mechanism: a minimal nested-host
+  reproducer zeros *every* call and does not yet account for why the second
+  Cartesian call survived.
+- **RZ:** all tested parsed species were zero (not first-only).
+- **XZ:** was previously clean only because an XZ-only host re-evaluation path
+  masked the device defect (later generalized, then retired).
 
-No out-of-bounds access is established by the current evidence. The former
-patch and report names preserved an earlier, unproven diagnosis and have been
-retired.
+No out-of-bounds access is established by the current evidence. Earlier patch
+and report names that preserved an unproven diagnosis have been retired.
+
+## Mechanism
+
+AdaptiveCpp SSCP never defines `__SYCL_DEVICE_ONLY__` in device kernels on the
+toolchain used by this port. Unpatched AMReX therefore treats
+`AMREX_IF_ON_DEVICE` as a no-op and always takes the host branch of
+`ParserExecutor`, including inside GPU kernels. That is the same macro-family
+defect as the existing GpuAtomic SSCP bypass.
+
+The particle path reaches the host executor through a copied
+`InjectorMomentum` object and its nested union member. Minimal Metal
+reproducers show:
+
+1. Nested host-executor evaluation returns zero.
+2. By-value and device-executor paths return the expected bytecode answer.
+3. Promoting only the raw device bytecode pointer to a top-level kernel capture
+   did not repair the WarpX path (non-finite momentum instead).
+
+That explains the zero *class*. It does **not** explain the Cartesian
+first-call-only asymmetry (the nested-stock reproducer zeros every call).
+
+## Fix
 
 Patch:
-[`patches/warpx/0002-work-around-metal-parser-momentum-device-zero.patch`](../patches/warpx/0002-work-around-metal-parser-momentum-device-zero.patch)
+[`patches/amrex-post/0006-fix-parserexecutor-sscp-device-executor.patch`](../patches/amrex-post/0006-fix-parserexecutor-sscp-device-executor.patch)
 
-The companion coordinate-aware host backfill remains in
-[`patches/warpx/0001-metal-source-identity.patch`](../patches/warpx/0001-metal-source-identity.patch).
+Under AdaptiveCpp unified host/device passes
+(`AMREX_USE_SYCL` with `__ACPP_ENABLE_LLVM_SSCP_TARGET__` or
+`ACPP_LIBKERNEL_CUDA_NVCXX`), `ParserExecutor` uses AdaptiveCpp runtime target
+selectors — `__acpp_if_target_device` / `__acpp_if_target_host` — so each
+entry point evaluates the matching executor. There is no compile-time
+device-preferred fallback: host calls keep host bytecode (device arena is not
+host-accessible), and device calls keep device bytecode (host-executor-in-kernel
+is the original defect). The original `AMREX_IF_ON_DEVICE` /
+`AMREX_IF_ON_HOST` body remains in the `#else` for non-unified paths.
 
-## Observed mechanism
+An earlier compile-time “prefer `m_device_executor` under the SSCP macro” form
+was wrong for SSCP’s single host/device pass: host calls in the same binary
+would take the device executor. That form was replaced by runtime target
+dispatch before retirement of the host backfill.
 
-The failing device path reaches parser executors through a copied
-`InjectorMomentum` object and its nested union member. Promoting only the raw
-device bytecode pointer to a top-level kernel capture did not repair the path;
-it produced non-finite momentum instead.
+The host-side `AddPlasma` backfill and device zero-bypass in the former WarpX
+`0001` / `0002` patches are **retired**; WarpX `0002` is removed and the
+public series keeps the number gap rather than renumbering mid-adoption.
 
-Since package assembly, the zero *class* has been localized on the pinned
-AdaptiveCpp SSCP/Metal stack used by this port:
+```cpp
+#if defined(AMREX_USE_SYCL) && (defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__) || defined(ACPP_LIBKERNEL_CUDA_NVCXX))
+        __acpp_if_target_device(return parser_exe_eval(m_device_executor, l_var.data());)
+        __acpp_if_target_host(return parser_exe_eval(m_host_executor, l_var.data());)
+#else
+        AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
+        AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
+#endif
+```
 
-1. `__SYCL_DEVICE_ONLY__` is unset in SSCP device kernels on that toolchain.
-2. Unpatched AMReX `ParserExecutor` therefore elides `AMREX_IF_ON_DEVICE` and
-   evaluates its host-executor expression inside the kernel.
-3. A minimal Metal reproducer zeros nested host-executor evaluation; by-value
-   and device-executor paths return the expected bytecode answer.
+The SSCP path is applied after the existing Metal PIC/parser reductions in
+`patches/amrex-post/0004-metal-pic-rng-reduction-fixes.patch` (which introduce
+`ParserExeReal` for single precision).
 
-That explains the zero class and is valuable upstream information. It does
-**not** explain the Cartesian first-call-only asymmetry (the nested-stock
-reproducer zeros every call). The preferred AMReX SSCP repair (force
-`m_device_executor` under AdaptiveCpp SSCP, mirroring the existing GpuAtomic
-fast path) has passed a single no-backfill 1D analytic smoke; the full
-no-backfill 31-case/RZ/control matrix is still pending. The root fix is
-**not** in this package; `0002` remains the host-backfill workaround.
-
-## Workaround
-
-The two existing patches continue to act as one mechanism:
-
-1. For parser momentum under GPU+SYCL, the `AddPlasma` device kernel writes
-   temporary zero momentum instead of traversing the suspect nested parser
-   state.
-2. After final particle positions are available, the host re-evaluates the
-   parsed momentum and copies `ux`, `uy`, and `uz` back to the device.
-3. The host path reconstructs physical Cartesian coordinates for 1D/Z, XZ,
-   3D, RZ, cylindrical, and spherical geometries. RZ uses
-   `(r cos(theta), r sin(theta), z)`.
-4. At the initial `t=0` identity-boost state, ballistic correction returns the
-   input longitudinal coordinate before any unnecessary device parser
-   dereference. Later times retain the full ballistic formula.
-
-The momentum bypass and host backfill are parser-only and SYCL-only. The
-`t=0` shortcut is backend-independent but algebraically exact. CPU builds,
-CUDA/HIP builds, and constant, Gaussian, Gaussian-flux, vacuum, and grid
-impressed-current paths retain their physical behavior.
+CPU builds, CUDA/HIP builds, and constant, Gaussian, Gaussian-flux, vacuum, and
+grid impressed-current paths retain their physical behavior.
 
 ## Validation
 
@@ -88,27 +97,29 @@ The unfixed binary was first shown red with a 31-case, fail-closed matrix:
 - step-1 primary-field amplitude and GPU/CPU comparisons.
 
 The unfixed result reproduced the call-ordinal zero in 1D/3D and the
-all-parsed-species zero in RZ. XZ and every nonparsed control remained clean.
+all-parsed-species zero in RZ. XZ (with the old host mask) and every nonparsed
+control remained clean.
 
-The generalized host workaround then passed the same matrix 31/31 with zero
-case failures and zero control failures. Representative step-1 GPU/CPU
-amplitude ratios were:
-
-- 1D: `Ex=0.9999999168`, `jx=0.9999999187`, `rho=1.0`
-- RZ: `Ez=1.0000000593`, `jz=1.0000000548`,
-  `rho=1.0000115596`
-
-Every parsed PPC/order/restricted arm passed. Constant momentum, Gaussian
-momentum, source-free vacuum, and grid impressed-current controls remained
-clean. All accepted Metal runs used the uniform full-tile-leave redistribution
-workaround (`particles.redistribute_uniform_tile_leave=1`) and at least a
-600-second initialization grace; shader validation was not enabled.
+With the SSCP device-executor fix and **no host backfill**, the same matrix
+passed 31/31 on particle oracles and field compares for all dimensions,
+including every RZ parsed arm and both species. Controls
+(constant/Gaussian/vacuum/J_ext where applicable) remained clean. All accepted
+Metal runs used the uniform full-tile-leave redistribution workaround
+(`particles.redistribute_uniform_tile_leave=1`) and at least a 600-second
+initialization grace; shader validation was not enabled.
 
 ## Limitations
 
-This is containment via host backfill, not a general device-runtime fix. It
-adds a device-to-host and host-to-device particle-momentum round trip during
-affected `AddPlasma` injection.
+This is a real fix for the SSCP `AMREX_IF_ON_*` / host-executor class, not a
+host-side containment path. It removes the previous device→host→device
+momentum round trip at injection.
+
+**Call-ordinal asymmetry remains unexplained** at the minimal-repro level. The
+SSCP fix cures both species everywhere (including reversed order and RZ), so
+retirement does not depend on explaining it. The Cartesian second-species-OK
+path remains a secondary WarpX/Metal-shaped puzzle (lazy translation? arena
+pointer caching?) and is left open rather than hand-waved away because a
+matrix went green.
 
 **Acceptance boundary (what the 31/31 matrix actually covers):** unboosted
 initial `AddPlasma` only, on the single-precision Metal path, with
@@ -122,8 +133,7 @@ initial `AddPlasma` only, on the single-precision Metal path, with
 - parsed `NFluxPerCell` / `AddPlasmaFlux` (still evaluates its momentum
   injector in a separate device kernel);
 - runtime validation of the `WARPX_DIM_RCYLINDER` and `WARPX_DIM_RSPHERE`
-  coordinate branches (compile-time extensions of the same reconstruction
-  logic, not in the 31-case matrix).
+  coordinate branches (not in the 31-case matrix).
 
-A recipient can apply the workaround successfully and still run an unvalidated
-parsed-injection path — check dump-0 momentum for every parsed species.
+A recipient should still check dump-0 momentum for every parsed species when
+exercising unvalidated injection paths.

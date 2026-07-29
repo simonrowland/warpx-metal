@@ -114,10 +114,15 @@ apply_patch "${AMREX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/amrex-post/0004-metal-pic-rng-reduction-fixes.patch"
 apply_patch "${AMREX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/amrex-post/0005-metal-uniform-tile-leave.patch"
+apply_patch "${AMREX_SOURCE_DIR}" \
+    "${ROOT_DIR}/patches/amrex-post/0006-fix-parserexecutor-sscp-device-executor.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0001-metal-source-identity.patch"
-apply_patch "${WARPX_SOURCE_DIR}" \
-    "${ROOT_DIR}/patches/warpx/0002-work-around-metal-parser-momentum-device-zero.patch"
+# 0002 retired: host-side parser-momentum workaround replaced by AMReX
+# ParserExecutor SSCP runtime target dispatch (amrex-post/0006 uses
+# __acpp_if_target_{host,device}, not a compile-time device preference).
+# Number gap kept so mid-adoption recipients are not hurt by renumbering a
+# public series.
 apply_patch "${WARPX_SOURCE_DIR}" \
     "${ROOT_DIR}/patches/warpx/0003-correct-macos-memory-guard-available-memory.patch"
 apply_patch "${WARPX_SOURCE_DIR}" \

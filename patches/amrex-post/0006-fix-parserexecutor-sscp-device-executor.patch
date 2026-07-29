@@ -1,0 +1,84 @@
+diff --git a/Src/Base/Parser/AMReX_Parser.H b/Src/Base/Parser/AMReX_Parser.H
+index 22ac08a..231ef74 100644
+--- a/Src/Base/Parser/AMReX_Parser.H
++++ b/Src/Base/Parser/AMReX_Parser.H
+@@ -45,8 +45,22 @@ struct ParserExecutor
+     [[nodiscard]] AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     ParserExeReal operator() () const noexcept
+     {
++#if defined(AMREX_USE_SYCL) && (defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__) || defined(ACPP_LIBKERNEL_CUDA_NVCXX))
++        // AdaptiveCpp unified host/device passes (generic SSCP and cuda-nvcxx)
++        // never define __SYCL_DEVICE_ONLY__, so AMREX_IF_ON_DEVICE is a no-op and
++        // the host branch would always run — including inside GPU kernels.
++        // Dispatch with AdaptiveCpp target selectors: SSCP uses the
++        // __acpp_sscp_is_{host,device} IR constants (folded per partition);
++        // cuda-nvcxx uses nvc++ `if target(nv::target::is_{host,device})`.
++        // Do NOT prefer device bytecode for host calls (device arena is not
++        // host-accessible). Do NOT fall back to host bytecode on device
++        // (that is the original host-executor-in-kernel defect).
++        __acpp_if_target_device(return parser_exe_eval(m_device_executor, nullptr);)
++        __acpp_if_target_host(return parser_exe_eval(m_host_executor, nullptr);)
++#else
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, nullptr);))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, nullptr);))
++#endif
+     }
+ 
+     /**
+@@ -61,8 +75,13 @@ struct ParserExecutor
+     operator() (Ts... var) const noexcept
+     {
+         amrex::GpuArray<ParserExeReal,N> l_var{static_cast<ParserExeReal>(var)...};
++#if defined(AMREX_USE_SYCL) && (defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__) || defined(ACPP_LIBKERNEL_CUDA_NVCXX))
++        __acpp_if_target_device(return parser_exe_eval(m_device_executor, l_var.data());)
++        __acpp_if_target_host(return parser_exe_eval(m_host_executor, l_var.data());)
++#else
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
++#endif
+     }
+ 
+     /**
+@@ -78,8 +97,13 @@ struct ParserExecutor
+     operator() (Ts... var) const noexcept
+     {
+         amrex::GpuArray<ParserExeReal,N> l_var{static_cast<ParserExeReal>(var)...};
++#if defined(AMREX_USE_SYCL) && (defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__) || defined(ACPP_LIBKERNEL_CUDA_NVCXX))
++        __acpp_if_target_device(return static_cast<float>(parser_exe_eval(m_device_executor, l_var.data()));)
++        __acpp_if_target_host(return static_cast<float>(parser_exe_eval(m_host_executor, l_var.data()));)
++#else
+         AMREX_IF_ON_DEVICE((return static_cast<float>(parser_exe_eval(m_device_executor, l_var.data()));))
+         AMREX_IF_ON_HOST((return static_cast<float>(parser_exe_eval(m_host_executor, l_var.data()));))
++#endif
+     }
+ 
+     /**
+@@ -92,8 +116,13 @@ struct ParserExecutor
+     {
+         GpuArray<ParserExeReal,N> l_var{};
+         for (int i = 0; i < N; ++i) { l_var[i] = static_cast<ParserExeReal>(var[i]); }
++#if defined(AMREX_USE_SYCL) && (defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__) || defined(ACPP_LIBKERNEL_CUDA_NVCXX))
++        __acpp_if_target_device(return parser_exe_eval(m_device_executor, l_var.data());)
++        __acpp_if_target_host(return parser_exe_eval(m_host_executor, l_var.data());)
++#else
+         AMREX_IF_ON_DEVICE((return parser_exe_eval(m_device_executor, l_var.data());))
+         AMREX_IF_ON_HOST((return parser_exe_eval(m_host_executor, l_var.data());))
++#endif
+     }
+ 
+     /**
+@@ -101,8 +130,14 @@ struct ParserExecutor
+      */
+     AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+     explicit operator bool () const {
++#if defined(AMREX_USE_SYCL) && (defined(__ACPP_ENABLE_LLVM_SSCP_TARGET__) || defined(ACPP_LIBKERNEL_CUDA_NVCXX))
++        // Target-aware: host reports host bytecode; device requires device bytecode.
++        __acpp_if_target_device(return m_device_executor != nullptr;)
++        __acpp_if_target_host(return m_host_executor != nullptr;)
++#else
+         AMREX_IF_ON_DEVICE((return m_device_executor != nullptr;))
+         AMREX_IF_ON_HOST((return m_host_executor != nullptr;))
++#endif
+     }
+ 
+     char* m_host_executor = nullptr;  ///< Pointer to host-visible bytecode.
