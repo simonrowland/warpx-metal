@@ -1,0 +1,16 @@
+diff --git a/Source/Particles/PhysicalParticleContainer.cpp b/Source/Particles/PhysicalParticleContainer.cpp
+index fa525bd2..a0fe2310 100644
+--- a/Source/Particles/PhysicalParticleContainer.cpp
++++ b/Source/Particles/PhysicalParticleContainer.cpp
+@@ -810,10 +810,9 @@ PhysicalParticleContainer::Evolve (ablastr::fields::MultiFabRegister& fields,
+                 }
+             }
+ 
+-            amrex::Gpu::synchronize();
+-
+             if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+             {
++                amrex::Gpu::synchronize();
+                 wt = static_cast<amrex::Real>(amrex::second()) - wt;
+                 amrex::HostDevice::Atomic::Add( &(*cost)[pti.index()], wt);
+             }
