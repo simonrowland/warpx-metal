@@ -103,7 +103,7 @@ Run this on the build host. `PREFIX` must not already exist.
 ```bash
 export PREFIX=/Applications/warpx-metal-prod-20260728
 export FORK_URL=https://github.com/simonrowland/warpx-metal.git
-export EXPECTED_PATCH_PAYLOAD_SHA256=fdf84dbdef2fdfddb3570955c866354f7d519b0e63a78f5094f5b922d7b56ef2
+export EXPECTED_PATCH_PAYLOAD_SHA256=f24a82d511f1fa73b8b75fa2ebce46e8a227f4ceee0c827bf5c8181245e04ce6
 
 test ! -e "$PREFIX"
 git ls-remote --exit-code "$FORK_URL" HEAD

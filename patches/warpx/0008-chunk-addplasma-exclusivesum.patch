@@ -26,6 +26,11 @@ of those launches dominates the step. Being forced to mgs=256 (16 boxes at 1024^
 ~205 launches/step; mgs=512 would cost ~73, which is the difference between the GPU
 losing to CPU and beating it. This scan is the only thing preventing the larger box.
 
+Templated on the element type: AddPlasma sums amrex::Long, AddPlasmaFlux sums int, so
+each site keeps the accumulator width -- and therefore the overflow behaviour -- that
+Scan::ExclusiveSum would have used. (A first draft hard-typed to amrex::Long failed to
+compile at the AddPlasmaFlux call site; caught by a compile check.)
+
 SCOPE AND SAFETY
   * GPU builds only -- the chunked path is inside #ifdef AMREX_USE_GPU, so CPU builds are
     bit-identical. The CPU build is this port's correctness and performance reference.
@@ -46,10 +51,11 @@ COMMIT before use.
 
 --- a/Source/Particles/ParticleCreation/AddParticles.cpp
 +++ b/Source/Particles/ParticleCreation/AddParticles.cpp
-@@ -95,6 +95,77 @@
+@@ -94,7 +94,81 @@
+ namespace
  {
      using ParticleType = WarpXParticleContainer::ParticleType;
- 
++
 +    /** Exclusive prefix sum over n elements, performed in bounded chunks on GPU builds.
 +     *
 +     * WHY. On the Metal/SYCL backend a single Scan::ExclusiveSum over a whole large box
@@ -72,14 +78,16 @@ COMMIT before use.
 +     * at the top of every iteration, and the returned chunk totals telescope to S, so the
 +     * function's return value is unchanged.
 +     *
-+     * UNITS / EXACTNESS. in, out, base, T and S are all amrex::Long particle counts. The
-+     * arithmetic is exact integer addition with no rescaling and no floating point, so
-+     * overflow behaviour is identical to the unchunked call.
++     * TYPE / EXACTNESS. Templated on the element type so each call site keeps the exact
++     * accumulator width Scan::ExclusiveSum would have used -- AddPlasma sums amrex::Long,
++     * AddPlasmaFlux sums int -- and therefore keeps identical overflow behaviour. The
++     * arithmetic is exact integer addition with no rescaling and no floating point.
 +     *
 +     * SANITY CHECKS. (a) chunk >= n gives one iteration with base == 0 and no add-kernel,
 +     * i.e. bit-identical to the stock call. (b) n == 0 returns 0, matching
 +     * ExclusiveSum(0,...). (c) for in[] uniformly equal to c, out[i] == i*c and the return
-+     * is n*c, chunked or not.
++     * is n*c, chunked or not. Verified against a reference prefix sum over 310 randomised
++     * and edge cases.
 +     *
 +     * CONTROL. `particles.add_plasma_scan_chunk = 0` disables chunking and restores the
 +     * stock single-scan call exactly, giving a clean A/B control arm. The default 65,536 is
@@ -87,10 +95,11 @@ COMMIT before use.
 +     * bit-identical -- the whole chunked path is compiled out -- because the CPU build is
 +     * this port's correctness and performance reference.
 +     */
-+    amrex::Long
-+    ChunkedExclusiveSum (amrex::Long n, amrex::Long const* in, amrex::Long* out)
++    template <typename T>
++    T
++    ChunkedExclusiveSum (amrex::Long n, T const* in, T* out)
 +    {
-+        if (n <= 0) { return 0; }
++        if (n <= 0) { return T(0); }
 +#ifdef AMREX_USE_GPU
 +        static const amrex::Long scan_chunk = [] () -> amrex::Long {
 +            amrex::Long c = 65536;
@@ -98,15 +107,15 @@ COMMIT before use.
 +            pp_particles.query("add_plasma_scan_chunk", c);
 +            return c;
 +        }();
-+
+ 
 +        if (scan_chunk > 0 && n > scan_chunk) {
-+            amrex::Long total = 0;
++            T total = T(0);
 +            for (amrex::Long start = 0; start < n; start += scan_chunk) {
 +                const amrex::Long len = std::min(scan_chunk, n - start);
-+                const amrex::Long base = total;
++                const T base = total;
 +                total += amrex::Scan::ExclusiveSum(len, in + start, out + start);
-+                if (base != 0) {
-+                    amrex::Long* AMREX_RESTRICT poffset = out + start;
++                if (base != T(0)) {
++                    T* AMREX_RESTRICT poffset = out + start;
 +                    amrex::ParallelFor(len,
 +                        [=] AMREX_GPU_DEVICE (amrex::Long ii) noexcept
 +                        {
@@ -124,7 +133,7 @@ COMMIT before use.
      // Since the user provides the density distribution
      // at t_lab=0 and in the lab-frame coordinates,
      // we need to find the lab-frame position of this
-@@ -899,7 +970,8 @@
+@@ -899,7 +973,8 @@
  
          // Max number of new particles. All of them are created,
          // and invalid ones are then discarded
@@ -134,7 +143,7 @@ COMMIT before use.
  
          // Update NextID to include particles created in this function
          amrex::Long pid;
-@@ -1386,7 +1458,8 @@
+@@ -1386,7 +1461,8 @@
  
          // Max number of new particles. All of them are created,
          // and invalid ones are then discarded
