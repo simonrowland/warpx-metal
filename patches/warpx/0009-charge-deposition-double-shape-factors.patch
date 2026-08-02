@@ -1,0 +1,204 @@
+Subject: [PATCH] Charge deposition: keep normalized coords and shape factors in double
+
+Applies the single-precision hardening that current deposition already has, to the
+charge deposition path that was missed.
+
+THE ASYMMETRY. Source/Particles/Deposition/CurrentDeposition.H computes the normalized
+particle coordinate and the shape factors in double, and converts back to amrex::Real
+only for the final scatter. It carries the in-source comment "Keep these double to avoid
+bug in single precision" (lines ~115, ~127). The structurally identical code in
+ChargeDeposition.H does all of that work in amrex::Real, which is binary32 in a
+single-precision build.
+
+WHY IT SHOWS UP IN rho AND NOT IN j. A normalized coordinate on a 1024-cell axis is
+O(1e3); converting it to binary32 before index/weight selection discards far more than
+one field-scale ulp, so platforms whose FMA/instruction selection differs can choose
+slightly different shape weights. Same-species currents ADD, so that error stays at
+round-off. Total charge density is the NEAR-CANCELLING difference of two same-magnitude
+species densities, and the cancellation amplifies the relative error enormously.
+
+MEASURED (two-species Langmuir, 1024^2, PPC1, single precision, Yee FDTD, identical
+decks/seeds, two platforms compared at step 1):
+    Ex, Ez, jx, jz   max|d|/RMS ~ 6e-5, rel-L2 ~ 1.1e-5   (round-off)
+    particle counts  exact, both species
+    rho              max|d|/RMS ~ 1.8e-1, rel-L2 ~ 2.2e-2
+Normalizing the same rho difference against a SINGLE species density (3.204e5 C/m^3)
+instead of the near-cancelled net gives 2.24e-6 RMS / 1.90e-5 max -- i.e. the underlying
+deposition error really is round-off scale, and the reported 2% is cancellation
+amplifying it.
+
+WHY IT IS EASY TO MISS. Particle counts and field-energy invariants pass cleanly; only
+the deposited charge is wrong. A count-based sanity check sees a healthy run.
+
+IMPACT. Under plain Yee FDTD rho is diagnostic-only, so this corrupts charge-density,
+Gauss-law and charge-conservation DIAGNOSTICS without affecting the evolution. It becomes
+PHYSICS-ACTIVE wherever rho is consumed: electrostatic solvers, HybridPIC, div-E cleaning,
+and rho-corrected PSATD. Double-precision builds are unaffected.
+
+THE CHANGE. Mirror CurrentDeposition exactly: compute the normalized coordinate and the
+shape factors in double, then convert to amrex::Real immediately before the deposition
+loop, leaving the loop itself untouched. Applied to both doChargeDepositionShapeN and
+doChargeDepositionSharedShapeN, and to every geometry variant (Cartesian, RZ, RCYLINDER,
+RSPHERE).
+
+*** NOT YET VALIDATED ON HARDWARE *** -- authored while the GPU/SP build hosts were
+unreachable. Before landing: rebuild SP, re-run the field-level comparison, and confirm
+rho falls to round-off parity alongside Ex/Ez/jx/jz. Generated against WarpX
+87fb74da702088687725c5e6458cc0e8fa2953a5.
+
+--- a/Source/Particles/Deposition/ChargeDeposition.H
++++ b/Source/Particles/Deposition/ChargeDeposition.H
+@@ -82,48 +82,61 @@
+             const amrex::Real costheta = (rp > 0._rt ? xp/rp : 1._rt);
+             const amrex::Real sintheta = (rp > 0._rt ? yp/rp : 0._rt);
+             const Complex xy0 = Complex{costheta, sintheta};
+-            const amrex::Real x = (rp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (rp - xyzmin.x)*dinv.x;
+ #elif defined(WARPX_DIM_RCYLINDER)
+             const amrex::Real rp = std::sqrt(xp*xp + yp*yp);
+-            const amrex::Real x = (rp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (rp - xyzmin.x)*dinv.x;
+ #elif defined(WARPX_DIM_RSPHERE)
+             const amrex::Real rp = std::sqrt(xp*xp + yp*yp + zp*zp);
+-            const amrex::Real x = (rp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (rp - xyzmin.x)*dinv.x;
+ #else
+-            const amrex::Real x = (xp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (xp - xyzmin.x)*dinv.x;
+ #endif
+ 
+             // Compute shape factor along x
+             // i: leftmost grid point that the particle touches
+-            amrex::Real sx[depos_order + 1] = {0._rt};
++            // Keep these double to avoid bug in single precision
++            double sx_d[depos_order + 1] = {0.};
+             int i = 0;
+             if (rho_type[0] == NODE) {
+-                i = compute_shape_factor(sx, x);
++                i = compute_shape_factor(sx_d, x);
+             } else if (rho_type[0] == CELL) {
+-                i = compute_shape_factor(sx, x - 0.5_rt);
++                i = compute_shape_factor(sx_d, x - 0.5);
+             }
++            amrex::Real sx[depos_order + 1] = {0._rt};
++            for (int ix=0; ix<=depos_order; ix++) { sx[ix] = amrex::Real(sx_d[ix]); }
+ #endif // !defined(WARPX_DIM_1D_Z)
+ #if defined(WARPX_DIM_3D)
+             // y direction
+-            const amrex::Real y = (yp - xyzmin.y)*dinv.y;
+-            amrex::Real sy[depos_order + 1] = {0._rt};
++            // Keep these double to avoid bug in single precision
++            const double y = (yp - xyzmin.y)*dinv.y;
++            double sy_d[depos_order + 1] = {0.};
+             int j = 0;
+             if (rho_type[1] == NODE) {
+-                j = compute_shape_factor(sy, y);
++                j = compute_shape_factor(sy_d, y);
+             } else if (rho_type[1] == CELL) {
+-                j = compute_shape_factor(sy, y - 0.5_rt);
++                j = compute_shape_factor(sy_d, y - 0.5);
+             }
++            amrex::Real sy[depos_order + 1] = {0._rt};
++            for (int iy=0; iy<=depos_order; iy++) { sy[iy] = amrex::Real(sy_d[iy]); }
+ #endif
+ #if !defined(WARPX_DIM_RCYLINDER) && !defined(WARPX_DIM_RSPHERE)
+             // z direction
+-            const amrex::Real z = (zp - xyzmin.z)*dinv.z;
+-            amrex::Real sz[depos_order + 1] = {0._rt};
++            // Keep these double to avoid bug in single precision
++            const double z = (zp - xyzmin.z)*dinv.z;
++            double sz_d[depos_order + 1] = {0.};
+             int k = 0;
+             if (rho_type[WARPX_ZINDEX] == NODE) {
+-                k = compute_shape_factor(sz, z);
++                k = compute_shape_factor(sz_d, z);
+             } else if (rho_type[WARPX_ZINDEX] == CELL) {
+-                k = compute_shape_factor(sz, z - 0.5_rt);
++                k = compute_shape_factor(sz_d, z - 0.5);
+             }
++            amrex::Real sz[depos_order + 1] = {0._rt};
++            for (int iz=0; iz<=depos_order; iz++) { sz[iz] = amrex::Real(sz_d[iz]); }
+ #endif
+ 
+             // Deposit charge into rho_arr
+@@ -346,48 +359,61 @@
+                 sintheta = 0._rt;
+             }
+             const Complex xy0 = Complex{costheta, sintheta};
+-            const amrex::Real x = (rp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (rp - xyzmin.x)*dinv.x;
+ #elif defined(WARPX_DIM_RCYLINDER)
+             const amrex::Real rp = std::sqrt(xp*xp + yp*yp);
+-            const amrex::Real x = (rp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (rp - xyzmin.x)*dinv.x;
+ #elif defined(WARPX_DIM_RSPHERE)
+             const amrex::Real rp = std::sqrt(xp*xp + yp*yp + zp*zp);
+-            const amrex::Real x = (rp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (rp - xyzmin.x)*dinv.x;
+ #else
+-            const amrex::Real x = (xp - xyzmin.x)*dinv.x;
++            // Keep these double to avoid bug in single precision
++            const double x = (xp - xyzmin.x)*dinv.x;
+ #endif
+ 
+             // Compute shape factor along x
+             // i: leftmost grid point that the particle touches
+-            amrex::Real sx[depos_order + 1] = {0._rt};
++            // Keep these double to avoid bug in single precision
++            double sx_d[depos_order + 1] = {0.};
+             int i = 0;
+             if (rho_type[0] == NODE) {
+-                i = compute_shape_factor(sx, x);
++                i = compute_shape_factor(sx_d, x);
+             } else if (rho_type[0] == CELL) {
+-                i = compute_shape_factor(sx, x - 0.5_rt);
++                i = compute_shape_factor(sx_d, x - 0.5);
+             }
++            amrex::Real sx[depos_order + 1] = {0._rt};
++            for (int ix=0; ix<=depos_order; ix++) { sx[ix] = amrex::Real(sx_d[ix]); }
+ #endif //defined(WARPX_DIM_XZ) || defined(WARPX_DIM_RZ) || defined(WARPX_DIM_3D)
+ #if defined(WARPX_DIM_3D)
+             // y direction
+-            const amrex::Real y = (yp - xyzmin.y)*dinv.y;
+-            amrex::Real sy[depos_order + 1] = {0._rt};
++            // Keep these double to avoid bug in single precision
++            const double y = (yp - xyzmin.y)*dinv.y;
++            double sy_d[depos_order + 1] = {0.};
+             int j = 0;
+             if (rho_type[1] == NODE) {
+-                j = compute_shape_factor(sy, y);
++                j = compute_shape_factor(sy_d, y);
+             } else if (rho_type[1] == CELL) {
+-                j = compute_shape_factor(sy, y - 0.5_rt);
++                j = compute_shape_factor(sy_d, y - 0.5);
+             }
++            amrex::Real sy[depos_order + 1] = {0._rt};
++            for (int iy=0; iy<=depos_order; iy++) { sy[iy] = amrex::Real(sy_d[iy]); }
+ #endif
+ #if !defined(WARPX_DIM_RCYLINDER) && !defined(WARPX_DIM_RSPHERE)
+             // z direction
+-            const amrex::Real z = (zp - xyzmin.z)*dinv.z;
+-            amrex::Real sz[depos_order + 1] = {0._rt};
++            // Keep these double to avoid bug in single precision
++            const double z = (zp - xyzmin.z)*dinv.z;
++            double sz_d[depos_order + 1] = {0.};
+             int k = 0;
+             if (rho_type[WARPX_ZINDEX] == NODE) {
+-                k = compute_shape_factor(sz, z);
++                k = compute_shape_factor(sz_d, z);
+             } else if (rho_type[WARPX_ZINDEX] == CELL) {
+-                k = compute_shape_factor(sz, z - 0.5_rt);
++                k = compute_shape_factor(sz_d, z - 0.5);
+             }
++            amrex::Real sz[depos_order + 1] = {0._rt};
++            for (int iz=0; iz<=depos_order; iz++) { sz[iz] = amrex::Real(sz_d[iz]); }
+ #endif
+ 
+             // Deposit charge into buf

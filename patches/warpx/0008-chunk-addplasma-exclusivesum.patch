@@ -1,0 +1,146 @@
+Subject: [PATCH] Chunk AddPlasma/AddPlasmaFlux ExclusiveSum to decouple scan size from box size
+
+On the Metal/SYCL backend, particle initialisation hangs at zero steps once a box
+exceeds roughly 1e5 cells. Convicted stack:
+
+    WarpX::InitData -> AddPlasma -> amrex::Scan::ExclusiveSum
+        -> streamSynchronize -> ... -> waitUntilCompleted   (never returns)
+
+Measured bracket: 65,536 cells/box completes, 147,456 cells/box hangs. Stock hangs
+identically, so this is NOT introduced by the Metal port's own patches.
+
+The scan length is overlap_box.numPts() -- the whole box -- because MFIter tiling is
+unreachable on the GPU path: AddParticles gates it behind
+`do_tiling && amrex::Gpu::notInLaunchRegion()`, and the second term is false inside a
+GPU launch region, so `particles.tile_size` is silently ignored. Setting tiling inputs
+therefore does NOT shrink this scan; that was verified experimentally before writing
+this patch.
+
+This change bounds the scan length directly, in chunks, leaving the tiling guard alone
+(its launch-region semantics are load-bearing elsewhere). Both call sites are covered:
+AddPlasma and AddPlasmaFlux use the identical pattern, and leaving the second unpatched
+would leave the hang reachable via flux injection.
+
+WHY IT MATTERS: launches/step scale as 11*N_box + 29 on this backend and host submission
+of those launches dominates the step. Being forced to mgs=256 (16 boxes at 1024^2) costs
+~205 launches/step; mgs=512 would cost ~73, which is the difference between the GPU
+losing to CPU and beating it. This scan is the only thing preventing the larger box.
+
+SCOPE AND SAFETY
+  * GPU builds only -- the chunked path is inside #ifdef AMREX_USE_GPU, so CPU builds are
+    bit-identical. The CPU build is this port's correctness and performance reference.
+  * `particles.add_plasma_scan_chunk = 0` restores the stock single-scan call exactly,
+    giving a clean A/B control arm.
+  * Default chunk 65,536 = the largest per-box cell count measured to complete.
+  * The derivation, unit check and sanity cases are in the function comment.
+
+*** NOT YET VALIDATED ON HARDWARE ***
+Authored while the GPU hosts were unreachable. Before landing this requires:
+  1. mgs=512 at 1024^2 completing, with exact N_e = N_p = 1,048,576, x3;
+  2. mgs=256 unchanged against the 20.72 ms/step reference (no regression);
+  3. launches/step measured at mgs=512 -- predicted ~73, but measure, do not assume;
+  4. `add_plasma_scan_chunk=0` reproducing stock behaviour as the control.
+Generated against WarpX 87fb74da702088687725c5e6458cc0e8fa2953a5; the fork pins
+f7db079f9a8ca96d179e02709a29fe6c027ed8ed. RE-VERIFY THE HUNKS APPLY AT THE PINNED
+COMMIT before use.
+
+--- a/Source/Particles/ParticleCreation/AddParticles.cpp
++++ b/Source/Particles/ParticleCreation/AddParticles.cpp
+@@ -95,6 +95,77 @@
+ {
+     using ParticleType = WarpXParticleContainer::ParticleType;
+ 
++    /** Exclusive prefix sum over n elements, performed in bounded chunks on GPU builds.
++     *
++     * WHY. On the Metal/SYCL backend a single Scan::ExclusiveSum over a whole large box
++     * does not retire. Measured: 65,536 elements completes, 147,456 hangs, with the stack
++     *   AddPlasma -> Scan::ExclusiveSum -> streamSynchronize -> ... -> waitUntilCompleted.
++     * Stock hangs identically, so this is not introduced by the Metal port's own patches.
++     * MFIter tiling cannot shrink the scan: AddParticles gates tiling behind
++     * `do_tiling && amrex::Gpu::notInLaunchRegion()`, and the second term is false inside a
++     * GPU launch region, so `particles.tile_size` is silently ignored here (verified
++     * experimentally). Chunking bounds the scan length independently of box size, without
++     * touching the tiling guard, whose launch-region semantics are load-bearing elsewhere.
++     *
++     * DERIVATION. Required: out[i] = sum_{j<i} in[j], returning S = sum_{j<n} in[j].
++     * Split [0,n) into consecutive chunks [s, s+L). Within one chunk,
++     *     Scan::ExclusiveSum(L, in+s, out+s)  yields  out[s+k] = sum_{j<k} in[s+j]
++     * and returns that chunk total T = sum_{j<L} in[s+j]. Globally,
++     *     sum_{j<s+k} in[j] = (sum_{j<s} in[j]) + (sum_{j<k} in[s+j]) = base + out[s+k],
++     * so adding the constant `base` uniformly across the chunk restores global values.
++     * Advancing base by T after each chunk preserves the invariant base == sum_{j<s} in[j]
++     * at the top of every iteration, and the returned chunk totals telescope to S, so the
++     * function's return value is unchanged.
++     *
++     * UNITS / EXACTNESS. in, out, base, T and S are all amrex::Long particle counts. The
++     * arithmetic is exact integer addition with no rescaling and no floating point, so
++     * overflow behaviour is identical to the unchunked call.
++     *
++     * SANITY CHECKS. (a) chunk >= n gives one iteration with base == 0 and no add-kernel,
++     * i.e. bit-identical to the stock call. (b) n == 0 returns 0, matching
++     * ExclusiveSum(0,...). (c) for in[] uniformly equal to c, out[i] == i*c and the return
++     * is n*c, chunked or not.
++     *
++     * CONTROL. `particles.add_plasma_scan_chunk = 0` disables chunking and restores the
++     * stock single-scan call exactly, giving a clean A/B control arm. The default 65,536 is
++     * the largest per-box cell count measured to complete. CPU builds are left
++     * bit-identical -- the whole chunked path is compiled out -- because the CPU build is
++     * this port's correctness and performance reference.
++     */
++    amrex::Long
++    ChunkedExclusiveSum (amrex::Long n, amrex::Long const* in, amrex::Long* out)
++    {
++        if (n <= 0) { return 0; }
++#ifdef AMREX_USE_GPU
++        static const amrex::Long scan_chunk = [] () -> amrex::Long {
++            amrex::Long c = 65536;
++            amrex::ParmParse pp_particles("particles");
++            pp_particles.query("add_plasma_scan_chunk", c);
++            return c;
++        }();
++
++        if (scan_chunk > 0 && n > scan_chunk) {
++            amrex::Long total = 0;
++            for (amrex::Long start = 0; start < n; start += scan_chunk) {
++                const amrex::Long len = std::min(scan_chunk, n - start);
++                const amrex::Long base = total;
++                total += amrex::Scan::ExclusiveSum(len, in + start, out + start);
++                if (base != 0) {
++                    amrex::Long* AMREX_RESTRICT poffset = out + start;
++                    amrex::ParallelFor(len,
++                        [=] AMREX_GPU_DEVICE (amrex::Long ii) noexcept
++                        {
++                            poffset[ii] += base;
++                        });
++                }
++            }
++            return total;
++        }
++#endif
++        return amrex::Scan::ExclusiveSum(n, in, out);
++    }
++
++
+     // Since the user provides the density distribution
+     // at t_lab=0 and in the lab-frame coordinates,
+     // we need to find the lab-frame position of this
+@@ -899,7 +970,8 @@
+ 
+         // Max number of new particles. All of them are created,
+         // and invalid ones are then discarded
+-        const amrex::Long max_new_particles = amrex::Scan::ExclusiveSum(counts.size(), counts.data(), offset.data());
++        const amrex::Long max_new_particles = ChunkedExclusiveSum(
++            static_cast<amrex::Long>(counts.size()), counts.data(), offset.data());
+ 
+         // Update NextID to include particles created in this function
+         amrex::Long pid;
+@@ -1386,7 +1458,8 @@
+ 
+         // Max number of new particles. All of them are created,
+         // and invalid ones are then discarded
+-        const amrex::Long max_new_particles = amrex::Scan::ExclusiveSum(counts.size(), counts.data(), offset.data());
++        const amrex::Long max_new_particles = ChunkedExclusiveSum(
++            static_cast<amrex::Long>(counts.size()), counts.data(), offset.data());
+ 
+         // Update NextID to include particles created in this function
+         amrex::Long pid;
