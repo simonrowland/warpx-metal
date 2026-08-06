@@ -1,0 +1,1038 @@
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -10,6 +10,7 @@
+ // SPDX-License-Identifier: BSD-2-Clause
+ #include "hipSYCL/runtime/metal/metal_queue.hpp"
+ #include "hipSYCL/runtime/metal/metal_code_object.hpp"
++#include "hipSYCL/runtime/metal/metal_aot_cache_identity.hpp"
+ #include "hipSYCL/runtime/metal/metal_event.hpp"
+ #include "hipSYCL/runtime/metal/metal_jit_guard.hpp"
+ #include "hipSYCL/compiler/llvm-to-backend/metal/LLVMToMetalFactory.hpp"
+@@ -23,6 +24,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdlib>
++#include <cstdio>
+ #include <cstdint>
+ #include <iostream>
+ #include <memory>
+@@ -33,7 +35,349 @@
+ #include <utility>
+ 
+ #undef nil
++
++// ==== STALL-HUNT CAPTURE BEGIN (2026-08-05) ====
++#include <chrono>
++#include <thread>
++#include <vector>
++#include <string>
++#include <atomic>
++#include <mutex>
++#include <sstream>
++#include <deque>
++#include <cstdio>
++
++namespace stall_hunt {
++
++inline int watchdog_timeout_sec() {
++  static int t = []() -> int {
++    const char* env = std::getenv("ACPP_METAL_CMDBUF_WATCHDOG_SEC");
++    if (!env || !env[0]) return 0;
++    char* end = nullptr;
++    long v = std::strtol(env, &end, 10);
++    if (end == env || v <= 0) return 0;
++    if (v > 3600) v = 3600;
++    return static_cast<int>(v);
++  }();
++  return t;
++}
++
++inline const char* status_name(MTL::CommandBufferStatus s) {
++  switch (s) {
++    case MTL::CommandBufferStatusNotEnqueued: return "NotEnqueued";
++    case MTL::CommandBufferStatusEnqueued: return "Enqueued";
++    case MTL::CommandBufferStatusCommitted: return "Committed";
++    case MTL::CommandBufferStatusScheduled: return "Scheduled";
++    case MTL::CommandBufferStatusCompleted: return "Completed";
++    case MTL::CommandBufferStatusError: return "Error";
++  }
++  return "Unknown";
++}
++
++inline std::string err_str(NS::Error* error) {
++  if (!error) return "none";
++  std::ostringstream out;
++  out << "domain=";
++  if (error->domain() && error->domain()->utf8String())
++    out << error->domain()->utf8String();
++  else
++    out << "null";
++  out << " code=" << error->code() << " desc=";
++  if (error->localizedDescription() && error->localizedDescription()->utf8String())
++    out << error->localizedDescription()->utf8String();
++  else
++    out << "null";
++  return out.str();
++}
++
++struct LaunchRec {
++  std::uint64_t seq = 0;
++  std::string label;
++  std::uint64_t wait_value = 0;
++  std::uint64_t signal_value = 0;
++  std::uint64_t shared_signalled_at_submit = 0;
++  std::chrono::steady_clock::time_point t;
++};
++
++struct CBRec {
++  std::uint64_t id = 0;
++  std::string label;
++  MTL::CommandBuffer* cb = nullptr;
++  MTL::SharedEvent* shared_event = nullptr;
++  std::uint64_t encode_wait_value = 0;
++  std::uint64_t encode_signal_value = 0;
++  std::uint64_t shared_signalled_at_submit = 0;
++  std::chrono::steady_clock::time_point created_at;
++  std::atomic<bool> completed{false};
++  std::atomic<bool> timeout_logged{false};
++};
++
++inline std::mutex& g_mu() { static std::mutex m; return m; }
++inline std::vector<std::shared_ptr<CBRec>>& g_cbs() {
++  static std::vector<std::shared_ptr<CBRec>> v; return v;
++}
++inline std::deque<LaunchRec>& g_launches() {
++  static std::deque<LaunchRec> d; return d;
++}
++inline std::atomic<std::uint64_t>& g_next_id() {
++  static std::atomic<std::uint64_t> n{0}; return n;
++}
++inline std::atomic<std::uint64_t>& g_launch_seq() {
++  static std::atomic<std::uint64_t> n{0}; return n;
++}
++inline std::atomic<bool>& g_watchdog_started() {
++  static std::atomic<bool> b{false}; return b;
++}
++inline std::atomic<MTL::SharedEvent*>& g_primary_shared() {
++  static std::atomic<MTL::SharedEvent*> p{nullptr}; return p;
++}
++inline std::atomic<std::uint64_t>& g_last_signal_submitted() {
++  static std::atomic<std::uint64_t> n{0}; return n;
++}
++inline std::atomic<std::uint64_t>& g_last_wait_submitted() {
++  static std::atomic<std::uint64_t> n{0}; return n;
++}
++inline std::atomic<bool>& g_table_dumped() {
++  static std::atomic<bool> b{false}; return b;
++}
++
++inline void record_launch(const std::string& label, std::uint64_t wait_v,
++                          std::uint64_t signal_v, std::uint64_t signalled) {
++  LaunchRec r;
++  r.seq = ++g_launch_seq();
++  r.label = label;
++  r.wait_value = wait_v;
++  r.signal_value = signal_v;
++  r.shared_signalled_at_submit = signalled;
++  r.t = std::chrono::steady_clock::now();
++  std::lock_guard<std::mutex> lock(g_mu());
++  g_launches().push_back(std::move(r));
++  while (g_launches().size() > 20) g_launches().pop_front();
++}
++
++inline void dump_table(const char* reason, MTL::SharedEvent* evt_hint = nullptr) {
++  bool first = !g_table_dumped().exchange(true);
++  auto now = std::chrono::steady_clock::now();
++  std::uint64_t signalled = 0;
++  MTL::SharedEvent* evt = evt_hint ? evt_hint : g_primary_shared().load();
++  if (evt) signalled = evt->signaledValue();
++
++  std::ostringstream out;
++  out << "\n======== STALL_HUNT_CB_TABLE reason=" << reason
++      << " first=" << (first ? 1 : 0) << " =========\n";
++  out << "shared_event_ptr=" << static_cast<const void*>(evt)
++      << " shared_signalled_value=" << signalled
++      << " last_signal_submitted=" << g_last_signal_submitted().load()
++      << " last_wait_submitted=" << g_last_wait_submitted().load()
++      << "\n";
++  out << "--- outstanding / recent CBs ---\n";
++  out << "id\tage_sec\tstatus\terror\tencode_wait\tencode_signal\t"
++         "signalled_at_submit\tcompleted\tlabel\n";
++
++  std::vector<std::shared_ptr<CBRec>> snap;
++  std::deque<LaunchRec> launches;
++  {
++    std::lock_guard<std::mutex> lock(g_mu());
++    snap = g_cbs();
++    launches = g_launches();
++  }
++
++  int outstanding = 0;
++  for (auto& rec : snap) {
++    if (!rec || !rec->cb) continue;
++    auto age = std::chrono::duration_cast<std::chrono::seconds>(
++        now - rec->created_at).count();
++    auto* cb = rec->cb;
++    auto st = cb->status();
++    std::string stn = status_name(st);
++    std::string er = err_str(cb->error());
++    bool done = rec->completed.load();
++    if (!done) outstanding++;
++    if (!done || age < 5) {
++      out << rec->id << "\t" << age << "\t" << stn << "\t\"" << er << "\"\t"
++          << rec->encode_wait_value << "\t" << rec->encode_signal_value << "\t"
++          << rec->shared_signalled_at_submit << "\t" << (done ? 1 : 0) << "\t\""
++          << rec->label << "\"\n";
++    }
++  }
++  out << "outstanding_count=" << outstanding << "\n";
++
++  out << "--- last ~20 launches (most recent last) ---\n";
++  out << "seq\twait\tsignal\tsignalled_at_submit\tlabel\n";
++  for (const auto& L : launches) {
++    out << L.seq << "\t" << L.wait_value << "\t" << L.signal_value << "\t"
++        << L.shared_signalled_at_submit << "\t\"" << L.label << "\"\n";
++  }
++
++  out << "--- classification_hints ---\n";
++  bool row1 = false, row2 = false, row3 = false;
++  for (auto& rec : snap) {
++    if (!rec || !rec->cb || rec->completed.load()) continue;
++    auto st = rec->cb->status();
++    std::uint64_t need = rec->encode_wait_value;
++    if (need > 0 && signalled < need &&
++        (st == MTL::CommandBufferStatusCommitted ||
++         st == MTL::CommandBufferStatusScheduled ||
++         st == MTL::CommandBufferStatusEnqueued)) {
++      row1 = true;
++      out << "HINT_ROW1 id=" << rec->id
++          << " CB waiting encodeWait=" << need
++          << " but signalled=" << signalled << "\n";
++    } else if (st == MTL::CommandBufferStatusCompleted) {
++      row2 = true;
++      out << "HINT_ROW2 id=" << rec->id
++          << " CB Completed but still tracked outstanding\n";
++    } else if ((st == MTL::CommandBufferStatusCommitted ||
++                st == MTL::CommandBufferStatusScheduled) &&
++               (need == 0 || signalled >= need)) {
++      row3 = true;
++      out << "HINT_ROW3 id=" << rec->id
++          << " CB " << status_name(st)
++          << " waits_satisfied (need=" << need
++          << " signalled=" << signalled
++          << ") but GPU has not retired\n";
++    } else {
++      out << "HINT_OTHER id=" << rec->id << " status=" << status_name(st)
++          << " wait=" << need << " signalled=" << signalled << "\n";
++    }
++  }
++  out << "summary_row1_unsatisfied_wait=" << (row1 ? 1 : 0)
++      << " row2_completed_host_blind=" << (row2 ? 1 : 0)
++      << " row3_driver_non_retire=" << (row3 ? 1 : 0) << "\n";
++  out << "======== END STALL_HUNT_CB_TABLE ========\n";
++
++  std::cerr << out.str() << std::flush;
++  if (const char* path = std::getenv("STALL_HUNT_CAPTURE_PATH")) {
++    if (path[0]) {
++      FILE* f = std::fopen(path, "a");
++      if (f) {
++        std::fputs(out.str().c_str(), f);
++        std::fclose(f);
++      }
++    }
++  }
++}
+ 
++inline void watchdog_loop() {
++  for (;;) {
++    std::this_thread::sleep_for(std::chrono::seconds(1));
++    const int timeout = watchdog_timeout_sec();
++    if (timeout <= 0) continue;
++    auto now = std::chrono::steady_clock::now();
++    std::vector<std::shared_ptr<CBRec>> pending;
++    bool fire = false;
++    {
++      std::lock_guard<std::mutex> lock(g_mu());
++      pending.reserve(g_cbs().size());
++      for (auto& rec : g_cbs()) {
++        if (!rec || !rec->cb) continue;
++        if (rec->completed.load()) {
++          if (rec->cb) {
++            rec->cb->release();
++            rec->cb = nullptr;
++          }
++          continue;
++        }
++        auto age = std::chrono::duration_cast<std::chrono::seconds>(
++            now - rec->created_at).count();
++        if (age >= timeout && !rec->timeout_logged.exchange(true)) {
++          fire = true;
++          auto* cb = rec->cb;
++          std::cerr << "B001_METAL_CMDBUF_TIMEOUT"
++                    << " id=" << rec->id
++                    << " age_sec=" << age
++                    << " timeout_sec=" << timeout
++                    << " status=" << status_name(cb->status())
++                    << " error=\"" << err_str(cb->error()) << "\""
++                    << " encode_wait=" << rec->encode_wait_value
++                    << " encode_signal=" << rec->encode_signal_value
++                    << " signalled_now="
++                    << (rec->shared_event ? rec->shared_event->signaledValue() : 0)
++                    << " label=\"" << rec->label << "\""
++                    << std::endl;
++        }
++        pending.push_back(rec);
++      }
++      g_cbs().swap(pending);
++    }
++    if (fire) {
++      dump_table("watchdog_timeout");
++    }
++  }
++}
++
++inline void watch_cb(MTL::CommandBuffer* cb, MTL::SharedEvent* shared,
++                     std::string label, std::uint64_t wait_v, std::uint64_t signal_v) {
++  if (!cb) return;
++  // Always track when env set; also when STALL_HUNT_ALWAYS_TRACK=1
++  if (!std::getenv("ACPP_METAL_CMDBUF_WATCHDOG_SEC") &&
++      !std::getenv("STALL_HUNT_ALWAYS_TRACK")) {
++    return;
++  }
++  if (shared) g_primary_shared().store(shared);
++  if (signal_v) g_last_signal_submitted().store(signal_v);
++  if (wait_v) g_last_wait_submitted().store(wait_v);
++
++  std::uint64_t signalled = shared ? shared->signaledValue() : 0;
++  record_launch(label, wait_v, signal_v, signalled);
++
++  auto rec = std::make_shared<CBRec>();
++  rec->id = ++g_next_id();
++  rec->label = std::move(label);
++  rec->cb = cb->retain();
++  rec->shared_event = shared;
++  rec->encode_wait_value = wait_v;
++  rec->encode_signal_value = signal_v;
++  rec->shared_signalled_at_submit = signalled;
++  rec->created_at = std::chrono::steady_clock::now();
++
++  cb->addCompletedHandler([rec](MTL::CommandBuffer* c) {
++    rec->completed.store(true);
++    if (c && c->status() == MTL::CommandBufferStatusError) {
++      std::cerr << "B001_METAL_CMDBUF_ERROR id=" << rec->id
++                << " error=\"" << err_str(c->error()) << "\""
++                << " label=\"" << rec->label << "\"" << std::endl;
++    }
++  });
++
++  {
++    std::lock_guard<std::mutex> lock(g_mu());
++    g_cbs().push_back(rec);
++  }
++  bool expected = false;
++  if (g_watchdog_started().compare_exchange_strong(expected, true)) {
++    std::thread{watchdog_loop}.detach();
++    std::cerr << "STALL_HUNT_WATCHDOG_STARTED timeout_sec="
++              << watchdog_timeout_sec() << std::endl;
++  }
++}
++
++inline void note_host_wait_spin(MTL::SharedEvent* evt, std::uint64_t want, int spin_sec) {
++  static std::atomic<int> last_dump_at{-1};
++  if (spin_sec < 5) return;
++  bool should = (spin_sec == 5 || spin_sec == 15 || spin_sec == 30 ||
++                 (spin_sec > 30 && spin_sec % 30 == 0));
++  if (!should) return;
++  int prev = last_dump_at.load();
++  if (prev == spin_sec) return;
++  last_dump_at.store(spin_sec);
++  std::uint64_t have = evt ? evt->signaledValue() : 0;
++  std::cerr << "STALL_HUNT_HOST_WAIT_SPIN sec=" << spin_sec
++            << " want=" << want << " have=" << have
++            << " delta=" << (want > have ? want - have : 0) << std::endl;
++  dump_table("host_wait_spin", evt);
++}
++
++} // namespace stall_hunt
++
++// C-linkage trampoline for metal_event.cpp
++extern "C" void stall_hunt_note_host_wait_c(void* evt, unsigned long long want, int spin_sec) {
++  stall_hunt::note_host_wait_spin(reinterpret_cast<MTL::SharedEvent*>(evt),
++                                  static_cast<std::uint64_t>(want), spin_sec);
++}
++// ==== STALL-HUNT CAPTURE END ====
++
++
+ namespace hipsycl {
+ namespace rt {
+ 
+@@ -207,6 +551,34 @@
+   return mutex;
+ }
+ 
++bool get_cached_metal_aot_image_identity(
++    hcf_object_id hcf_id, const std::string& image_name,
++    const common::hcf_container* hcf,
++    const common::hcf_container::node* image_node,
++    metal_aot_image_identity& identity) {
++  static std::mutex identity_mutex;
++  static std::unordered_map<std::string, metal_aot_image_identity>
++      identity_cache;
++  const std::string key = std::to_string(hcf_id) + ":" + image_name;
++
++  std::lock_guard<std::mutex> lock{identity_mutex};
++  auto existing = identity_cache.find(key);
++  if (existing != identity_cache.end()) {
++    identity = existing->second;
++    return true;
++  }
++  if (!hcf || !image_node) {
++    return false;
++  }
++  std::string image_bytes;
++  if (!hcf->get_binary_attachment(image_node, image_bytes)) {
++    return false;
++  }
++  identity = make_metal_aot_image_identity(image_bytes);
++  identity_cache.emplace(key, identity);
++  return true;
++}
++
+ std::string metal_error_message(const char* prefix, NS::Error* error) {
+   std::string error_msg = prefix;
+   if (error && error->localizedDescription()) {
+@@ -216,12 +588,9 @@
+   return error_msg;
+ }
+ 
+-NS::URL* metal_archive_url(const std::string& archive_path) {
+-  NS::String* path_string =
+-      NS::String::string(archive_path.c_str(), NS::UTF8StringEncoding);
+-  return NS::URL::fileURLWithPath(path_string);
+-}
+-
++#if defined(__clang__)
++__attribute__((noinline))
++#endif
+ NS::SharedPtr<MTL::ComputePipelineState>
+ new_pipeline_state_from_archive(MTL::Device* device,
+                                 MTL::Function* function,
+@@ -229,69 +598,137 @@
+                                 const std::string& archive_path,
+                                 std::string_view kernel_name,
+                                 bool allow_archive_population,
+-                                std::string& error_msg) {
+-  if (!archive || archive_path.empty()) {
++                                std::string& error_msg,
++                                bool& compiler_activity) {
++  compiler_activity = false;
++  // Fail closed before any ObjC NSArray construction. arrayWithObject:nil throws
++  // NSInvalidArgumentException and aborts the process; a C++ null check alone was
++  // not enough once this helper was inlined into the JIT launch path with a live
++  // (possibly null) archive handle from the AOT overlay call site.
++  if (archive == nullptr || archive_path.empty() || function == nullptr) {
+     return {};
+   }
+ 
+   NS::SharedPtr<MTL::ComputePipelineDescriptor> descriptor =
+       NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
+   descriptor->setComputeFunction(function);
+-  NS::Array* archive_array =
+-      NS::Array::array(reinterpret_cast<const NS::Object*>(archive));
++  // Re-check immediately before the ObjC boundary (archive is non-owning).
++  if (archive == nullptr) {
++    return {};
++  }
++  // Never call +[NSArray arrayWithObject:] with a nil argument — that raises
++  // NSInvalidArgumentException (uncaught → process abort) rather than returning
++  // nil. Keep this on a noinline helper so the JIT launch path can hard-skip it.
++  const NS::Object* archive_obj =
++      reinterpret_cast<const NS::Object*>(archive);
++  if (archive_obj == nullptr) {
++    error_msg = "metal: binary archive object is null at setBinaryArchives";
++    return {};
++  }
++  NS::Array* archive_array = NS::Array::array(archive_obj);
++  if (archive_array == nullptr) {
++    error_msg = "metal: Failed to build binary-archive NSArray";
++    return {};
++  }
+   descriptor->setBinaryArchives(archive_array);
+ 
++  // NOTE (2026-07-28 aot-on defect): the first "archive-hit" success path in the
++  // previous overlay binary ended with an unconditional arm64 `brk #0x1` after
++  // the archive-hit fprintf (EXC_BREAKPOINT/SIGTRAP at imageOffset of that brk).
++  // The after-lock success path correctly did `str pipeline, [sret]; b epilogue`.
++  // Collapse all hit/miss success returns through one epilogue so we cannot
++  // reintroduce a divergent, trap-ending success path. Additive principle: the
++  // archive path must still fall through to direct JIT PSO creation on failure.
+   NS::Error* error = nullptr;
+   NS::SharedPtr<MTL::ComputePipelineState> pipeline_state =
+       NS::TransferPtr(device->newComputePipelineState(
+           descriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss,
+           nullptr, &error));
++  const char* hit_tag = nullptr;
+   if (pipeline_state && !error) {
+-    HIPSYCL_DEBUG_INFO
+-        << "[Metal] Persistent pipeline archive hit for kernel "
+-        << kernel_name << " archive=" << archive_path << std::endl;
+-    return pipeline_state;
+-  }
+-
+-  if (!allow_archive_population) {
++    hit_tag = "archive-hit";
++  } else if (!allow_archive_population) {
+     error_msg = metal_error_message(
+         "metal: Binary archive pipeline lookup failed", error);
+     return {};
+-  }
++  } else {
++    HIPSYCL_DEBUG_INFO
++        << "[Metal] Persistent pipeline archive miss for kernel "
++        << kernel_name << " archive=" << archive_path << std::endl;
+ 
+-  HIPSYCL_DEBUG_INFO
+-      << "[Metal] Persistent pipeline archive miss for kernel "
+-      << kernel_name << " archive=" << archive_path << std::endl;
++    metal_interprocess_lock archive_lock{archive_path + ".lock"};
++    if (!archive_lock.acquired()) {
++      error_msg = "metal: Could not acquire archive transaction lock: " +
++                  archive_lock.error_message();
++      return {};
++    }
++    NS::SharedPtr<MTL::BinaryArchive> transaction_archive = NS::TransferPtr(
++        open_metal_binary_archive_with_lock_held(device, archive_path));
++    if (!transaction_archive) {
++      error_msg = "metal: Could not open archive transaction";
++      return {};
++    }
++    if (!transaction_archive.get()) {
++      error_msg =
++          "metal: transaction archive became null before setBinaryArchives";
++      return {};
++    }
++    descriptor->setBinaryArchives(NS::Array::array(
++        reinterpret_cast<const NS::Object*>(transaction_archive.get())));
+ 
+-  NS::Error* add_error = nullptr;
+-  if (!archive->addComputePipelineFunctions(descriptor.get(), &add_error)) {
+-    error_msg = metal_error_message(
+-        "metal: Failed to populate binary archive", add_error);
+-    return {};
+-  }
++    // Another process may have populated this kernel while this process waited
++    // for the path lock. Reopen and retry before mutating the archive.
++    error = nullptr;
++    pipeline_state = NS::TransferPtr(device->newComputePipelineState(
++        descriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss,
++        nullptr, &error));
++    if (pipeline_state && !error) {
++      hit_tag = "archive-hit-after-lock";
++    } else {
++      compiler_activity = true;
++      NS::Error* add_error = nullptr;
++      if (!transaction_archive->addComputePipelineFunctions(descriptor.get(),
++                                                             &add_error)) {
++        error_msg = metal_error_message(
++            "metal: Failed to populate binary archive", add_error);
++        return {};
++      }
+ 
+-  NS::Error* serialize_error = nullptr;
+-  if (!archive->serializeToURL(metal_archive_url(archive_path),
+-                               &serialize_error)) {
+-    HIPSYCL_DEBUG_WARNING
+-        << metal_error_message(
+-               "metal: Failed to serialize binary archive", serialize_error)
+-        << " path=" << archive_path << std::endl;
+-  }
++      result serialize_result = serialize_metal_binary_archive_atomically(
++          transaction_archive.get(), archive_path, true);
++      if (!serialize_result.is_success()) {
++        std::fprintf(stderr,
++                     "ACPP_METAL_AOT archive-error=serialize path=%s\n",
++                     archive_path.c_str());
++        error_msg = serialize_result.what();
++      }
+ 
+-  error = nullptr;
+-  pipeline_state = NS::TransferPtr(device->newComputePipelineState(
+-      descriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss,
+-      nullptr, &error));
+-  if (pipeline_state && !error) {
+-    HIPSYCL_DEBUG_INFO
+-        << "[Metal] Populated persistent pipeline archive for kernel "
+-        << kernel_name << " archive=" << archive_path << std::endl;
+-    return pipeline_state;
++      error = nullptr;
++      pipeline_state = NS::TransferPtr(device->newComputePipelineState(
++          descriptor.get(), MTL::PipelineOptionFailOnBinaryArchiveMiss,
++          nullptr, &error));
++      if (pipeline_state && !error) {
++        hit_tag = "archive-populated";
++        HIPSYCL_DEBUG_INFO
++            << "[Metal] Populated persistent pipeline archive for kernel "
++            << kernel_name << " archive=" << archive_path << std::endl;
++      } else {
++        error_msg = metal_error_message(
++            "metal: Binary archive pipeline retry failed", error);
++        return {};
++      }
++    }
+   }
+ 
+-  error_msg =
+-      metal_error_message("metal: Binary archive pipeline retry failed", error);
++  if (hit_tag && pipeline_state) {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT %s kernel=%.*s path=%s\n", hit_tag,
++                 static_cast<int>(kernel_name.size()), kernel_name.data(),
++                 archive_path.c_str());
++    // Force a single, shared success return (see note above about brk trap).
++    NS::SharedPtr<MTL::ComputePipelineState> out = pipeline_state;
++    return out;
++  }
+   return {};
+ }
+ 
+@@ -315,8 +752,19 @@
+   HIPSYCL_DEBUG_INFO << "[Metal] Compute pipeline cache miss for kernel "
+                      << kernel_name << std::endl;
+ 
++  // Path2 has no hard compiler-RSS kill on ordinary JIT PSO creation. The AOT
++  // overlay introduced a default 1024 MB MTLCompilerService limit that aborts
++  // even tiny decks during first pipeline compile when offline AOT is off.
++  // Keep the RSS monitor only when an AOT feature is explicitly enabled.
++  const char* offline_aot =
++      std::getenv("ACPP_METAL_ENABLE_OFFLINE_METALLIB");
++  const char* binary_archive =
++      std::getenv("ACPP_METAL_ENABLE_BINARY_ARCHIVE");
++  const bool aot_rss_guard =
++      (offline_aot && std::string{offline_aot} == "1") ||
++      (binary_archive && std::string{binary_archive} == "1");
+   metal_jit_guard::scoped_compile jit_compile{
+-      "Metal compute pipeline compilation"};
++      "Metal compute pipeline compilation", 0, aot_rss_guard};
+   result guard_result =
+       jit_compile.check("before Metal compute pipeline compilation");
+   if (!guard_result.is_success()) {
+@@ -324,17 +772,25 @@
+   }
+ 
+   std::string archive_error;
+-  pipeline_state = new_pipeline_state_from_archive(
+-      device, function, archive, archive_path, kernel_name,
+-      true, archive_error);
+-  guard_result = jit_compile.check("after Metal binary archive pipeline attempt");
+-  if (!guard_result.is_success()) {
+-    return guard_result;
+-  }
+-  if (!pipeline_state && archive && !archive_error.empty()) {
+-    HIPSYCL_DEBUG_WARNING << archive_error << "; falling back to direct "
+-                          << "pipeline compilation for kernel "
+-                          << kernel_name << std::endl;
++  bool archive_compiler_activity = false;
++  // Outer guard: never enter the archive helper (and never touch NSArray)
++  // unless both the archive object and path are present. Path2 SSCP launch
++  // always passes nullptr here; AOT must keep that as the default JIT shape.
++  if (archive != nullptr && !archive_path.empty() && function != nullptr) {
++    pipeline_state = new_pipeline_state_from_archive(
++        device, function, archive, archive_path, kernel_name,
++        true, archive_error, archive_compiler_activity);
++    guard_result = jit_compile.check(
++        "after Metal binary archive pipeline attempt",
++        archive_compiler_activity);
++    if (!guard_result.is_success()) {
++      return guard_result;
++    }
++    if (!pipeline_state && !archive_error.empty()) {
++      HIPSYCL_DEBUG_WARNING << archive_error << "; falling back to direct "
++                            << "pipeline compilation for kernel "
++                            << kernel_name << std::endl;
++    }
+   }
+ 
+   if (!pipeline_state) {
+@@ -342,7 +798,7 @@
+     pipeline_state = NS::TransferPtr(
+         device->newComputePipelineState(function, &error));
+     guard_result =
+-        jit_compile.check("after Metal direct pipeline compilation");
++        jit_compile.check("after Metal direct pipeline compilation", true);
+     if (!guard_result.is_success()) {
+       return guard_result;
+     }
+@@ -553,6 +1009,12 @@
+   if (!make_pointer_translation_table(allocator, pointer_translation_table, pointer_translation_error)) {
+     encoder->endEncoding();
+     return make_error(__acpp_here(), error_info{pointer_translation_error});
++  }
++  if (std::getenv("ACPP_PTRTRANS_LOG_COUNTS")) {
++    std::cerr << "ACPP_PTRTRANS_LAUNCH registered_buffers="
++              << pointer_translation_table.count
++              << " capacity=" << pointer_translation_table.capacity
++              << " kernel=" << kernel_name << "\n";
+   }
+   auto pointer_translation_buffer = NS::TransferPtr(
+       device->newBuffer(&pointer_translation_table,
+@@ -640,6 +1102,9 @@
+                       << "' executed successfully" << std::endl;
+   });
+ 
++  stall_hunt::watch_cb(command_buffer, /*shared*/ nullptr,
++    std::string("kernel ") + std::string(kernel_name),
++    /*wait*/ 0, /*signal*/ 0);
+   command_buffer->commit();
+ 
+   return make_success();
+@@ -783,8 +1248,12 @@
+ 
+   auto val = ++_event_counter;
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++  std::uint64_t pending_wait = _pending_gpu_event;
+   auto* cmd_buf = new_command_buffer();
+   cmd_buf->encodeSignalEvent(_shared_event, val);
++  stall_hunt::watch_cb(cmd_buf, _shared_event,
++    "insert_event signal=" + std::to_string(val),
++    pending_wait, val);
+   cmd_buf->commit();
+   remember_submitted_command_buffer(cmd_buf);
+ 
+@@ -1104,8 +1573,12 @@
+   inorder_queue_event<metal_event_handle>* metal_evt = cast<inorder_queue_event<metal_event_handle>>(evt.get());
+   auto handle = metal_evt->request_backend_event();
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
++  std::uint64_t pending_wait = _pending_gpu_event;
+   auto* cmd_buf = new_command_buffer();
+   cmd_buf->encodeWait(handle.event, handle.value);
++  stall_hunt::watch_cb(cmd_buf, handle.event,
++    "queue_wait value=" + std::to_string(handle.value),
++    handle.value ? handle.value : pending_wait, 0);
+   cmd_buf->commit();
+   remember_submitted_command_buffer(cmd_buf);
+ 
+@@ -1209,20 +1682,104 @@
+ 
+   _config.set_build_option(kernel_build_option::metal_max_args_for_flat_mode, metal_max_args_for_flat_mode);
+ 
+-  // Generate configuration IDs for caching
+-  auto binary_configuration_id = adaptivity_engine.finalize_binary_configuration(_config);
++  const std::string requested_kernel_name{kernel_name};
++  std::vector<std::string> selected_kernel_names;
++  const std::string selected_image_name =
++      adaptivity_engine.select_image_and_kernels(&selected_kernel_names);
++  if (std::find(selected_kernel_names.begin(), selected_kernel_names.end(),
++                requested_kernel_name) != selected_kernel_names.end()) {
++    selected_kernel_names = {requested_kernel_name};
++  }
++
++  const common::hcf_container* selected_hcf =
++      hcf_cache::get().get_hcf(hcf_object);
++  const common::hcf_container::node* images_node =
++      selected_hcf && selected_hcf->root_node()
++          ? selected_hcf->root_node()->get_subnode("images")
++          : nullptr;
++  const common::hcf_container::node* selected_image_node =
++      images_node ? images_node->get_subnode(selected_image_name) : nullptr;
++  metal_aot_image_identity aot_identity = {};
++  if (!selected_hcf || !selected_image_node ||
++      !get_cached_metal_aot_image_identity(
++          hcf_object, selected_image_name, selected_hcf,
++          selected_image_node, aot_identity)) {
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_queue: Could not digest selected HCF image " +
++                   selected_image_name});
++  }
++  // Generate configuration IDs for caching.
++  auto binary_configuration_id =
++      adaptivity_engine.finalize_binary_configuration(_config);
+   kernel_configuration::extend_hash(
+     binary_configuration_id,
+     kernel_base_config_parameter::runtime_device,
+     static_cast<int>(_device_id.get_id()));
+   kernel_configuration::extend_hash(
++      binary_configuration_id,
++      kernel_base_config_parameter::runtime_device,
++      requested_kernel_name);
++  kernel_configuration::extend_hash(
++      binary_configuration_id,
++      kernel_base_config_parameter::runtime_device,
++      aot_identity.content_digest_low);
++  kernel_configuration::extend_hash(
++      binary_configuration_id,
++      kernel_base_config_parameter::runtime_device,
++      aot_identity.content_digest_high);
++  kernel_configuration::extend_hash(
++      binary_configuration_id,
++      kernel_base_config_parameter::runtime_device,
++      aot_identity.image_size);
++  kernel_configuration::extend_hash(
++      binary_configuration_id,
++      kernel_base_config_parameter::runtime_device,
++      make_metal_aot_cache_slot_digest(requested_kernel_name,
++                                       aot_identity));
++
++  // The persistent JIT cache is also the AOT hand-off: on a miss, AdaptiveCpp
++  // lowers generic IR to MSL and the offline Metal tools turn that MSL into
++  // metallib bytes. On subsequent process starts, the cache returns those
++  // bytes directly to newLibrary(data), avoiding newLibrary(source) and its
++  // MTLCompilerService footprint. Keep a distinct schema discriminator so an
++  // older cache entry containing MSL text can never be interpreted as a
++  // metallib.
++  const char* offline_aot_env =
++      std::getenv("ACPP_METAL_ENABLE_OFFLINE_METALLIB");
++  const bool prefer_offline_metallib =
++      offline_aot_env && std::string{offline_aot_env} == "1";
++  std::string offline_cache_identity;
++  result fingerprint_result = make_success();
++  if (prefer_offline_metallib) {
++    fingerprint_result = get_metal_offline_cache_fingerprint(
++        _device, offline_cache_identity);
++  }
++  const bool enable_offline_metallib =
++      prefer_offline_metallib && fingerprint_result.is_success();
++  if (prefer_offline_metallib && !enable_offline_metallib) {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT source-fallback=toolchain-absent reason=%s\n",
++                 fingerprint_result.what().c_str());
++  }
++  if (enable_offline_metallib) {
++    kernel_configuration::extend_hash(
++        binary_configuration_id,
++        kernel_base_config_parameter::runtime_device,
++        offline_cache_identity);
++    const std::uint64_t registry_id =
++        _device ? static_cast<std::uint64_t>(_device->registryID()) : 0;
++    kernel_configuration::extend_hash(
++        binary_configuration_id,
++        kernel_base_config_parameter::runtime_device,
++        registry_id);
++  }
++  kernel_configuration::extend_hash(
+     binary_configuration_id,
+     kernel_base_config_parameter::runtime_device,
+-    0x4d534c32);
++    enable_offline_metallib ? 0x4d4c4942 : 0x4d534c32);
+   auto code_object_configuration_id = binary_configuration_id;
+ 
+-  const std::string requested_kernel_name{kernel_name};
+-
+   // Helper to get image name and kernel names from adaptivity engine.
+   // The Metal compiler service is sensitive to very large MSL translation
+   // units. Compile only the submitted kernel when the selected image contains
+@@ -1230,19 +1787,11 @@
+   // a whole-image MSL compile for every first launch.
+   auto get_image_and_kernel_names =
+     [&](std::vector<std::string>& contained_kernels) -> std::string {
+-    std::string selected_image =
+-        adaptivity_engine.select_image_and_kernels(&contained_kernels);
+-    if (std::find(contained_kernels.begin(), contained_kernels.end(),
+-                  requested_kernel_name) != contained_kernels.end()) {
+-      contained_kernels = {requested_kernel_name};
+-    }
+-    return selected_image;
++    contained_kernels = selected_kernel_names;
++    return selected_image_name;
+   };
+ 
+-  // JIT compiler function - invoked on cache miss to lower LLVM IR to MSL.
+-  // Metal library compilation stays in-process via MTLDevice::newLibrary so
+-  // runtime JIT does not depend on xcrun metal/metallib.
+-  auto jit_compiler = [&](std::string& compiled_image) -> bool {
++  auto translate_to_msl = [&](std::string& metal_source) -> bool {
+     std::vector<std::string> kernel_names;
+     std::string selected_image_name = get_image_and_kernel_names(kernel_names);
+ 
+@@ -1254,7 +1803,6 @@
+ 
+     bool enable_dead_arg_elimination = kernel_names.size() == 1;
+ 
+-    std::string metal_source;
+     rt::result err = glue::jit::compile_and_store_stats(
+       translator.get(), hcf_object, selected_image_name, _config,
+       binary_configuration_id, _reflection_map, metal_source,
+@@ -1264,26 +1812,85 @@
+       register_error(err);
+       return false;
+     }
++    return true;
++  };
+ 
+-    compiled_image = std::move(metal_source);
++  std::string source_fallback_payload;
++  bool offline_rss_limit_exceeded = false;
++  std::unique_ptr<metal_interprocess_lock> cache_lock;
++
++  // JIT compiler function - invoked on cache miss to lower LLVM IR to MSL.
++  auto jit_compiler = [&](std::string& compiled_image) -> bool {
++    std::string metal_source;
++    if (!translate_to_msl(metal_source)) {
++      return false;
++    }
++
++    if (enable_offline_metallib) {
++      metal_offline_compile_result offline_result =
++          compile_metal_source_to_metallib(
++              metal_source, binary_configuration_id, compiled_image,
++              cache_lock ? cache_lock->native_handle() : -1);
++      if (!offline_result.status.is_success()) {
++        if (offline_result.failure ==
++            metal_offline_compile_failure::rss_limit_exceeded) {
++          offline_rss_limit_exceeded = true;
++          register_error(offline_result.status);
++          return false;
++        }
++
++        const char* reason = "compile-rejected";
++        if (offline_result.failure ==
++            metal_offline_compile_failure::toolchain_absent) {
++          reason = "toolchain-absent";
++        } else if (offline_result.failure ==
++                   metal_offline_compile_failure::io_error) {
++          reason = "io-error";
++        }
++        std::fprintf(stderr,
++                     "ACPP_METAL_AOT source-fallback=%s reason=%s\n",
++                     reason, offline_result.status.what().c_str());
++        source_fallback_payload = std::move(metal_source);
++        return false;
++      }
++    } else {
++      compiled_image = std::move(metal_source);
++    }
+     return true;
+   };
+ 
+-  // Code object constructor - creates executable object from generated MSL.
+-  auto code_object_constructor = [&](const std::string& metal_source) -> code_object* {
++  bool cached_metallib_rejected = false;
++
++  // Code object constructor - creates executable object from generated MSL or
++  // from metallib bytes returned by the persistent cache.
++  auto code_object_constructor = [&](const std::string& metal_input) -> code_object* {
+     std::vector<std::string> kernel_names;
+     get_image_and_kernel_names(kernel_names);
+ 
+     std::string target_arch = "metal";
+ 
+     metal_sscp_executable_object* exec_obj = new metal_sscp_executable_object{
+-      metal_source, target_arch, hcf_object, kernel_names, _device, _config,
+-      metal_library_input_kind::source};
++      metal_input, target_arch, hcf_object, kernel_names, _device, _config,
++      enable_offline_metallib ? metal_library_input_kind::metallib
++                               : metal_library_input_kind::source};
+ 
+     result r = exec_obj->get_build_result();
+ 
+     if (!r.is_success()) {
+-      register_error(r);
++      if (enable_offline_metallib) {
++        cached_metallib_rejected = true;
++        const std::string invalid_cache_file =
++            kernel_cache::get_persistent_cache_file(binary_configuration_id);
++        if (std::remove(invalid_cache_file.c_str()) == 0) {
++          HIPSYCL_DEBUG_WARNING
++              << "[Metal] Removed rejected cached metallib "
++              << invalid_cache_file << std::endl;
++        }
++        std::fprintf(stderr,
++                     "ACPP_METAL_AOT source-fallback=cache-load-rejected\n");
++      } else {
++        register_error(r);
++      }
+       delete exec_obj;
+       return nullptr;
+     }
+@@ -1298,10 +1905,64 @@
+     return exec_obj;
+   };
+ 
++  if (enable_offline_metallib) {
++    const std::string cache_file =
++        kernel_cache::get_persistent_cache_file(binary_configuration_id);
++    cache_lock = std::make_unique<metal_interprocess_lock>(
++        cache_file + ".lock");
++    if (!cache_lock->acquired()) {
++      return make_error(
++          __acpp_here(),
++          error_info{"metal_queue: " + cache_lock->error_message()});
++    }
++  }
++
+   const code_object* obj = _kernel_cache->get_or_construct_jit_code_object(
+     code_object_configuration_id, binary_configuration_id,
+     jit_compiler, code_object_constructor);
+ 
++  if (!obj && enable_offline_metallib && !offline_rss_limit_exceeded) {
++    if (source_fallback_payload.empty() && cached_metallib_rejected &&
++        !translate_to_msl(source_fallback_payload)) {
++      return make_error(
++          __acpp_here(),
++          error_info{"metal_queue: Source fallback translation failed"});
++    }
++    if (!source_fallback_payload.empty()) {
++      auto fallback_code_object_id = code_object_configuration_id;
++      kernel_configuration::extend_hash(
++          fallback_code_object_id,
++          kernel_base_config_parameter::runtime_device,
++          static_cast<std::uint64_t>(0x53464231));
++      obj = _kernel_cache->get_or_construct_code_object(
++          fallback_code_object_id, [&]() -> code_object* {
++            metal_sscp_executable_object* fallback_obj =
++                new metal_sscp_executable_object{
++                    source_fallback_payload, "metal", hcf_object,
++                    selected_kernel_names, _device, _config,
++                    metal_library_input_kind::source};
++            result build_result = fallback_obj->get_build_result();
++            if (!build_result.is_success()) {
++              register_error(build_result);
++              delete fallback_obj;
++              return nullptr;
++            }
++            const bool has_dead_arg_elimination =
++                selected_kernel_names.size() == 1;
++            glue::jit::load_jit_output_metadata(
++                *fallback_obj, has_dead_arg_elimination,
++                binary_configuration_id);
++            std::fprintf(stderr,
++                         "ACPP_METAL_AOT source-fallback=success\n");
++            return fallback_obj;
++          });
++    }
++  }
++
++  // The per-key lock protects persistent lookup/compile/store only. Release it
++  // before metadata work, PSO creation, command-buffer submission, or waits.
++  cache_lock.reset();
++
+   if (!obj) {
+     return make_error(__acpp_here(),
+       error_info{"metal_queue: Code object construction failed"});
+@@ -1329,9 +1990,24 @@
+       error_info{"metal_queue: Metal library is null"});
+   }
+ 
++// Path2 keeps SSCP launch on a null BinaryArchive forever (archive helpers are
++  // opt-in). The AOT overlay previously always forwarded get_binary_archive(),
++  // which made the archive PSO path live on the ordinary JIT launch and exposed
++  // NSArray arrayWithObject:nil when the archive handle was absent. Keep the
++  // offline/archive path additive: wire it only when explicitly enabled.
++  const char* enable_binary_archive =
++      std::getenv("ACPP_METAL_ENABLE_BINARY_ARCHIVE");
++  const bool use_binary_archive =
++      enable_binary_archive && std::string{enable_binary_archive} == "1";
++  MTL::BinaryArchive* launch_archive =
++      use_binary_archive ? metal_obj->get_binary_archive() : nullptr;
++  const std::string empty_archive_path;
++  const std::string& launch_archive_path =
++      use_binary_archive ? metal_obj->get_binary_archive_path()
++                         : empty_archive_path;
+   auto* command_buffer = new_command_buffer();
+   auto submission = launch_kernel_from_library(
+-    library, _device, nullptr, std::string{}, command_buffer, _allocator,
++    library, _device, launch_archive, launch_archive_path, command_buffer, _allocator,
+     kernel_name,
+     num_groups, group_size, local_mem_size,
+     _arg_mapper.get_mapped_args(),

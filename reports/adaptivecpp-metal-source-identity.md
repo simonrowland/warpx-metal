@@ -17,8 +17,8 @@ runtime contracts. It is not merely an identity marker.
 
 ## Evidence and limits
 
-The five AdaptiveCpp patches apply in lexical order to pinned revision
-`3733a5655103a75c09d81e2ba6b519d15896551f`, and the touched applied paths pass
+The AdaptiveCpp patches apply in lexical order to pinned revision
+`4fe52accc3dca8640f2fbcc80dfd260a51fc2fd8`, and the touched applied paths pass
 `git diff --check`. The stack-level M4 Pro results in
 [`VALIDATION.md`](../VALIDATION.md) were reported by upstream collaborator
 `lulzx`; no patch-specific raw receipt is retained here. This remediation did

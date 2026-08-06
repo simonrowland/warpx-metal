@@ -1,0 +1,108 @@
+Subject: [PATCH] Common: durable atomic write for cache files
+
+Offline metallib and binary-archive caches write large artifacts. The measured
+tree hardens filesystem atomic writes with process-id temp names, fsync of the
+temp file, and fsync of the parent directory before rename, so a crash mid-write
+cannot leave a truncated cache entry that later fails closed as a false hit.
+
+Source reproduction only: not compile-verified here.
+
+diff --git a/src/common/filesystem.cpp b/src/common/filesystem.cpp
+--- a/src/common/filesystem.cpp
++++ b/src/common/filesystem.cpp
+@@ -23,6 +23,7 @@
+ 
+ #ifndef _WIN32
+ #include <dlfcn.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include <pwd.h>
+@@ -177,7 +178,15 @@
+ bool atomic_write(const std::string &filename, const std::string &data) {
+   fs::path p{filename};
+ 
+-  std::string temp_file = std::to_string(random_number<std::size_t>())+".tmp";
++  static std::atomic<std::uint64_t> temp_counter{0};
++#ifdef _WIN32
++  const auto process_id = static_cast<std::uint64_t>(GetCurrentProcessId());
++#else
++  const auto process_id = static_cast<std::uint64_t>(::getpid());
++#endif
++  const std::string temp_file = p.filename().string() + ".tmp." +
++      std::to_string(process_id) + "." +
++      std::to_string(temp_counter.fetch_add(1));
+   fs::path tmp_path = p.parent_path() / temp_file;
+ 
+   std::ofstream ostr{tmp_path, std::ios::binary|std::ios::out|std::ios::trunc};
+@@ -185,10 +194,62 @@
+   if(!ostr.is_open())
+     return false;
+   
+-  ostr.write(data.data(), data.size());
++  ostr.write(data.data(), static_cast<std::streamsize>(data.size()));
++  ostr.flush();
++  if (!ostr.good()) {
++    ostr.close();
++    std::error_code remove_error;
++    fs::remove(tmp_path, remove_error);
++    return false;
++  }
+   ostr.close();
+-
+-  fs::rename(tmp_path, p);
++  if (ostr.fail()) {
++    std::error_code remove_error;
++    fs::remove(tmp_path, remove_error);
++    return false;
++  }
++
++#ifndef _WIN32
++  const int temp_fd = ::open(tmp_path.c_str(), O_RDONLY | O_CLOEXEC);
++  const bool temp_sync_ok = temp_fd >= 0 && ::fsync(temp_fd) == 0;
++  const bool temp_close_ok = temp_fd >= 0 && ::close(temp_fd) == 0;
++  if (!temp_sync_ok || !temp_close_ok) {
++    std::error_code remove_error;
++    fs::remove(tmp_path, remove_error);
++    return false;
++  }
++
++  const fs::path parent_path = p.parent_path().empty() ? fs::path{"."}
++                                                        : p.parent_path();
++  const int parent_fd = ::open(parent_path.c_str(), O_RDONLY | O_CLOEXEC);
++  if (parent_fd < 0 || ::fsync(parent_fd) != 0) {
++    if (parent_fd >= 0) {
++      ::close(parent_fd);
++    }
++    std::error_code remove_error;
++    fs::remove(tmp_path, remove_error);
++    return false;
++  }
++#endif
++
++  std::error_code rename_error;
++  fs::rename(tmp_path, p, rename_error);
++  if (rename_error) {
++#ifndef _WIN32
++    ::close(parent_fd);
++#endif
++    std::error_code remove_error;
++    fs::remove(tmp_path, remove_error);
++    return false;
++  }
++
++#ifndef _WIN32
++  const bool directory_sync_ok = ::fsync(parent_fd) == 0;
++  const bool directory_close_ok = ::close(parent_fd) == 0;
++  if (!directory_sync_ok || !directory_close_ok) {
++    return false;
++  }
++#endif
+ 
+   return true;
+ }
+@@ -283,4 +344,3 @@
+ }
+ }
+ }
+-

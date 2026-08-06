@@ -12,7 +12,7 @@
 >
 > - `patches/warpx/` — `0001`, `0003`, `0004`, `0005`, `0006`, `0007`
 > - `patches/amrex-post/` — `0004`, `0005`, `0006`
-> - `patches/adaptivecpp/` — `0008`, `0018`, `0019`, `0020`, `0022`
+> - `patches/adaptivecpp/` — `0008`, `0018`–`0020`, `0022`, `0023`–`0031`
 > - `patches/amrex/` — three replacement source files, not patches
 >
 > The numbering gaps are deliberate: retired patches keep their numbers rather
@@ -103,7 +103,7 @@ Run this on the build host. `PREFIX` must not already exist.
 ```bash
 export PREFIX=/Applications/warpx-metal-prod-20260728
 export FORK_URL=https://github.com/simonrowland/warpx-metal.git
-export EXPECTED_PATCH_PAYLOAD_SHA256=f24a82d511f1fa73b8b75fa2ebce46e8a227f4ceee0c827bf5c8181245e04ce6
+export EXPECTED_PATCH_PAYLOAD_SHA256=565dccde7fbe8c4620cf6d16bda06205aa9f9f236f5193c4cd84b586e37ac776
 
 test ! -e "$PREFIX"
 git ls-remote --exit-code "$FORK_URL" HEAD
@@ -217,7 +217,7 @@ fetch pinned upstream trees and apply the fork's patch payload:
 
 | tree | upstream pin | package action |
 |---|---|---|
-| AdaptiveCpp | `3733a5655103a75c09d81e2ba6b519d15896551f` | clone/reset, then apply every `patches/adaptivecpp/*.patch` |
+| AdaptiveCpp | `4fe52accc3dca8640f2fbcc80dfd260a51fc2fd8` | clone/reset, then apply every `patches/adaptivecpp/*.patch` |
 | AMReX | `fa795322b44fff24fef3a795c3b00d24e015ee42` | clone/reset; apply `patches/amrex/*.patch`; copy the three AMReX replacement files; make the scripted source edits; then apply `patches/amrex-post/*.patch` |
 | WarpX | `f7db079f9a8ca96d179e02709a29fe6c027ed8ed` | clone/reset, then apply every `patches/warpx/*.patch` |
 
@@ -893,6 +893,22 @@ These are operating requirements, not tuning suggestions.
   grace is a hang, not compilation. Preserve the log and process sample. Treat
   the run as hung, and reboot the affected host if the GPU remains wedged.
 - Keep `MTL_SHADER_VALIDATION` unset for accepted runs.
+- **The offline-metallib and binary-archive paths are opt-in at runtime and
+  default off.** A build that never sets them carries the code but never
+  executes it, and will not reproduce the timings these patches were measured
+  against. Set `ACPP_METAL_ENABLE_OFFLINE_METALLIB=1` to publish and load
+  precompiled `.metallib` output, and `ACPP_METAL_ENABLE_BINARY_ARCHIVE=1` to
+  enable the pipeline binary archive. Both write into `ACPP_APPDB_DIR`, so give
+  each distinct binary its own; a stale directory shared with a different build
+  yields misses rather than errors, which is easy to mistake for slow hardware.
+- **Bound the stall detection explicitly.** `ACPP_METAL_COMMAND_TIMEOUT_MS`
+  (default `120000`) sets how long a queue waits before latching a failure and
+  aborting; `ACPP_METAL_CMDBUF_WATCHDOG_SEC` enables command-buffer stall
+  diagnostics. `30000` and `30` are reasonable for long runs and cut the time
+  spent inside a stall roughly fourfold without affecting healthy runs. Note
+  the abort is fail-closed by design: the run ends with a named error rather
+  than hanging, but the GPU itself does not recover and the host still needs a
+  reboot before the next attempt.
 - Keep `WARPX_MAX_MEM_FRACTION=0.99` on GPU launches unless a later,
   separately verified package removes that requirement.
 - The W3 soak establishes a workaround envelope, not unlimited production

@@ -1,0 +1,1075 @@
+Subject: [PATCH] Metal: offline metallib compile and binary-archive code objects
+
+The published metal_code_object path only covers MSL source JIT. Every
+measurement run that sets ACPP_METAL_ENABLE_OFFLINE_METALLIB and
+ACPP_METAL_ENABLE_BINARY_ARCHIVE depends on the measured tree's offline path:
+spawn metal+metallib under the JIT guard, write durable cache entries, optional
+MTL::BinaryArchive transaction save/load, and feature-flag gating.
+
+Extend metal_code_object.hpp/cpp and the kernel_cache offline flag plumbing,
+and add the offline-compile unit test, to match the measured tree.
+
+Note: the offline paths are inert unless the runtime env vars are set (see
+INSTALL recommendation). Source reproduction only: not compile-verified here.
+
+diff --git a/include/hipSYCL/runtime/metal/metal_code_object.hpp b/include/hipSYCL/runtime/metal/metal_code_object.hpp
+--- a/include/hipSYCL/runtime/metal/metal_code_object.hpp
++++ b/include/hipSYCL/runtime/metal/metal_code_object.hpp
+@@ -35,10 +35,50 @@
+   metallib
+ };
+ 
+-result compile_metal_source_to_metallib(
++enum class metal_offline_compile_failure {
++  none,
++  toolchain_absent,
++  compile_rejected,
++  io_error,
++  rss_limit_exceeded
++};
++
++struct metal_offline_compile_result {
++  result status;
++  metal_offline_compile_failure failure;
++};
++
++class metal_interprocess_lock {
++public:
++  explicit metal_interprocess_lock(const std::string& path);
++  ~metal_interprocess_lock();
++
++  metal_interprocess_lock(const metal_interprocess_lock&) = delete;
++  metal_interprocess_lock& operator=(const metal_interprocess_lock&) = delete;
++
++  bool acquired() const;
++  int native_handle() const;
++  const std::string& error_message() const;
++
++private:
++  int _fd = -1;
++  std::string _error_message;
++};
++
++result get_metal_offline_cache_fingerprint(MTL::Device* device,
++                                           std::string& fingerprint);
++
++metal_offline_compile_result compile_metal_source_to_metallib(
+     const std::string &metal_source,
+     kernel_cache::code_object_id id_of_binary,
+-    std::string &metallib);
++    std::string &metallib, int cache_lock_fd = -1);
++
++result serialize_metal_binary_archive_atomically(
++    MTL::BinaryArchive* archive, const std::string& archive_path,
++    bool caller_holds_lock = false);
++
++MTL::BinaryArchive* open_metal_binary_archive_with_lock_held(
++    MTL::Device* device, const std::string& path);
+ 
+ class metal_executable_object : public code_object {
+ public:
+diff --git a/src/runtime/metal/metal_code_object.cpp b/src/runtime/metal/metal_code_object.cpp
+--- a/src/runtime/metal/metal_code_object.cpp
++++ b/src/runtime/metal/metal_code_object.cpp
+@@ -10,24 +10,55 @@
+ // SPDX-License-Identifier: BSD-2-Clause
+ #include "hipSYCL/runtime/metal/metal_code_object.hpp"
+ #include "hipSYCL/runtime/metal/metal_jit_guard.hpp"
++#include "hipSYCL/runtime/metal/metal_process_utils.hpp"
+ 
+ #include <Metal/Metal.hpp>
+ #include <dispatch/dispatch.h>
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <spawn.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
+ #include <fstream>
++#include <iomanip>
++#include <memory>
++#include <mutex>
+ #include <sstream>
++#include <thread>
++#include <vector>
+ 
+ #undef nil
+ 
+ #include "hipSYCL/common/debug.hpp"
+ #include "hipSYCL/common/filesystem.hpp"
++#include "hipSYCL/common/stable_running_hash.hpp"
++
++extern char** environ;
+ 
+ namespace hipsycl {
+ namespace rt {
+ 
+ namespace {
++
++bool metal_binary_archive_enabled() {
++  const char* value = std::getenv("ACPP_METAL_ENABLE_BINARY_ARCHIVE");
++  return value && std::string{value} == "1";
++}
++
++bool metal_aot_feature_enabled() {
++  const char* offline = std::getenv("ACPP_METAL_ENABLE_OFFLINE_METALLIB");
++  return metal_binary_archive_enabled() ||
++         (offline && std::string{offline} == "1");
++}
+ 
+ std::string metal_error_message(const std::string& prefix, NS::Error* error) {
+   std::string msg = prefix;
+@@ -38,18 +69,6 @@
+   return msg;
+ }
+ 
+-std::string shell_quote(const std::string& value) {
+-  std::string result = "'";
+-  for (char c : value) {
+-    if (c == '\'')
+-      result += "'\\''";
+-    else
+-      result += c;
+-  }
+-  result += "'";
+-  return result;
+-}
+-
+ bool read_binary_file(const std::string& path, std::string& out) {
+   std::ifstream file{path, std::ios::in | std::ios::binary | std::ios::ate};
+   if (!file.is_open())
+@@ -70,34 +89,333 @@
+   std::remove(path.c_str());
+ }
+ 
+-result run_metal_toolchain(const std::string& source_path,
+-                           const std::string& air_path,
+-                           const std::string& metallib_path) {
+-  std::string command =
+-      "xcrun -sdk macosx metal -std=metal4.0 -Osize -c " +
+-      shell_quote(source_path) + " -o " + shell_quote(air_path) +
+-      " && xcrun -sdk macosx metallib " + shell_quote(air_path) +
+-      " -o " + shell_quote(metallib_path);
+-
+-  int status = std::system(command.c_str());
+-  if (status != 0) {
++metal_offline_compile_result offline_failure(
++    metal_offline_compile_failure failure, const std::string& message) {
++  return {make_error(__acpp_here(), error_info{message}), failure};
++}
++
++// Allow a non-default metal/xcrun so hosts without the Metal cryptex can still build.
++// ACPP_METAL_XCRUN=/path/to/wrapper  OR default /usr/bin/xcrun
++static std::string metal_xcrun_path() {
++  if (const char* p = std::getenv("ACPP_METAL_XCRUN")) {
++    if (p[0] != '\0') return std::string{p};
++  }
++  return "/usr/bin/xcrun";
++}
++
++metal_offline_compile_result run_tool_stage(
++    const std::vector<std::string>& tool_args,
++    metal_jit_guard::scoped_compile& guard, int cache_lock_fd) {
++  std::vector<std::string> owned_args{
++      "/usr/bin/nice", "-n", "15", metal_xcrun_path()};
++  owned_args.insert(owned_args.end(), tool_args.begin(), tool_args.end());
++  metal_process::child_process child;
++  std::string spawn_error;
++  if (!metal_process::spawn_in_own_process_group(
++          owned_args, child, spawn_error, -1, false,
++          metal_process::spawn_failure_injection::none,
++          cache_lock_fd >= 0 ? std::vector<int>{cache_lock_fd}
++                             : std::vector<int>{})) {
++    return offline_failure(
++        metal_offline_compile_failure::toolchain_absent,
++        "metal_code_object: Could not spawn offline Metal toolchain: " +
++            spawn_error);
++  }
++
++  // Publish only a verified dedicated PGID to the RSS monitor.
++  guard.set_compiler_process_group(child.pgid);
++  int child_status = 0;
++  pid_t waited = -1;
++  const std::size_t timeout_s = metal_jit_guard::read_size_env(
++      "ACPP_METAL_TOOL_TIMEOUT_S", 120);
++  const auto deadline = std::chrono::steady_clock::now() +
++                        std::chrono::seconds{timeout_s};
++  while (true) {
++    if (guard.limit_exceeded()) {
++      const bool reaped =
++          metal_process::terminate_and_reap(child, child_status);
++      guard.clear_compiler_process_group();
++      if (!reaped) {
++        return offline_failure(
++            metal_offline_compile_failure::rss_limit_exceeded,
++            "metal_code_object: RSS limit tripped and compiler child did not "
++            "reap before the cleanup deadline");
++      }
++      return offline_failure(
++          metal_offline_compile_failure::rss_limit_exceeded,
++          "metal_code_object: Offline Metal compiler RSS ceiling tripped");
++    }
++    if (std::chrono::steady_clock::now() >= deadline) {
++      const bool reaped =
++          metal_process::terminate_and_reap(child, child_status);
++      guard.clear_compiler_process_group();
++      return offline_failure(
++          metal_offline_compile_failure::compile_rejected,
++          reaped
++              ? "metal_code_object: Offline Metal compiler stage timed out"
++              : "metal_code_object: Offline Metal compiler timed out and did "
++                "not reap before the cleanup deadline");
++    }
++    waited = ::waitpid(child.pid, &child_status, WNOHANG);
++    if (waited == child.pid) {
++      child.pid = -1;
++      break;
++    }
++    if (waited < 0 && errno != EINTR) {
++      const bool reaped =
++          metal_process::terminate_and_reap(child, child_status);
++      guard.clear_compiler_process_group();
++      return offline_failure(
++          metal_offline_compile_failure::compile_rejected,
++          reaped
++              ? "metal_code_object: Could not wait for offline Metal compiler"
++              : "metal_code_object: Could not wait for or reap offline Metal "
++                "compiler");
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds{20});
++  }
++
++  if (waited <= 0) {
++    guard.clear_compiler_process_group();
++    return offline_failure(
++        metal_offline_compile_failure::compile_rejected,
++        "metal_code_object: Could not reap offline Metal compiler process");
++  }
++
++  // The leader is already reaped. Never signal its old PGID here: PGID reuse
++  // could target an unrelated process group after a successful waitpid.
++  if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
++    guard.clear_compiler_process_group();
+     std::ostringstream msg;
+-    msg << "metal_code_object: Offline Metal library compilation failed"
+-        << " with status " << status
+-        << "; command=" << command;
+-    return make_error(__acpp_here(), error_info{msg.str()});
+-  }
+-  return make_success();
++    msg << "metal_code_object: Offline Metal compiler rejected input; status="
++        << child_status;
++    return offline_failure(metal_offline_compile_failure::compile_rejected,
++                           msg.str());
++  }
++
++  guard.clear_compiler_process_group();
++  return {make_success(), metal_offline_compile_failure::none};
++}
++
++metal_offline_compile_result run_metal_toolchain(
++    const std::string& source_path, const std::string& air_path,
++    const std::string& metallib_path,
++    metal_jit_guard::scoped_compile& guard, int cache_lock_fd) {
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr, "ACPP_METAL_AOT phase=metal-start\n");
++  }
++  auto metal_result = run_tool_stage(
++      {"-sdk", "macosx", "metal", "-std=metal4.0", "-Os", "-c",
++       source_path, "-o", air_path},
++      guard, cache_lock_fd);
++  if (!metal_result.status.is_success()) {
++    return metal_result;
++  }
++
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr, "ACPP_METAL_AOT phase=metallib-start\n");
++  }
++  auto metallib_result = run_tool_stage(
++      {"-sdk", "macosx", "metallib", air_path, "-o", metallib_path},
++      guard, cache_lock_fd);
++  if (!metallib_result.status.is_success()) {
++    return metallib_result;
++  }
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr, "ACPP_METAL_AOT phase=toolchain-complete\n");
++  }
++  return {make_success(), metal_offline_compile_failure::none};
++}
++
++std::string trim_command_output(std::string value) {
++  while (!value.empty() &&
++         (value.back() == '\n' || value.back() == '\r' ||
++          value.back() == ' ' || value.back() == '\t')) {
++    value.pop_back();
++  }
++  for (char& c : value) {
++    if (c == '\n' || c == '\r' || c == '\t') {
++      c = ' ';
++    }
++  }
++  return value;
++}
++
++bool capture_command(const std::vector<std::string>& command,
++                     std::string& output) {
++  int pipe_fds[2] = {-1, -1};
++  if (::pipe(pipe_fds) != 0) {
++    return false;
++  }
++  ::fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
++  ::fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
++
++  metal_process::child_process child;
++  std::string spawn_error;
++  if (!metal_process::spawn_in_own_process_group(
++          command, child, spawn_error, pipe_fds[1], true)) {
++    ::close(pipe_fds[0]);
++    ::close(pipe_fds[1]);
++    return false;
++  }
++  ::close(pipe_fds[1]);
++  const int flags = ::fcntl(pipe_fds[0], F_GETFL, 0);
++  if (flags < 0 || ::fcntl(pipe_fds[0], F_SETFL, flags | O_NONBLOCK) != 0) {
++    int status = 0;
++    metal_process::terminate_and_reap(child, status);
++    ::close(pipe_fds[0]);
++    return false;
++  }
++
++  output.clear();
++  int child_status = 0;
++  bool child_reaped = false;
++  bool pipe_eof = false;
++  const auto deadline = std::chrono::steady_clock::now() +
++                        std::chrono::seconds{5};
++  char buffer[512];
++  while (!child_reaped || !pipe_eof) {
++    const ssize_t count = ::read(pipe_fds[0], buffer, sizeof(buffer));
++    if (count > 0) {
++      output.append(buffer, static_cast<std::size_t>(count));
++      if (output.size() > 1024 * 1024) {
++        metal_process::terminate_and_reap(child, child_status);
++        ::close(pipe_fds[0]);
++        return false;
++      }
++    } else if (count == 0) {
++      pipe_eof = true;
++    } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
++      metal_process::terminate_and_reap(child, child_status);
++      ::close(pipe_fds[0]);
++      return false;
++    }
++
++    if (!child_reaped) {
++      const pid_t waited = ::waitpid(child.pid, &child_status, WNOHANG);
++      if (waited == child.pid || (waited < 0 && errno == ECHILD)) {
++        child.pid = -1;
++        child_reaped = true;
++      } else if (waited < 0 && errno != EINTR) {
++        metal_process::terminate_and_reap(child, child_status);
++        ::close(pipe_fds[0]);
++        return false;
++      }
++    }
++    if (std::chrono::steady_clock::now() >= deadline) {
++      metal_process::terminate_and_reap(child, child_status);
++      ::close(pipe_fds[0]);
++      return false;
++    }
++    if (!child_reaped || !pipe_eof) {
++      std::this_thread::sleep_for(std::chrono::milliseconds{5});
++    }
++  }
++  ::close(pipe_fds[0]);
++  output = trim_command_output(std::move(output));
++  return WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0 &&
++         !output.empty();
++}
++
++std::string stable_file_digest(const std::string& path) {
++  std::ifstream input{path, std::ios::binary};
++  if (!input) {
++    return {};
++  }
++  common::stable_running_hash hash;
++  std::uint64_t total_bytes = 0;
++  char buffer[64 * 1024];
++  while (input) {
++    input.read(buffer, sizeof(buffer));
++    const std::streamsize count = input.gcount();
++    if (count > 0) {
++      hash(buffer, static_cast<std::size_t>(count));
++      total_bytes += static_cast<std::uint64_t>(count);
++    }
++  }
++  if (!input.eof()) {
++    return {};
++  }
++  // Derivation: build identity is ChibiHash64 over every dylib byte, followed
++  // by the exact byte count to distinguish a truncated prefix from its source.
++  hash(&total_bytes, sizeof(total_bytes));
++  std::ostringstream out;
++  out << std::hex << hash.get_current_hash() << ":" << std::dec
++      << total_bytes;
++  return out.str();
++}
++
++struct live_toolchain_probe {
++  bool available = false;
++  std::string fingerprint;
++  std::string error;
++};
++
++
++const live_toolchain_probe& get_live_toolchain_probe() {
++  static std::once_flag once;
++  static live_toolchain_probe probe;
++  std::call_once(once, []() {
++    std::string metal_path;
++    std::string metal_version;
++    std::string sdk_build;
++    std::string os_build;
++    const std::string xcrun = metal_xcrun_path();
++    if (!capture_command({xcrun, "--find", "metal"},
++                         metal_path) ||
++        !capture_command({xcrun, "-sdk", "macosx", "metal",
++                          "--version"}, metal_version) ||
++        !capture_command({xcrun, "-sdk", "macosx",
++                          "--show-sdk-build-version"}, sdk_build) ||
++        !capture_command({"/usr/bin/sw_vers", "-buildVersion"}, os_build)) {
++      probe.error = "required xcrun/SDK/OS fingerprint probe failed";
++      return;
++    }
++
++    static int adaptivecpp_module_anchor = 0;
++    Dl_info module_info = {};
++    if (::dladdr(&adaptivecpp_module_anchor, &module_info) == 0 ||
++        !module_info.dli_fname) {
++      probe.error = "could not resolve running AdaptiveCpp library";
++      return;
++    }
++    const std::string build_identity =
++        stable_file_digest(module_info.dli_fname);
++    if (build_identity.empty()) {
++      probe.error = "could not digest running AdaptiveCpp library";
++      return;
++    }
++
++    probe.fingerprint =
++        "schema=aot-v2|metal-path=" + metal_path +
++        "|metal-version=" + metal_version + "|sdk-build=" + sdk_build +
++        "|os-build=" + os_build + "|acpp-build=" + build_identity;
++    probe.available = true;
++  });
++  return probe;
++}
++
++std::uint64_t stable_string_digest(const std::string& value) {
++  common::stable_running_hash hash;
++  const std::uint64_t bytes = value.size();
++  hash(&bytes, sizeof(bytes));
++  hash(value.data(), value.size());
++  return hash.get_current_hash();
+ }
+ 
+ std::string make_metal_binary_archive_path(MTL::Device* device) {
++  std::string fingerprint;
++  if (!get_metal_offline_cache_fingerprint(device, fingerprint).is_success()) {
++    return {};
++  }
+   std::ostringstream archive_name;
+-  archive_name << "metal-pipeline-";
++  archive_name << "metal-pipeline-v2-";
+   if (device) {
+     archive_name << std::hex << device->registryID();
+   } else {
+     archive_name << "no-device";
+   }
++  archive_name << "-" << std::hex << stable_string_digest(fingerprint);
+   archive_name << ".binarchive";
+ 
+   return common::filesystem::join_path(
+@@ -106,7 +424,8 @@
+ }
+ 
+ MTL::BinaryArchive*
+-open_metal_binary_archive(MTL::Device* device, const std::string& path) {
++open_metal_binary_archive_unlocked(MTL::Device* device,
++                                   const std::string& path) {
+   if (!device || path.empty()) {
+     return nullptr;
+   }
+@@ -116,33 +435,46 @@
+     return nullptr;
+   }
+ 
++  auto create_archive = [&](bool use_existing,
++                            NS::Error** error) -> MTL::BinaryArchive* {
++    NS::SharedPtr<MTL::BinaryArchiveDescriptor> descriptor =
++        NS::TransferPtr(MTL::BinaryArchiveDescriptor::alloc()->init());
++    if (use_existing) {
++      NS::String* path_string =
++          NS::String::string(path.c_str(), NS::UTF8StringEncoding);
++      descriptor->setUrl(NS::URL::fileURLWithPath(path_string));
++    }
++    return device->newBinaryArchive(descriptor.get(), error);
++  };
++
++  const bool exists = std::filesystem::exists(path);
+   NS::Error* error = nullptr;
+-  NS::SharedPtr<MTL::BinaryArchiveDescriptor> descriptor =
+-      NS::TransferPtr(MTL::BinaryArchiveDescriptor::alloc()->init());
+-  std::ifstream existing_archive{path, std::ios::binary};
+-  if (existing_archive.good()) {
+-    NS::String* path_string =
+-        NS::String::string(path.c_str(), NS::UTF8StringEncoding);
+-    NS::URL* archive_url = NS::URL::fileURLWithPath(path_string);
+-    descriptor->setUrl(archive_url);
+-  }
+-
+-  MTL::BinaryArchive* archive =
+-      device->newBinaryArchive(descriptor.get(), &error);
++  MTL::BinaryArchive* archive = create_archive(exists, &error);
++  if ((error || !archive) && exists) {
++    static std::atomic<std::uint64_t> quarantine_counter{0};
++    std::ostringstream quarantine;
++    quarantine << path << ".quarantine." << ::getpid() << "."
++               << quarantine_counter.fetch_add(1);
++    if (std::rename(path.c_str(), quarantine.str().c_str()) != 0) {
++      std::fprintf(stderr,
++                   "ACPP_METAL_AOT archive-error=quarantine path=%s\n",
++                   path.c_str());
++      return nullptr;
++    }
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT archive-error=quarantined path=%s replacement=%s\n",
++                 path.c_str(), quarantine.str().c_str());
++    error = nullptr;
++    archive = create_archive(false, &error);
++  }
+   if (error || !archive) {
+-    HIPSYCL_DEBUG_WARNING
+-        << "metal_code_object: Could not open Metal binary archive at "
+-        << path;
+-    if (error && error->localizedDescription()) {
+-      HIPSYCL_DEBUG_WARNING
+-          << ": " << error->localizedDescription()->utf8String();
+-    }
+-    HIPSYCL_DEBUG_WARNING << std::endl;
++    std::fprintf(stderr, "ACPP_METAL_AOT archive-error=open path=%s\n",
++                 path.c_str());
+     return nullptr;
+   }
+ 
+-  HIPSYCL_DEBUG_INFO << "metal_code_object: Opened Metal binary archive "
+-                     << path << std::endl;
++  std::fprintf(stderr, "ACPP_METAL_AOT archive-open path=%s existing=%d\n",
++               path.c_str(), exists ? 1 : 0);
+   return archive;
+ }
+ 
+@@ -156,7 +488,8 @@
+ 
+   NS::Error* error = nullptr;
+   metal_jit_guard::scoped_compile jit_compile{
+-      "Metal library source compilation", source.size()};
++      "Metal library source compilation", source.size(),
++      metal_aot_feature_enabled()};
+   result guard_result =
+       jit_compile.check("before Metal library source compilation");
+   if (!guard_result.is_success()) {
+@@ -164,13 +497,7 @@
+   }
+ 
+   NS::SharedPtr<MTL::CompileOptions> options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+-  // Use the highest MSL version available in our metal-cpp headers.
+-  // LanguageVersion4_0 requires macOS 26+ metal-cpp; fall back to 3_2.
+-#if defined(MTL_LANGUAGEVERSION_4_0) || __METAL_VERSION__ >= 400
+   options->setLanguageVersion(MTL::LanguageVersion4_0);
+-#else
+-  options->setLanguageVersion(MTL::LanguageVersion3_2);
+-#endif
+   options->setOptimizationLevel(MTL::LibraryOptimizationLevel::LibraryOptimizationLevelSize);
+ 
+   NS::String* sourceString = NS::String::string(source.c_str(),
+@@ -178,7 +505,8 @@
+ 
+   library = device->newLibrary(sourceString, options.get(), &error);
+ 
+-  guard_result = jit_compile.check("after Metal library source compilation");
++  guard_result = jit_compile.check("after Metal library source compilation",
++                                   true);
+   if (!guard_result.is_success()) {
+     if (library) {
+       library->release();
+@@ -204,6 +532,9 @@
+ 
+   HIPSYCL_DEBUG_INFO << "metal_code_object: Successfully compiled Metal shader"
+                      << std::endl;
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr, "ACPP_METAL_AOT source-compile=success\n");
++  }
+ 
+   return make_success();
+ }
+@@ -219,6 +550,11 @@
+   if (metallib.empty()) {
+     return make_error(__acpp_here(),
+                       error_info{"metal_code_object: Metal library binary is empty"});
++  }
++  if (metallib.size() < 4 || std::memcmp(metallib.data(), "MTLB", 4) != 0) {
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: Cached Metal library has invalid magic"});
+   }
+ 
+   void* data = std::malloc(metallib.size());
+@@ -248,43 +584,273 @@
+                           error)});
+   }
+ 
+-  HIPSYCL_DEBUG_INFO << "metal_code_object: Loaded cached Metal library of size "
+-                     << metallib.size() << std::endl;
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT metallib-cache-load=hit bytes=%zu\n",
++                 metallib.size());
++  }
+   return make_success();
+ }
+ 
+ } // anonymous namespace
+ 
+-result compile_metal_source_to_metallib(
++metal_interprocess_lock::metal_interprocess_lock(const std::string& path) {
++  _fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
++  if (_fd < 0) {
++    _error_message = "could not open lock " + path + ": " +
++                     std::string{std::strerror(errno)};
++    return;
++  }
++
++  const std::size_t timeout_s = metal_jit_guard::read_size_env(
++      "ACPP_METAL_CACHE_LOCK_TIMEOUT_S", 300);
++  const auto deadline = std::chrono::steady_clock::now() +
++                        std::chrono::seconds{timeout_s};
++  while (::flock(_fd, LOCK_EX | LOCK_NB) != 0) {
++    if (errno != EWOULDBLOCK && errno != EAGAIN) {
++      _error_message = "could not acquire lock " + path + ": " +
++                       std::string{std::strerror(errno)};
++      ::close(_fd);
++      _fd = -1;
++      return;
++    }
++    if (std::chrono::steady_clock::now() >= deadline) {
++      _error_message = "timed out acquiring lock " + path;
++      ::close(_fd);
++      _fd = -1;
++      return;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds{20});
++  }
++
++  const std::string owner = std::to_string(::getpid()) + "\n";
++  if (::ftruncate(_fd, 0) != 0 || ::lseek(_fd, 0, SEEK_SET) < 0 ||
++      ::write(_fd, owner.data(), owner.size()) !=
++          static_cast<ssize_t>(owner.size())) {
++    _error_message = "could not write lock owner metadata for " + path;
++    ::flock(_fd, LOCK_UN);
++    ::close(_fd);
++    _fd = -1;
++  }
++}
++
++metal_interprocess_lock::~metal_interprocess_lock() {
++  if (_fd >= 0) {
++    ::flock(_fd, LOCK_UN);
++    ::close(_fd);
++  }
++}
++
++bool metal_interprocess_lock::acquired() const {
++  return _fd >= 0;
++}
++
++int metal_interprocess_lock::native_handle() const {
++  return _fd;
++}
++
++const std::string& metal_interprocess_lock::error_message() const {
++  return _error_message;
++}
++
++MTL::BinaryArchive* open_metal_binary_archive_with_lock_held(
++    MTL::Device* device, const std::string& path) {
++  return open_metal_binary_archive_unlocked(device, path);
++}
++
++result get_metal_offline_cache_fingerprint(MTL::Device* device,
++                                           std::string& fingerprint) {
++  const live_toolchain_probe& probe = get_live_toolchain_probe();
++  if (!probe.available) {
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: " + probe.error});
++  }
++
++  std::string device_family = "unknown";
++  int apple_gpu_family = 0;
++  if (device && device->name()) {
++    device_family = device->name()->utf8String();
++    if (device->supportsFamily(MTL::GPUFamily(MTL::GPUFamilyApple8 + 1))) {
++      apple_gpu_family = 9;
++    } else if (device->supportsFamily(MTL::GPUFamilyApple8)) {
++      apple_gpu_family = 8;
++    } else if (device->supportsFamily(MTL::GPUFamilyApple7)) {
++      apple_gpu_family = 7;
++    }
++  }
++  fingerprint = probe.fingerprint + "|device-family=" + device_family +
++                "|apple-gpu-family=" + std::to_string(apple_gpu_family) +
++                "|msl=metal4.0|optimization=-Os";
++  if (const char* override_id =
++          std::getenv("ACPP_METAL_OFFLINE_METALLIB_CACHE_ID")) {
++    fingerprint += "|operator-override=" + std::string{override_id};
++  }
++
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr, "ACPP_METAL_AOT fingerprint=%s\n",
++                 fingerprint.c_str());
++  }
++  return make_success();
++}
++
++result serialize_metal_binary_archive_atomically(
++    MTL::BinaryArchive* archive, const std::string& archive_path,
++    bool caller_holds_lock) {
++  if (!archive || archive_path.empty()) {
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: Missing archive or archive path"});
++  }
++  std::unique_ptr<metal_interprocess_lock> lock;
++  if (!caller_holds_lock) {
++    lock = std::make_unique<metal_interprocess_lock>(archive_path + ".lock");
++  }
++  if (lock && !lock->acquired()) {
++    return make_error(__acpp_here(), error_info{lock->error_message()});
++  }
++
++  static std::atomic<std::uint64_t> temp_counter{0};
++  std::ostringstream temp_name;
++  temp_name << archive_path << ".tmp." << ::getpid() << "."
++            << temp_counter.fetch_add(1);
++  const std::string temp_path = temp_name.str();
++  NS::String* path_string =
++      NS::String::string(temp_path.c_str(), NS::UTF8StringEncoding);
++  NS::Error* error = nullptr;
++  if (!archive->serializeToURL(NS::URL::fileURLWithPath(path_string), &error)) {
++    remove_if_present(temp_path);
++    return make_error(
++        __acpp_here(),
++        error_info{metal_error_message(
++            "metal_code_object: Failed to serialize binary archive", error)});
++  }
++
++  struct stat archive_stat = {};
++  if (::stat(temp_path.c_str(), &archive_stat) != 0 || archive_stat.st_size <= 0) {
++    remove_if_present(temp_path);
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: Serialized binary archive is empty"});
++  }
++  const int temp_fd = ::open(temp_path.c_str(), O_RDONLY);
++  bool flush_ok = false;
++  if (temp_fd >= 0) {
++    const int sync_status = ::fsync(temp_fd);
++    const int close_status = ::close(temp_fd);
++    flush_ok = sync_status == 0 && close_status == 0;
++  }
++  if (!flush_ok) {
++    remove_if_present(temp_path);
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: Could not flush serialized archive"});
++  }
++  if (std::rename(temp_path.c_str(), archive_path.c_str()) != 0) {
++    remove_if_present(temp_path);
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: Could not atomically publish archive"});
++  }
++  const std::string parent_path =
++      std::filesystem::path{archive_path}.parent_path().string();
++  const int parent_fd = ::open(parent_path.c_str(), O_RDONLY);
++  bool directory_flush_ok = false;
++  if (parent_fd >= 0) {
++    const int sync_status = ::fsync(parent_fd);
++    const int close_status = ::close(parent_fd);
++    directory_flush_ok = sync_status == 0 && close_status == 0;
++  }
++  if (!directory_flush_ok) {
++    return make_error(
++        __acpp_here(),
++        error_info{"metal_code_object: Published archive but directory fsync failed"});
++  }
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT archive-published path=%s bytes=%lld\n",
++                 archive_path.c_str(),
++                 static_cast<long long>(archive_stat.st_size));
++  }
++  return make_success();
++}
++
++metal_offline_compile_result compile_metal_source_to_metallib(
+     const std::string &metal_source,
+     kernel_cache::code_object_id id_of_binary,
+-    std::string &metallib) {
+-  std::string cache_file = kernel_cache::get_persistent_cache_file(id_of_binary);
+-  std::string source_path = cache_file + ".metal";
+-  std::string air_path = cache_file + ".air";
+-  std::string metallib_path = cache_file + ".metallib";
++    std::string &metallib, int cache_lock_fd) {
++  const std::string cache_file =
++      kernel_cache::get_persistent_cache_file(id_of_binary);
++  std::string temp_template = cache_file + ".work." +
++                              std::to_string(::getpid()) + ".XXXXXX";
++  std::vector<char> temp_template_buffer(temp_template.begin(),
++                                         temp_template.end());
++  temp_template_buffer.push_back('\0');
++  char* created_dir = ::mkdtemp(temp_template_buffer.data());
++  if (!created_dir) {
++    return offline_failure(
++        metal_offline_compile_failure::io_error,
++        "metal_code_object: Could not create process-unique compiler directory");
++  }
++
++  const std::string temp_dir{created_dir};
++  const std::string source_path = temp_dir + "/source.metal";
++  const std::string air_path = temp_dir + "/image.air";
++  const std::string metallib_path = temp_dir + "/image.metallib";
++  auto cleanup = [&]() {
++    std::error_code error;
++    std::filesystem::remove_all(temp_dir, error);
++  };
+ 
+   if (!common::filesystem::atomic_write(source_path, metal_source)) {
+-    return make_error(__acpp_here(),
+-                      error_info{"metal_code_object: Could not write temporary MSL source"});
+-  }
+-
+-  result compile_result = run_metal_toolchain(source_path, air_path, metallib_path);
+-  remove_if_present(source_path);
+-  remove_if_present(air_path);
+-  if (!compile_result.is_success()) {
+-    remove_if_present(metallib_path);
++    cleanup();
++    return offline_failure(
++        metal_offline_compile_failure::io_error,
++        "metal_code_object: Could not write temporary MSL source");
++  }
++
++  metal_jit_guard::scoped_compile offline_compile{
++      "Offline Metal toolchain compilation", metal_source.size()};
++  result guard_result =
++      offline_compile.check("before offline Metal toolchain compilation");
++  if (!guard_result.is_success()) {
++    cleanup();
++    return offline_failure(
++        metal_offline_compile_failure::rss_limit_exceeded,
++        guard_result.what());
++  }
++
++  auto compile_result = run_metal_toolchain(
++      source_path, air_path, metallib_path, offline_compile, cache_lock_fd);
++  if (!compile_result.status.is_success()) {
++    cleanup();
+     return compile_result;
+   }
+-
+-  if (!read_binary_file(metallib_path, metallib)) {
+-    remove_if_present(metallib_path);
+-    return make_error(__acpp_here(),
+-                      error_info{"metal_code_object: Could not read compiled Metal library"});
+-  }
+-
+-  remove_if_present(metallib_path);
+-  return make_success();
++  guard_result = offline_compile.check(
++      "after offline Metal toolchain compilation", true);
++  if (!guard_result.is_success()) {
++    cleanup();
++    return offline_failure(
++        metal_offline_compile_failure::rss_limit_exceeded,
++        guard_result.what());
++  }
++
++  if (!read_binary_file(metallib_path, metallib) || metallib.size() < 4 ||
++      std::memcmp(metallib.data(), "MTLB", 4) != 0) {
++    cleanup();
++    metallib.clear();
++    return offline_failure(
++        metal_offline_compile_failure::io_error,
++        "metal_code_object: Compiled Metal library is unreadable or invalid");
++  }
++
++  cleanup();
++  if (metal_aot_feature_enabled()) {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT phase=offline-compile-success bytes=%zu\n",
++                 metallib.size());
++  }
++  return {make_success(), metal_offline_compile_failure::none};
+ }
+ 
+ metal_sscp_executable_object::metal_sscp_executable_object(
+@@ -298,9 +864,21 @@
+       _msl_source{input_kind == metal_library_input_kind::source ? metal_input
+                                                                  : std::string{}} {
+   _build_result = build(metal_input, input_kind);
+-  if (_build_result.is_success()) {
++  // Feature-off Metal startup must not probe xcrun, build an archive path,
++  // acquire an archive lock, or emit AOT diagnostics.
++  if (_build_result.is_success() && metal_binary_archive_enabled()) {
+     _binary_archive_path = make_metal_binary_archive_path(_device);
+-    _binary_archive = open_metal_binary_archive(_device, _binary_archive_path);
++    if (!_binary_archive_path.empty()) {
++      metal_interprocess_lock archive_lock{_binary_archive_path + ".lock"};
++      if (archive_lock.acquired()) {
++        _binary_archive = open_metal_binary_archive_with_lock_held(
++            _device, _binary_archive_path);
++      } else {
++        std::fprintf(stderr,
++                     "ACPP_METAL_AOT archive-error=lock path=%s\n",
++                     _binary_archive_path.c_str());
++      }
++    }
+   }
+ }
+ 
+diff --git a/src/runtime/kernel_cache.cpp b/src/runtime/kernel_cache.cpp
+--- a/src/runtime/kernel_cache.cpp
++++ b/src/runtime/kernel_cache.cpp
+@@ -16,6 +16,8 @@
+ #include "hipSYCL/runtime/backend.hpp"
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdio>
++#include <cstdlib>
+ #include <fstream>
+ #include <memory>
+ #include <mutex>
+@@ -503,9 +505,23 @@
+                      << " in file " << filename << std::endl;
+ 
+   std::streamsize file_size = file.tellg();
++  if (file_size <= 0) {
++    return false;
++  }
+   file.seekg(0, std::ios::beg);
+-  out.resize(file_size);
+-  file.read(out.data(), file_size);
++  out.resize(static_cast<std::size_t>(file_size));
++  if (!file.read(out.data(), file_size)) {
++    out.clear();
++    return false;
++  }
++
++  if (const char* offline =
++          std::getenv("ACPP_METAL_ENABLE_OFFLINE_METALLIB");
++      offline && std::string{offline} == "1") {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT persistent-cache-hit bytes=%lld\n",
++                 static_cast<long long>(file_size));
++  }
+   
+   return true;
+ }
+@@ -526,6 +542,15 @@
+     HIPSYCL_DEBUG_ERROR
+         << "Could not store JIT result in persistent kernel cache in file "
+         << filename << std::endl;
++    return;
++  }
++
++  if (const char* offline =
++          std::getenv("ACPP_METAL_ENABLE_OFFLINE_METALLIB");
++      offline && std::string{offline} == "1") {
++    std::fprintf(stderr,
++                 "ACPP_METAL_AOT persistent-cache-published bytes=%zu\n",
++                 data.size());
+   }
+ 
+   common::filesystem::persistent_storage::get()
+diff --git a/tests/runtime/metal_aot_offline_compile.cpp b/tests/runtime/metal_aot_offline_compile.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/runtime/metal_aot_offline_compile.cpp
+@@ -0,0 +1,57 @@
++#include "hipSYCL/runtime/metal/metal_code_object.hpp"
++
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <iterator>
++#include <string>
++
++int main(int argc, char** argv) {
++  if (argc < 2 || argc > 3) {
++    std::cerr << "usage: metal_aot_offline_compile <fixture.metal> "
++                 "[--expect-rss-trip]\n";
++    return 2;
++  }
++  const bool expect_rss_trip =
++      argc == 3 && std::string{argv[2]} == "--expect-rss-trip";
++  std::ifstream input{argv[1], std::ios::binary};
++  const std::string source{std::istreambuf_iterator<char>{input},
++                           std::istreambuf_iterator<char>{}};
++  if (!input.is_open() || source.empty()) {
++    std::cerr << "could not read fixture\n";
++    return 3;
++  }
++
++  if (!std::getenv("ACPP_METAL_MAX_COMPILER_MEM_MB")) {
++    setenv("ACPP_METAL_MAX_COMPILER_MEM_MB", "2048", 1);
++  }
++  if (!std::getenv("ACPP_METAL_JIT_POSTCHECK_MS")) {
++    setenv("ACPP_METAL_JIT_POSTCHECK_MS", "0", 1);
++  }
++  hipsycl::rt::kernel_cache::code_object_id id = {};
++  id[0] = 0x743030316132ULL;
++  std::string metallib;
++  auto result = hipsycl::rt::compile_metal_source_to_metallib(
++      source, id, metallib);
++  if (expect_rss_trip) {
++    if (!result.status.is_success() &&
++        result.failure ==
++            hipsycl::rt::metal_offline_compile_failure::rss_limit_exceeded) {
++      std::cout << "AOT_GUARD_PGID_CLEANUP_PASS rss-limit-classified\n";
++      return 0;
++    }
++    std::cerr << "expected RSS trip did not occur\n";
++    return 6;
++  }
++  if (!result.status.is_success()) {
++    std::cerr << result.status.what() << "\n";
++    return 4;
++  }
++  if (metallib.size() < 4 || metallib.compare(0, 4, "MTLB") != 0) {
++    std::cerr << "invalid metallib payload\n";
++    return 5;
++  }
++  std::cout << "AOT_OFFLINE_PREPOPULATE_PASS bytes=" << metallib.size()
++            << "\n";
++  return 0;
++}

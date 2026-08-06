@@ -1,0 +1,112 @@
+Subject: [PATCH] Metal: add AOT cache identity for offline metallib keys
+
+Offline metallib and binary-archive caches must key on more than the SSCP
+bitcode hash: toolchain paths, feature flags, and device fingerprint all change
+the produced binary. The measured tree introduces metal_aot_cache_identity.hpp
+plus a unit test so cache hits cannot mix incompatible offline artifacts.
+
+Add the identity helper and its test as in the measured tree.
+
+Source reproduction only: this patch was not compile-verified here.
+
+diff --git a/include/hipSYCL/runtime/metal/metal_aot_cache_identity.hpp b/include/hipSYCL/runtime/metal/metal_aot_cache_identity.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/hipSYCL/runtime/metal/metal_aot_cache_identity.hpp
+@@ -0,0 +1,69 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#pragma once
++
++#include "hipSYCL/common/stable_running_hash.hpp"
++
++#include <cstdint>
++#include <string_view>
++
++namespace hipsycl {
++namespace rt {
++
++struct metal_aot_image_identity {
++  std::uint64_t content_digest_low;
++  std::uint64_t content_digest_high;
++  std::uint64_t image_size;
++};
++
++inline metal_aot_image_identity make_metal_aot_image_identity(
++    std::string_view hcf_image) {
++  common::stable_running_hash digest_low;
++  common::stable_running_hash digest_high;
++  const std::uint64_t image_size = hcf_image.size();
++  const std::uint64_t low_domain = 0x4d544c2d414f542d;
++  const std::uint64_t high_domain = 0x494d4147452d5632;
++
++  // Derivation: two domain-separated ChibiHash64 streams over
++  // domain || len(image) || image form a stable 128-bit content digest.
++  // image_size is also folded into the outer kernel configuration.
++  digest_low(&low_domain, sizeof(low_domain));
++  digest_low(&image_size, sizeof(image_size));
++  digest_low(hcf_image.data(), hcf_image.size());
++  digest_high(&high_domain, sizeof(high_domain));
++  digest_high(&image_size, sizeof(image_size));
++  digest_high(hcf_image.data(), hcf_image.size());
++
++  return {digest_low.get_current_hash(), digest_high.get_current_hash(),
++          image_size};
++}
++
++inline std::uint64_t make_metal_aot_cache_slot_digest(
++    std::string_view requested_kernel_name,
++    const metal_aot_image_identity& image_identity) {
++  common::stable_running_hash digest;
++  const std::uint64_t kernel_name_size = requested_kernel_name.size();
++  digest(&kernel_name_size, sizeof(kernel_name_size));
++  digest(requested_kernel_name.data(), requested_kernel_name.size());
++  digest(&image_identity.content_digest_low,
++         sizeof(image_identity.content_digest_low));
++  digest(&image_identity.content_digest_high,
++         sizeof(image_identity.content_digest_high));
++  digest(&image_identity.image_size, sizeof(image_identity.image_size));
++  return digest.get_current_hash();
++}
++
++inline std::uint64_t make_metal_aot_cache_slot_digest(
++    std::string_view requested_kernel_name, std::string_view hcf_image) {
++  return make_metal_aot_cache_slot_digest(
++      requested_kernel_name, make_metal_aot_image_identity(hcf_image));
++}
++
++} // namespace rt
++} // namespace hipsycl
+diff --git a/tests/runtime/metal_aot_cache_identity.cpp b/tests/runtime/metal_aot_cache_identity.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/runtime/metal_aot_cache_identity.cpp
+@@ -0,0 +1,22 @@
++#include "hipSYCL/runtime/metal/metal_aot_cache_identity.hpp"
++
++#include <cassert>
++#include <iostream>
++
++int main() {
++  using hipsycl::rt::make_metal_aot_cache_slot_digest;
++
++  const std::string image = "image-with-kernel-a-and-kernel-b";
++  const auto kernel_a = make_metal_aot_cache_slot_digest("kernel_a", image);
++  const auto kernel_b = make_metal_aot_cache_slot_digest("kernel_b", image);
++  assert(kernel_a != kernel_b);
++
++  const auto source_a =
++      make_metal_aot_cache_slot_digest("same_kernel", "source-v1");
++  const auto source_b =
++      make_metal_aot_cache_slot_digest("same_kernel", "source-v2");
++  assert(source_a != source_b);
++
++  std::cout << "AOT_CACHE_IDENTITY_PASS multi-kernel same-name-different-source\n";
++  return 0;
++}

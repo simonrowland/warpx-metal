@@ -1,0 +1,80 @@
+Metal: stop sleeping a flat millisecond per command-buffer wait poll
+
+0019 gave the command-buffer wait a deadline, which it needed, but implemented
+the wait as a poll loop that sleeps a flat 1 ms per iteration. That puts a 1 ms
+floor under every wait whose command buffer is not already complete.
+
+On a 1024^2 two-species single-precision deck the launch rate is about 205
+kernels per step with roughly 3.1 waits per kernel, so about 640 waits per step
+reach that loop. Measured against the same deck, host, and cache with only the
+runtime differing, the floor cost 36 -> 328 ms/step, a 9x wall regression; the
+arithmetic closes if a little under half of those waits sleep once.
+
+Metal command buffers on this hardware typically retire in tens of microseconds,
+so the fix is to match the wait granularity to that: yield-spin first, then fall
+back to exponential backoff from 2 us to a 1 ms cap for genuinely long waits so
+a stalled queue does not burn a core. The deadline and every error path are
+unchanged - this is purely how the loop waits between status checks.
+
+Measured on the same deck, host, and cache:
+
+  flat 1 ms poll            ~328 ms/step
+  backoff only (2 us .. 1 ms) ~55 ms/step
+  spin then backoff          ~48 ms/step
+  runtime without the deadline machinery at all   ~36 ms/step
+
+Particle counts were exact on every run in all configurations.
+
+The residual against the no-deadline runtime is wait granularity: about 12 ms
+per step over ~640 waits is ~19 us per wait. Removing it entirely would need an
+event-driven wait, and Metal requires completion handlers to be registered
+before commit, so that is a larger change to the submit path rather than to
+this function.
+
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 39e0786..5fc8a12 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -428,6 +428,18 @@ result wait_for_metal_command_buffer(MTL::CommandBuffer* command_buffer,
+   const auto deadline =
+       std::chrono::steady_clock::now() + metal_command_buffer_timeout();
+   auto status = command_buffer->status();
++  // Back off from 2 us up to 1 ms instead of sleeping a flat 1 ms per poll.
++  // Derivation: a flat 1 ms floor costs ~1 ms on EVERY wait that is not already
++  // complete. At ~205 launches/step and ~3.1 waits/kernel that is ~640 waits/step;
++  // if ~46% of them sleep once, that is ~292 ms/step of pure sleep, which is what
++  // we measured: 36 -> 328 ms/step on a 1024^2 PPC1 deck (a 9x wall regression).
++  // Metal command buffers typically retire in tens of microseconds, so starting at
++  // 2 us and doubling keeps the common case in the microsecond range, while the
++  // 1 ms cap bounds wakeups for genuinely long waits. Deadline semantics unchanged.
++  auto backoff = std::chrono::microseconds{2};
++  const auto max_backoff = std::chrono::microseconds{1000};
++  int spins = 0;
++  constexpr int max_spins = 256;
+   while (status != MTL::CommandBufferStatusCompleted &&
+          status != MTL::CommandBufferStatusError) {
+     if (std::chrono::steady_clock::now() >= deadline) {
+@@ -438,7 +450,22 @@ result wait_for_metal_command_buffer(MTL::CommandBuffer* command_buffer,
+               << metal_command_buffer_status_name(status);
+       return make_error(__acpp_here(), error_info{message.str()});
+     }
+-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
++    // Phase 1: yield-spin. Measured residual under pure backoff was ~30 us/wait
++    // (19.4 ms/step over ~640 waits/step), which is just the 2+4+8+16 geometric
++    // sum needed to cover a typical ~30 us command-buffer retirement. A yield
++    // costs well under a microsecond, so ~256 of them cover that same window at
++    // far finer granularity than a 2 us sleep floor can. Phase 2: fall back to
++    // the exponential backoff for genuinely long waits so we do not burn a core.
++    if (spins < max_spins) {
++      ++spins;
++      std::this_thread::yield();
++    } else {
++      std::this_thread::sleep_for(backoff);
++      if (backoff < max_backoff) {
++        backoff *= 2;
++        if (backoff > max_backoff) { backoff = max_backoff; }
++      }
++    }
+     status = command_buffer->status();
+   }
+ 

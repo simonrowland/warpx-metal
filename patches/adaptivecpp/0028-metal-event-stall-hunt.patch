@@ -1,0 +1,24 @@
+diff --git a/src/runtime/metal/metal_event.cpp b/src/runtime/metal/metal_event.cpp
+--- a/src/runtime/metal/metal_event.cpp
++++ b/src/runtime/metal/metal_event.cpp
+@@ -17,6 +17,9 @@
+ #include <sstream>
+ #include <thread>
+ 
++// stall-hunt trampoline (defined in metal_queue.cpp)
++extern "C" void stall_hunt_note_host_wait_c(void* evt, unsigned long long want, int spin_sec);
++
+ namespace hipsycl {
+ namespace rt {
+ 
+@@ -46,7 +49,10 @@
+ 
+   const auto deadline =
+       std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
++  int spin_sec = 0;
+   while (!_handle.event->waitUntilSignaledValue(_handle.value, 1000)) {
++    ++spin_sec;
++    stall_hunt_note_host_wait_c(_handle.event, static_cast<unsigned long long>(_handle.value), spin_sec);
+     if (std::chrono::steady_clock::now() >= deadline) {
+       std::ostringstream message;
+       message << "metal_node_event: timed out after " << timeout_ms

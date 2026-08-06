@@ -1,0 +1,253 @@
+Subject: [PATCH] Metal: add process helpers for isolated offline compile
+
+metal_process_utils.hpp is untracked in the measured tree and never shipped in
+the published patch series. Offline metallib compilation and the JIT guard need
+stable helpers for process-group management, command capture, and resource
+accounting when spawning metal/metallib via xcrun.
+
+Add the header as it appears in the measured tree so later residual patches can
+include and call it without inventing a parallel API.
+
+Source reproduction only: this patch was not compile-verified here.
+
+diff --git a/include/hipSYCL/runtime/metal/metal_process_utils.hpp b/include/hipSYCL/runtime/metal/metal_process_utils.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/hipSYCL/runtime/metal/metal_process_utils.hpp
+@@ -0,0 +1,236 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#pragma once
++
++#include <fcntl.h>
++#include <spawn.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++extern char** environ;
++
++namespace hipsycl {
++namespace rt {
++namespace metal_process {
++
++enum class spawn_failure_injection {
++  none,
++  attr_init,
++  attr_setflags,
++  attr_setpgroup,
++  file_actions_init,
++  file_actions_addclose,
++  pgid_mismatch
++};
++
++struct child_process {
++  pid_t pid = -1;
++  pid_t pgid = -1;
++  bool group_verified = false;
++};
++
++inline bool wait_until_reaped(child_process& child, int& status,
++                              std::chrono::milliseconds timeout) {
++  const auto deadline = std::chrono::steady_clock::now() + timeout;
++  while (child.pid > 0) {
++    const pid_t waited = ::waitpid(child.pid, &status, WNOHANG);
++    if (waited == child.pid || (waited < 0 && errno == ECHILD)) {
++      child.pid = -1;
++      return true;
++    }
++    if (waited < 0 && errno != EINTR) {
++      return false;
++    }
++    if (std::chrono::steady_clock::now() >= deadline) {
++      return false;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds{10});
++  }
++  return true;
++}
++
++inline bool terminate_and_reap(child_process& child, int& status) {
++  if (child.pid <= 0) {
++    return true;
++  }
++
++  const pid_t direct_child = child.pid;
++  if (child.group_verified && child.pgid == direct_child) {
++    ::kill(-child.pgid, SIGTERM);
++  }
++  // Direct signaling is the required fallback if group setup or lookup failed.
++  ::kill(direct_child, SIGTERM);
++  // Do not reap the leader during the TERM grace period. Its unreaped PID
++  // prevents PGID reuse while we escalate any surviving descendants.
++  std::this_thread::sleep_for(std::chrono::milliseconds{500});
++  if (child.group_verified && child.pgid == direct_child) {
++    ::kill(-child.pgid, SIGKILL);
++  }
++  ::kill(direct_child, SIGKILL);
++  return wait_until_reaped(child, status, std::chrono::milliseconds{1500});
++}
++
++inline bool spawn_in_own_process_group(
++    const std::vector<std::string>& owned_args, child_process& child,
++    std::string& error, int stdout_fd = -1, bool silence_stderr = false,
++    spawn_failure_injection injection = spawn_failure_injection::none,
++    const std::vector<int>& close_fds = {}) {
++  if (owned_args.empty() || owned_args.front().empty()) {
++    error = "empty process command";
++    return false;
++  }
++
++  std::vector<char*> argv;
++  argv.reserve(owned_args.size() + 1);
++  for (const std::string& arg : owned_args) {
++    argv.push_back(const_cast<char*>(arg.c_str()));
++  }
++  argv.push_back(nullptr);
++
++  posix_spawnattr_t attributes;
++  int status = injection == spawn_failure_injection::attr_init
++                   ? EINVAL
++                   : ::posix_spawnattr_init(&attributes);
++  if (status != 0) {
++    error = "posix_spawnattr_init failed: " + std::string{std::strerror(status)};
++    return false;
++  }
++
++  posix_spawn_file_actions_t actions;
++  bool actions_initialized = false;
++  auto destroy_setup = [&]() -> int {
++    int first_error = 0;
++    if (actions_initialized) {
++      const int action_status = ::posix_spawn_file_actions_destroy(&actions);
++      if (action_status != 0) {
++        first_error = action_status;
++      }
++    }
++    const int attr_status = ::posix_spawnattr_destroy(&attributes);
++    return first_error != 0 ? first_error : attr_status;
++  };
++
++  const short flags = POSIX_SPAWN_SETPGROUP;
++  status = injection == spawn_failure_injection::attr_setflags
++               ? EINVAL
++               : ::posix_spawnattr_setflags(&attributes, flags);
++  if (status == 0) {
++    status = injection == spawn_failure_injection::attr_setpgroup
++                 ? EINVAL
++                 : ::posix_spawnattr_setpgroup(&attributes, 0);
++  }
++  if (status != 0) {
++    const int destroy_status = destroy_setup();
++    error = "posix_spawnattr setup failed: " + std::string{std::strerror(status)};
++    if (destroy_status != 0) {
++      error += "; destroy failed: " + std::string{std::strerror(destroy_status)};
++    }
++    return false;
++  }
++
++  status = injection == spawn_failure_injection::file_actions_init
++               ? EINVAL
++               : ::posix_spawn_file_actions_init(&actions);
++  if (status == 0) {
++    actions_initialized = true;
++  }
++  if (status == 0 && stdout_fd >= 0) {
++    status = ::posix_spawn_file_actions_adddup2(&actions, stdout_fd,
++                                                STDOUT_FILENO);
++    if (status == 0 && stdout_fd != STDOUT_FILENO) {
++      status = ::posix_spawn_file_actions_addclose(&actions, stdout_fd);
++    }
++  }
++  if (status == 0 && silence_stderr) {
++    status = ::posix_spawn_file_actions_addopen(
++        &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
++  }
++  if (status == 0 &&
++      injection == spawn_failure_injection::file_actions_addclose) {
++    status = EINVAL;
++  }
++  for (int fd : close_fds) {
++    if (status == 0 && fd > STDERR_FILENO) {
++      status = ::posix_spawn_file_actions_addclose(&actions, fd);
++    }
++  }
++  if (status != 0) {
++    const int destroy_status = destroy_setup();
++    error = "posix_spawn file-action setup failed: " +
++            std::string{std::strerror(status)};
++    if (destroy_status != 0) {
++      error += "; destroy failed: " + std::string{std::strerror(destroy_status)};
++    }
++    return false;
++  }
++
++  // The PGID-mismatch injection deliberately omits SETPGROUP. The verifier
++  // below must reject and directly reap that child without group-signaling.
++  if (injection == spawn_failure_injection::pgid_mismatch) {
++    status = ::posix_spawnattr_setflags(&attributes, 0);
++    if (status != 0) {
++      const int destroy_status = destroy_setup();
++      error = "posix_spawnattr injection setup failed: " +
++              std::string{std::strerror(status)};
++      if (destroy_status != 0) {
++        error += "; destroy failed: " +
++                 std::string{std::strerror(destroy_status)};
++      }
++      return false;
++    }
++  }
++
++  pid_t spawned_pid = -1;
++  const int spawn_status = ::posix_spawn(
++      &spawned_pid, owned_args.front().c_str(), &actions, &attributes,
++      argv.data(), ::environ);
++  const int destroy_status = destroy_setup();
++  if (spawn_status != 0) {
++    error = "posix_spawn failed: " + std::string{std::strerror(spawn_status)};
++    if (destroy_status != 0) {
++      error += "; destroy failed: " + std::string{std::strerror(destroy_status)};
++    }
++    return false;
++  }
++
++  child.pid = spawned_pid;
++  if (destroy_status != 0) {
++    int child_status = 0;
++    terminate_and_reap(child, child_status);
++    error = "posix_spawn setup destroy failed: " +
++            std::string{std::strerror(destroy_status)};
++    return false;
++  }
++
++  const pid_t observed_pgid = ::getpgid(spawned_pid);
++  if (observed_pgid != spawned_pid) {
++    int child_status = 0;
++    terminate_and_reap(child, child_status);
++    error = observed_pgid < 0
++                ? "getpgid(child) failed: " + std::string{std::strerror(errno)}
++                : "compiler child did not become its own process-group leader";
++    return false;
++  }
++
++  child.pgid = observed_pgid;
++  child.group_verified = true;
++  return true;
++}
++
++} // namespace metal_process
++} // namespace rt
++} // namespace hipsycl

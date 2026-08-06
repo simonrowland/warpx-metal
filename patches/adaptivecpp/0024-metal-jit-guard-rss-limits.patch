@@ -1,0 +1,445 @@
+Subject: [PATCH] Metal: expand JIT guard with compiler RSS and process limits
+
+The published 0008 metal_jit_guard is a thin compile mutex. The measured tree
+grows it into a process-aware guard: attribute MTLCompilerService RSS, enforce
+compiler memory ceilings, poll metal/metallib child processes, and fail closed
+(exit 86) when the offline toolchain footprint exceeds the safe limit.
+
+Without this, concurrent offline metallib compiles can exhaust host memory and
+wedge the measurement host. Env knobs (compiler memory limit, poll interval)
+match the measured tree.
+
+Source reproduction only: this patch was not compile-verified here.
+
+diff --git a/include/hipSYCL/runtime/metal/metal_jit_guard.hpp b/include/hipSYCL/runtime/metal/metal_jit_guard.hpp
+--- a/include/hipSYCL/runtime/metal/metal_jit_guard.hpp
++++ b/include/hipSYCL/runtime/metal/metal_jit_guard.hpp
+@@ -10,18 +10,35 @@
+ 
+ #include "hipSYCL/runtime/error.hpp"
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cerrno>
+ #include <chrono>
++#include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <cstdio>
+ #include <mutex>
++#include <sstream>
++#include <string>
+ #include <thread>
++#include <unordered_map>
++#include <vector>
++
++#ifdef __APPLE__
++#include <libproc.h>
++#include <signal.h>
++#include <sys/types.h>
++#include <unistd.h>
++#endif
+ 
+ namespace hipsycl {
+ namespace rt {
+ namespace metal_jit_guard {
+ 
++inline constexpr std::size_t default_compiler_memory_limit_mb = 1024;
+ inline constexpr std::size_t default_compile_yield_ms = 20;
++inline constexpr std::size_t default_poll_interval_ms = 50;
+ inline constexpr std::size_t default_postcheck_ms = 1000;
+ 
+ inline std::size_t read_size_env(const char* name, std::size_t fallback) {
+@@ -39,8 +56,18 @@
+   return static_cast<std::size_t>(parsed);
+ }
+ 
++inline std::size_t compiler_memory_limit_mb() {
++  return read_size_env("ACPP_METAL_MAX_COMPILER_MEM_MB",
++                       default_compiler_memory_limit_mb);
++}
++
+ inline std::size_t compile_yield_ms() {
+   return read_size_env("ACPP_METAL_JIT_YIELD_MS", default_compile_yield_ms);
++}
++
++inline std::size_t poll_interval_ms() {
++  return read_size_env("ACPP_METAL_COMPILER_MEM_POLL_MS",
++                       default_poll_interval_ms);
+ }
+ 
+ inline std::size_t postcheck_ms() {
+@@ -53,36 +80,363 @@
+   return mutex;
+ }
+ 
++struct compiler_service_rss_state {
++  std::size_t rss_bytes = 0;
++  std::uint64_t start_identity = 0;
++};
++
++using rss_by_pid = std::unordered_map<int, compiler_service_rss_state>;
++
++inline std::size_t compiler_service_attributable_rss(
++    int pid, const compiler_service_rss_state& current,
++    const rss_by_pid& service_baseline, rss_by_pid& service_low_water) {
++  auto baseline = service_baseline.find(pid);
++  if (baseline == service_baseline.end() || current.start_identity == 0 ||
++      baseline->second.start_identity == 0 ||
++      baseline->second.start_identity != current.start_identity) {
++    // New PID, reused PID, or missing identity: continuity is unproven, so
++    // conservatively count the service's full current RSS.
++    return current.rss_bytes;
++  }
++
++  auto low_water = service_low_water.find(pid);
++  if (low_water == service_low_water.end() ||
++      low_water->second.start_identity != current.start_identity) {
++    low_water = service_low_water.emplace(pid, baseline->second).first;
++  }
++  low_water->second.rss_bytes =
++      std::min(low_water->second.rss_bytes, current.rss_bytes);
++  // Derivation: for a proven-continuous service identity, candidate RSS is
++  // current minus the lowest RSS observed in this compile scope. This catches
++  // shrink-then-regrow that a fixed start baseline would hide.
++  return current.rss_bytes > low_water->second.rss_bytes
++             ? current.rss_bytes - low_water->second.rss_bytes
++             : 0;
++}
++
++struct compiler_rss_sample {
++  std::size_t process_group_bytes = 0;
++  std::size_t compiler_service_delta_bytes = 0;
++
++  std::size_t combined_bytes() const {
++    return process_group_bytes + compiler_service_delta_bytes;
++  }
++};
++
++inline rss_by_pid mtl_compiler_service_rss_by_pid() {
++  rss_by_pid services;
++#ifdef __APPLE__
++  std::vector<pid_t> pids(4096);
++  int bytes = 0;
++  for (int attempt = 0; attempt < 3; ++attempt) {
++    bytes = proc_listpids(PROC_ALL_PIDS, 0, pids.data(),
++                          static_cast<int>(pids.size() * sizeof(pid_t)));
++    if (bytes < 0) {
++      return services;
++    }
++    if (static_cast<std::size_t>(bytes) < pids.size() * sizeof(pid_t)) {
++      break;
++    }
++    pids.resize(pids.size() * 2);
++  }
++
++  const std::size_t count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
++  for (std::size_t i = 0; i < count; ++i) {
++    if (pids[i] <= 0) {
++      continue;
++    }
++
++    char name[PROC_PIDPATHINFO_MAXSIZE] = {};
++    if (proc_name(pids[i], name, sizeof(name)) <= 0) {
++      continue;
++    }
++    if (std::strcmp(name, "MTLCompilerService") != 0) {
++      continue;
++    }
++
++    struct proc_taskinfo task_info = {};
++    if (proc_pidinfo(pids[i], PROC_PIDTASKINFO, 0, &task_info,
++                     sizeof(task_info)) == sizeof(task_info)) {
++      struct proc_bsdinfo process_info = {};
++      std::uint64_t start_identity = 0;
++      if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &process_info,
++                       sizeof(process_info)) == sizeof(process_info)) {
++        start_identity =
++            static_cast<std::uint64_t>(process_info.pbi_start_tvsec) *
++                1000000ULL +
++            static_cast<std::uint64_t>(process_info.pbi_start_tvusec);
++      }
++      services[pids[i]] = {
++          static_cast<std::size_t>(task_info.pti_resident_size),
++          start_identity};
++    }
++  }
++#endif
++  return services;
++}
++
++inline const rss_by_pid& process_start_mtl_compiler_service_baseline() {
++  // Captured once on this backend's first compile scope. Every later scope
++  // measures service growth against the same per-process baseline so retained
++  // compiler memory cannot disappear by resetting the baseline per kernel.
++  static const rss_by_pid baseline = mtl_compiler_service_rss_by_pid();
++  return baseline;
++}
++
++inline compiler_rss_sample compiler_rss_bytes(
++    int compiler_pgid, const rss_by_pid& service_baseline,
++    rss_by_pid& service_low_water) {
++  compiler_rss_sample sample;
++#ifdef __APPLE__
++  std::vector<pid_t> pids(4096);
++  int bytes = 0;
++  for (int attempt = 0; attempt < 3; ++attempt) {
++    bytes = proc_listpids(PROC_ALL_PIDS, 0, pids.data(),
++                          static_cast<int>(pids.size() * sizeof(pid_t)));
++    if (bytes < 0) {
++      return sample;
++    }
++    if (static_cast<std::size_t>(bytes) < pids.size() * sizeof(pid_t)) {
++      break;
++    }
++    pids.resize(pids.size() * 2);
++  }
++
++  const std::size_t count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
++  for (std::size_t i = 0; i < count; ++i) {
++    const pid_t pid = pids[i];
++    if (pid <= 0) {
++      continue;
++    }
++
++    char name[PROC_PIDPATHINFO_MAXSIZE] = {};
++    if (proc_name(pid, name, sizeof(name)) <= 0) {
++      continue;
++    }
++
++    struct proc_taskinfo task_info = {};
++    if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &task_info,
++                     sizeof(task_info)) != sizeof(task_info)) {
++      continue;
++    }
++    const std::size_t rss =
++        static_cast<std::size_t>(task_info.pti_resident_size);
++
++    if (compiler_pgid > 0 &&
++        (std::strcmp(name, "metal") == 0 ||
++         std::strcmp(name, "metallib") == 0) &&
++        getpgid(pid) == compiler_pgid) {
++      sample.process_group_bytes += rss;
++    } else if (std::strcmp(name, "MTLCompilerService") == 0) {
++      struct proc_bsdinfo process_info = {};
++      std::uint64_t start_identity = 0;
++      if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &process_info,
++                       sizeof(process_info)) == sizeof(process_info)) {
++        start_identity =
++            static_cast<std::uint64_t>(process_info.pbi_start_tvsec) *
++                1000000ULL +
++            static_cast<std::uint64_t>(process_info.pbi_start_tvusec);
++      }
++      sample.compiler_service_delta_bytes +=
++          compiler_service_attributable_rss(
++              pid, {rss, start_identity}, service_baseline,
++              service_low_water);
++    }
++  }
++#else
++  (void)compiler_pgid;
++  (void)service_baseline;
++  (void)service_low_water;
++#endif
++  return sample;
++}
++
++inline std::size_t bytes_to_mb_ceil(std::size_t bytes) {
++  constexpr std::size_t one_mb = 1024 * 1024;
++  return (bytes + one_mb - 1) / one_mb;
++}
++
++inline std::string make_limit_message(const char* phase,
++                                      std::size_t rss_mb,
++                                      std::size_t limit_mb,
++                                      std::size_t submitted_source_bytes) {
++  std::ostringstream os;
++  os << "AdaptiveCpp Metal: compiler footprint exceeded safe limit ("
++     << rss_mb << " MB >= " << limit_mb << " MB) during " << phase
++     << " - deck too large for this GPU/driver; reduce kernels/resolution "
++        "or raise ACPP_METAL_MAX_COMPILER_MEM_MB at your own risk";
++  if (submitted_source_bytes != 0) {
++    os << " (submitted Metal source bytes=" << submitted_source_bytes << ")";
++  }
++  return os.str();
++}
++
++inline result check_compiler_memory_limit(
++    const char* phase, int compiler_pgid,
++    const rss_by_pid& service_baseline,
++    rss_by_pid& service_low_water,
++    std::size_t submitted_source_bytes = 0) {
++  const std::size_t limit_mb = compiler_memory_limit_mb();
++  if (limit_mb == 0) {
++    return make_success();
++  }
++
++  const std::size_t rss_mb = bytes_to_mb_ceil(
++      compiler_rss_bytes(compiler_pgid, service_baseline, service_low_water)
++          .combined_bytes());
++  if (rss_mb >= limit_mb) {
++    return make_error(
++        __acpp_here(),
++        error_info{
++            make_limit_message(phase, rss_mb, limit_mb,
++                               submitted_source_bytes)});
++  }
++  return make_success();
++}
++
++[[noreturn]] inline void fail_process_for_compiler_memory_limit(
++    const char* phase, std::size_t rss_mb, std::size_t limit_mb,
++    std::size_t submitted_source_bytes) {
++  const std::string message =
++      make_limit_message(phase, rss_mb, limit_mb, submitted_source_bytes);
++  std::fprintf(stderr, "%s\n", message.c_str());
++  std::fflush(stderr);
++  std::_Exit(86);
++}
++
+ class scoped_compile {
+ public:
+-  scoped_compile(const char* phase, std::size_t submitted_source_bytes = 0)
++  scoped_compile(const char* phase, std::size_t submitted_source_bytes = 0,
++                 bool enabled = true)
+       : _phase{phase}, _submitted_source_bytes{submitted_source_bytes},
+-        _lock{compile_mutex()} {}
++        _enabled{enabled} {
++    if (!_enabled) {
++      return;
++    }
++    _lock = std::unique_lock<std::mutex>{compile_mutex()};
++    _service_baseline = process_start_mtl_compiler_service_baseline();
++    _service_low_water = _service_baseline;
++    const std::size_t limit_mb = compiler_memory_limit_mb();
++    if (limit_mb != 0) {
++      _monitor = std::thread{[this, limit_mb]() {
++        const std::chrono::milliseconds poll{
++            std::max<std::size_t>(poll_interval_ms(), 10)};
++        while (!_done.load(std::memory_order_acquire)) {
++          std::this_thread::sleep_for(poll);
++          const int compiler_pgid = _compiler_pgid.load(
++              std::memory_order_acquire);
++          const std::size_t rss_mb =
++              bytes_to_mb_ceil(sample_compiler_rss(compiler_pgid)
++                                   .combined_bytes());
++          if (rss_mb >= limit_mb) {
++            _observed_rss_mb.store(rss_mb, std::memory_order_release);
++            _limit_exceeded.store(true, std::memory_order_release);
++#ifdef __APPLE__
++            if (compiler_pgid > 0) {
++              // The waitpid owner reaps the group leader after this signal.
++              // Negative PID targets only the compiler PGID, never WarpX.
++              ::kill(-compiler_pgid, SIGTERM);
++            }
++#endif
++            // The waitpid owner performs bounded TERM->KILL->reap. Never
++            // _Exit from the monitor: that could orphan the compiler group.
++            break;
++          }
++        }
++      }};
++    }
++  }
+ 
+   scoped_compile(const scoped_compile&) = delete;
+   scoped_compile& operator=(const scoped_compile&) = delete;
+ 
+   ~scoped_compile() {
+-    const std::size_t yield_ms = compile_yield_ms();
+-    if (yield_ms != 0) {
+-      std::this_thread::sleep_for(std::chrono::milliseconds{yield_ms});
+-    }
+-  }
+-
+-  result check(const char* phase) const {
+-    if (phase && std::strncmp(phase, "after ", 6) == 0) {
++    _done.store(true, std::memory_order_release);
++    if (_monitor.joinable()) {
++      _monitor.join();
++    }
++
++  }
++
++  void set_compiler_process_group(int pgid) {
++    _compiler_pgid.store(pgid, std::memory_order_release);
++  }
++
++  void clear_compiler_process_group() {
++    _compiler_pgid.store(0, std::memory_order_release);
++  }
++
++  bool limit_exceeded() const {
++    return _limit_exceeded.load(std::memory_order_acquire);
++  }
++
++  result check(const char* phase, bool compiler_activity = false) {
++    if (!_enabled) {
++      return make_success();
++    }
++    if (compiler_activity) {
++      const std::size_t yield_ms = compile_yield_ms();
++      if (yield_ms != 0) {
++        std::this_thread::sleep_for(std::chrono::milliseconds{yield_ms});
++      }
+       const std::size_t settle_ms = postcheck_ms();
+       if (settle_ms != 0) {
+         std::this_thread::sleep_for(std::chrono::milliseconds{settle_ms});
+       }
++      const char* offline =
++          std::getenv("ACPP_METAL_ENABLE_OFFLINE_METALLIB");
++      const char* archive =
++          std::getenv("ACPP_METAL_ENABLE_BINARY_ARCHIVE");
++      if ((offline && std::string{offline} == "1") ||
++          (archive && std::string{archive} == "1")) {
++        std::fprintf(
++            stderr,
++            "ACPP_METAL_AOT compiler-settle yield_ms=%zu settle_ms=%zu\n",
++            yield_ms, settle_ms);
++      }
++    }
++    if (limit_exceeded()) {
++      return make_error(
++          __acpp_here(),
++          error_info{make_limit_message(
++              phase, _observed_rss_mb.load(std::memory_order_acquire),
++              compiler_memory_limit_mb(), _submitted_source_bytes)});
++    }
++    const std::size_t limit_mb = compiler_memory_limit_mb();
++    if (limit_mb == 0) {
++      return make_success();
++    }
++    const std::size_t rss_mb = bytes_to_mb_ceil(
++        sample_compiler_rss(_compiler_pgid.load(std::memory_order_acquire))
++            .combined_bytes());
++    if (rss_mb >= limit_mb) {
++      return make_error(
++          __acpp_here(),
++          error_info{make_limit_message(phase, rss_mb, limit_mb,
++                                        _submitted_source_bytes)});
+     }
+     return make_success();
+   }
+ 
+ private:
++  compiler_rss_sample sample_compiler_rss(int compiler_pgid) {
++    std::lock_guard<std::mutex> lock{_rss_state_mutex};
++    return compiler_rss_bytes(compiler_pgid, _service_baseline,
++                              _service_low_water);
++  }
++
+   const char* _phase;
+   std::size_t _submitted_source_bytes;
++  bool _enabled;
++  std::atomic<bool> _done{false};
++  std::atomic<bool> _limit_exceeded{false};
++  std::atomic<std::size_t> _observed_rss_mb{0};
++  std::atomic<int> _compiler_pgid{0};
+   std::unique_lock<std::mutex> _lock;
++  rss_by_pid _service_baseline;
++  rss_by_pid _service_low_water;
++  std::mutex _rss_state_mutex;
++  std::thread _monitor;
+ };
+ 
+ } // namespace metal_jit_guard

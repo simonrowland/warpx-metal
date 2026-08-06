@@ -16,7 +16,7 @@ echo "=== Step 1: Clone AdaptiveCpp ==="
 # Pinned develop revision the patches in patches/adaptivecpp/ are generated
 # against. Newer develop commits have upstreamed parts of this work (e.g. the
 # PointerTranslation passes), so the patches no longer apply at tip.
-ACPP_REV="3733a5655103a75c09d81e2ba6b519d15896551f"
+ACPP_REV="4fe52accc3dca8640f2fbcc80dfd260a51fc2fd8"
 
 if [ -d "${ACPP_SOURCE_DIR}/.git" ]; then
     echo "  [OK] AdaptiveCpp already cloned at ${ACPP_SOURCE_DIR}"
