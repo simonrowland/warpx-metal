@@ -79,12 +79,42 @@ LLVM 20 builds AdaptiveCpp. LLVM 18 supplies `ld64.lld`, which the LLVM 20
 Homebrew bottle does not. The script also downloads Apple `metal-cpp` headers
 under the package prefix.
 
-The ordinary AdaptiveCpp JIT build does **not** need Apple's separately
-downloaded Metal offline compiler component. A machine without it can still run
-the deployed GPU binaries and perform ordinary JIT builds; missing
-`metal`/`metallib` is a warning, not a blocker for this install. Offline
-`.metallib`/AOT work is a separate procedure and does require the component,
-installed with `xcodebuild -downloadComponent MetalToolchain`.
+> **★ Install the Metal Toolchain before building, or the resulting binary will
+> be about twice as slow.**
+>
+> `xcodebuild -downloadComponent MetalToolchain`
+>
+> A build *without* it still succeeds and still runs correctly — which is the
+> problem, because nothing about the slow binary looks wrong. With the component
+> present, AdaptiveCpp compiles kernels ahead of time with Apple's `metal`
+> compiler and loads them as `.metallib`; without it, kernels go through the
+> runtime SSCP JIT path instead, and Apple's compiler produces materially better
+> device code.
+>
+> Measured on one host, one deck (3D 96×96×320 PPC1, single box), identical
+> runtime environment, differing only in whether the binary was built with the
+> component available:
+>
+> | build | steady per-step | first step (compile) |
+> |---|---:|---:|
+> | with Metal Toolchain (AOT `.metallib`) | **~24 ms** | ~14 s |
+> | without (runtime JIT) | **~51 ms** | ~57 s |
+>
+> The per-step gap is sustained, not a warm-up artifact: the JIT build stays flat
+> near 51 ms through step 999. Both builds produce identical particle counts, so
+> correctness is unaffected — only speed.
+>
+> Confirm the component resolves before building:
+>
+> ```bash
+> xcrun -f metal
+> ```
+>
+> Then confirm at runtime that the ahead-of-time path is actually being used, by
+> setting `ACPP_METAL_ENABLE_OFFLINE_METALLIB=1` and checking the run log for
+> `ACPP_METAL_AOT` lines — `metallib-cache-load=hit` means it is working. **No
+> such lines means the binary has no ahead-of-time support compiled in**, and you
+> are on the slow path regardless of the environment variable.
 
 Suggested policy when installing across several machines:
 
