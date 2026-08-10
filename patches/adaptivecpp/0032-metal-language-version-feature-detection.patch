@@ -1,0 +1,77 @@
+Metal: detect LanguageVersion4_0 from the selected headers
+
+The macOS 15 metal-cpp bundle published by Apple stops at
+LanguageVersion3_2, while newer headers on some build hosts expose
+LanguageVersion4_0. Patch 0026 made the latter unconditional, so a clean
+package build fails against the headers installed by 00-install-deps.sh.
+
+metal-cpp provides LanguageVersion4_0 as an enum value, not a feature macro.
+Probe the selected METAL_INCLUDE_DIR by compiling a reference to that enum,
+then expose the result only as a private rt-backend-metal definition. The
+runtime JIT path requests 4.0 when the selected headers support it and falls
+back to 3.2 otherwise. Re-run the probe on every configure so a reused build
+directory cannot retain a result from a different header bundle.
+
+This does not change the ahead-of-time metallib path, whose language version
+is selected by Apple's metal compiler rather than MTL::CompileOptions.
+
+diff --git a/src/runtime/CMakeLists.txt b/src/runtime/CMakeLists.txt
+index 02c01bb3..9182032c 100644
+--- a/src/runtime/CMakeLists.txt
++++ b/src/runtime/CMakeLists.txt
+@@ -411,6 +411,25 @@ if (WITH_METAL_BACKEND)
+   if(NOT METAL_INCLUDE_DIR)
+     message(FATAL_ERROR "Could not find Metal/Metal.hpp. Please specify METAL_INCLUDE_DIR.")
+   endif()
++
++  # metal-cpp publishes LanguageVersion4_0 as an enum value, not a feature
++  # macro. Compile against the selected headers so older bundles can fall back
++  # to LanguageVersion3_2 while newer headers retain the 4_0 runtime JIT path.
++  include(CheckCXXSourceCompiles)
++  include(CMakePushCheckState)
++  cmake_push_check_state(RESET)
++  set(CMAKE_REQUIRED_INCLUDES "${METAL_INCLUDE_DIR}")
++  set(CMAKE_REQUIRED_FLAGS "-fblocks")
++  unset(ACPP_METAL_HAS_LANGUAGEVERSION_4_0 CACHE)
++  check_cxx_source_compiles([=[
++    #include <Metal/Metal.hpp>
++    int main() {
++      const auto version = MTL::LanguageVersion4_0;
++      (void)version;
++      return 0;
++    }
++  ]=] ACPP_METAL_HAS_LANGUAGEVERSION_4_0)
++  cmake_pop_check_state()
+ 
+   add_library(rt-backend-metal SHARED
+     metal/metal_backend.cpp
+@@ -427,6 +446,13 @@ if (WITH_METAL_BACKEND)
+     )
+ 
+   target_compile_definitions(rt-backend-metal PRIVATE -DHIPSYCL_WITH_SSCP_COMPILER)
++  if(ACPP_METAL_HAS_LANGUAGEVERSION_4_0)
++    target_compile_definitions(rt-backend-metal PRIVATE
++      ACPP_METAL_HAS_LANGUAGEVERSION_4_0)
++    message(STATUS "Metal runtime JIT language version: 4.0")
++  else()
++    message(STATUS "Metal runtime JIT language version: 3.2")
++  endif()
+   target_compile_options(rt-backend-metal PRIVATE -fblocks)
+   target_link_libraries(rt-backend-metal PRIVATE llvm-to-metal)
+ 
+diff --git a/src/runtime/metal/metal_code_object.cpp b/src/runtime/metal/metal_code_object.cpp
+index 61c0ccac..b4fcc6d3 100644
+--- a/src/runtime/metal/metal_code_object.cpp
++++ b/src/runtime/metal/metal_code_object.cpp
+@@ -497,7 +497,11 @@ result build_metal_library_from_source(MTL::Library*& library,
+   }
+ 
+   NS::SharedPtr<MTL::CompileOptions> options = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
++#ifdef ACPP_METAL_HAS_LANGUAGEVERSION_4_0
+   options->setLanguageVersion(MTL::LanguageVersion4_0);
++#else
++  options->setLanguageVersion(MTL::LanguageVersion3_2);
++#endif
+   options->setOptimizationLevel(MTL::LibraryOptimizationLevel::LibraryOptimizationLevelSize);
+ 
+   NS::String* sourceString = NS::String::string(source.c_str(),
