@@ -10,9 +10,9 @@
 >
 > The validated patch payload is:
 >
-> - `patches/warpx/` — `0001`, `0003`, `0004`, `0005`, `0006`, `0007`
+> - `patches/warpx/` — `0001`, `0003`, `0004`, `0005`, `0006`, `0007`, `0008`, `0009`
 > - `patches/amrex-post/` — `0004`, `0005`, `0006`
-> - `patches/adaptivecpp/` — `0008`, `0018`–`0020`, `0022`, `0023`–`0032`
+> - `patches/adaptivecpp/` — `0008`, `0018`–`0020`, `0022`, `0023`–`0033`
 > - `patches/amrex/` — three replacement source files, not patches
 >
 > The numbering gaps are deliberate: retired patches keep their numbers rather
@@ -133,7 +133,7 @@ Run this on the build host. `PREFIX` must not already exist.
 ```bash
 export PREFIX=/Applications/warpx-metal-prod-20260728
 export FORK_URL=https://github.com/simonrowland/warpx-metal.git
-export EXPECTED_PATCH_PAYLOAD_SHA256=0b34549f0a029584dc254c288ed666054224890132e7ba915d6f2769a7aeed3e
+export EXPECTED_PATCH_PAYLOAD_SHA256=bd622de06e835a4e1021447f4ee875b5273457fa01deb8026ea63b5b341ebead
 
 test ! -e "$PREFIX"
 git ls-remote --exit-code "$FORK_URL" HEAD

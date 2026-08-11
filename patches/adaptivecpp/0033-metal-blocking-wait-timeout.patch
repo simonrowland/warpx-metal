@@ -1,0 +1,1315 @@
+Metal: use validated timeouts for blocking completion waits
+
+Replace command-buffer status polling with completion-handler blocking waits while
+keeping timeout failures sticky. Shared-event waits now use an absolute steady-
+clock deadline and clamp every Metal wait to the remaining API-granularity
+budget.
+
+Use one validated timeout accessor for both paths. Signed, malformed, zero,
+overflowing, and policy-excess values are rejected with a warning and fall back
+to the 120000 ms default; the policy maximum is 24 hours.
+
+Add parser and cached-accessor boundary tests, plus deterministic failure-sink
+tests proving timeout and command-buffer error results remain sticky for later
+waits. An Apple-only integration test drives an unsignaled shared event through
+the production event-wait implementation, checks the retained registered error,
+and exercises the real Metal command-buffer error-status mapping.
+
+
+diff --git a/include/hipSYCL/runtime/metal/metal_command_buffer_status.hpp b/include/hipSYCL/runtime/metal/metal_command_buffer_status.hpp
+new file mode 100644
+index 0000000..cfc92d4
+--- /dev/null
++++ b/include/hipSYCL/runtime/metal/metal_command_buffer_status.hpp
+@@ -0,0 +1,40 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * Copyright The AdaptiveCpp Contributors
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#ifndef HIPSYCL_METAL_COMMAND_BUFFER_STATUS_HPP
++#define HIPSYCL_METAL_COMMAND_BUFFER_STATUS_HPP
++
++#include "metal_wait_result.hpp"
++
++#include <Metal/Metal.hpp>
++
++namespace hipsycl {
++namespace rt {
++
++inline bool metal_command_buffer_status_is_error(
++    MTL::CommandBufferStatus status) {
++  return status == MTL::CommandBufferStatusError;
++}
++
++template <class TimeoutFailureFactory, class ErrorFailureFactory>
++result capture_metal_command_buffer_wait_result(
++    const std::shared_ptr<metal_async_error_state>& state, bool completed,
++    MTL::CommandBufferStatus status, TimeoutFailureFactory&& timeout_failure,
++    ErrorFailureFactory&& error_failure) {
++  return capture_metal_command_buffer_wait_result(
++      state, completed, metal_command_buffer_status_is_error(status),
++      std::forward<TimeoutFailureFactory>(timeout_failure),
++      std::forward<ErrorFailureFactory>(error_failure));
++}
++
++} // namespace rt
++} // namespace hipsycl
++
++#endif // HIPSYCL_METAL_COMMAND_BUFFER_STATUS_HPP
+diff --git a/include/hipSYCL/runtime/metal/metal_queue.hpp b/include/hipSYCL/runtime/metal/metal_queue.hpp
+index 0e952be..d5a5bc9 100644
+--- a/include/hipSYCL/runtime/metal/metal_queue.hpp
++++ b/include/hipSYCL/runtime/metal/metal_queue.hpp
+@@ -21,6 +21,7 @@
+ 
+ #include "metal_allocator.hpp"
+ #include "metal_event.hpp"
++#include "metal_wait_result.hpp"
+ 
+ #include <mach/mach_time.h>
+ 
+@@ -106,19 +107,7 @@ struct metal_profiling_setup {
+   std::shared_ptr<metal_execution_finish_timestamp> finish_time;
+ };
+ 
+-// Command-buffer completion handlers run asynchronously and may outlive the
+-// queue that submitted them, so the sink is held by shared_ptr and captured by
+-// value. Namespace scope (rather than nested in metal_inorder_queue) so the
+-// submission helpers that install those handlers can name it.
+-struct metal_async_error_state {
+-  std::mutex mutex;
+-  result error;
+-};
+-
+-// Records the first asynchronous failure so that a later queue wait can fail
+-// closed. Also forwards to register_error() for the global async error list.
+-void record_metal_async_failure(
+-    const std::shared_ptr<metal_async_error_state>& state, result failure);
++struct metal_command_buffer_wait_state;
+ 
+ class metal_inorder_queue;
+ class metal_sscp_code_object_invoker : public sscp_code_object_invoker {
+@@ -173,7 +162,9 @@ public:
+ 
+ private:
+   MTL::CommandBuffer* new_command_buffer();
+-  void remember_submitted_command_buffer(MTL::CommandBuffer* command_buffer);
++  void remember_submitted_command_buffer(
++      MTL::CommandBuffer* command_buffer,
++      std::shared_ptr<metal_command_buffer_wait_state> completion_state);
+   result wait_for_last_submitted_command_buffer(const char* operation);
+   void profiling_setup(operation& op, const dag_node_ptr& node);
+ 
+@@ -194,6 +185,8 @@ private:
+   // most recently submitted producer so host readback can establish an
+   // explicit completion boundary before encoding its blit.
+   MTL::CommandBuffer* _last_submitted_command_buffer = nullptr;
++  std::shared_ptr<metal_command_buffer_wait_state>
++    _last_submitted_command_buffer_wait_state;
+   std::mutex _last_submitted_command_buffer_mutex;
+ 
+   // Command-buffer callbacks outlive individual submissions. Keep their first
+diff --git a/include/hipSYCL/runtime/metal/metal_wait_result.hpp b/include/hipSYCL/runtime/metal/metal_wait_result.hpp
+new file mode 100644
+index 0000000..0997512
+--- /dev/null
++++ b/include/hipSYCL/runtime/metal/metal_wait_result.hpp
+@@ -0,0 +1,83 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * Copyright The AdaptiveCpp Contributors
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#ifndef HIPSYCL_METAL_WAIT_RESULT_HPP
++#define HIPSYCL_METAL_WAIT_RESULT_HPP
++
++#include "hipSYCL/runtime/error.hpp"
++
++#include <memory>
++#include <mutex>
++#include <utility>
++
++namespace hipsycl {
++namespace rt {
++
++// Command-buffer completion handlers run asynchronously and may outlive the
++// queue that submitted them, so the sink is held by shared_ptr and captured by
++// value. Keeping the sink and its wait-result policy independent of Metal makes
++// the fail-closed behavior directly testable.
++struct metal_async_error_state {
++  std::mutex mutex;
++  result error;
++};
++
++inline result read_metal_async_failure(
++    const std::shared_ptr<metal_async_error_state>& state) {
++  std::lock_guard<std::mutex> lock{state->mutex};
++  return state->error;
++}
++
++// Records the first asynchronous failure so that a later queue wait can fail
++// closed. Also forwards every failure to the global async error list.
++inline void record_metal_async_failure(
++    const std::shared_ptr<metal_async_error_state>& state, result failure) {
++  if (state) {
++    std::lock_guard<std::mutex> lock{state->mutex};
++    if (state->error.is_success()) {
++      state->error = failure;
++    }
++  }
++  register_error(failure);
++}
++
++template <class TimeoutFailureFactory, class ErrorFailureFactory>
++result classify_metal_command_buffer_wait_result(
++    bool completed, bool command_buffer_failed,
++    TimeoutFailureFactory&& timeout_failure,
++    ErrorFailureFactory&& error_failure) {
++  if (!completed) {
++    return std::forward<TimeoutFailureFactory>(timeout_failure)();
++  }
++  if (command_buffer_failed) {
++    return std::forward<ErrorFailureFactory>(error_failure)();
++  }
++  return make_success();
++}
++
++template <class TimeoutFailureFactory, class ErrorFailureFactory>
++result capture_metal_command_buffer_wait_result(
++    const std::shared_ptr<metal_async_error_state>& state, bool completed,
++    bool command_buffer_failed, TimeoutFailureFactory&& timeout_failure,
++    ErrorFailureFactory&& error_failure) {
++  auto completion = classify_metal_command_buffer_wait_result(
++      completed, command_buffer_failed,
++      std::forward<TimeoutFailureFactory>(timeout_failure),
++      std::forward<ErrorFailureFactory>(error_failure));
++  if (!completion.is_success()) {
++    record_metal_async_failure(state, completion);
++  }
++  return completion;
++}
++
++} // namespace rt
++} // namespace hipsycl
++
++#endif // HIPSYCL_METAL_WAIT_RESULT_HPP
+diff --git a/src/runtime/metal/metal_event.cpp b/src/runtime/metal/metal_event.cpp
+index dbfb54e..11538f6 100644
+--- a/src/runtime/metal/metal_event.cpp
++++ b/src/runtime/metal/metal_event.cpp
+@@ -9,13 +9,12 @@
+  */
+ // SPDX-License-Identifier: BSD-2-Clause
+ #include "hipSYCL/runtime/metal/metal_event.hpp"
++#include "metal_timeout.hpp"
+ 
+ #include <Metal/Metal.hpp>
+ 
+ #include <chrono>
+-#include <cstdlib>
+ #include <sstream>
+-#include <thread>
+ 
+ // stall-hunt trampoline (defined in metal_queue.cpp)
+ extern "C" void stall_hunt_note_host_wait_c(void* evt, unsigned long long want, int spin_sec);
+@@ -37,32 +36,38 @@ bool metal_node_event::is_complete() const {
+ }
+ 
+ void metal_node_event::wait() {
+-  constexpr unsigned long long default_timeout_ms = 120'000;
+-  unsigned long long timeout_ms = default_timeout_ms;
+-  if (const char* env = std::getenv("ACPP_METAL_COMMAND_TIMEOUT_MS")) {
+-    char* end = nullptr;
+-    const auto requested = std::strtoull(env, &end, 10);
+-    if (end != env && *end == '\0' && requested > 0) {
+-      timeout_ms = requested;
+-    }
++  const auto timeout = metal_command_timeout();
++  const auto started_at = std::chrono::steady_clock::now();
++  const auto deadline = started_at + timeout;
++  int last_noted_second = 0;
++  const bool signaled = detail::wait_until_metal_event_deadline(
++      deadline, [this, started_at,
++                 &last_noted_second](std::chrono::milliseconds slice) {
++        const bool slice_signaled = _handle.event->waitUntilSignaledValue(
++            _handle.value, static_cast<unsigned long long>(slice.count()));
++        if (!slice_signaled) {
++          const int waited_seconds = static_cast<int>(
++              std::chrono::duration_cast<std::chrono::seconds>(
++                  std::chrono::steady_clock::now() - started_at)
++                  .count());
++          if (waited_seconds > last_noted_second) {
++            last_noted_second = waited_seconds;
++            stall_hunt_note_host_wait_c(
++                _handle.event, static_cast<unsigned long long>(_handle.value),
++                waited_seconds);
++          }
++        }
++        return slice_signaled;
++      });
++  if (signaled) {
++    return;
+   }
+ 
+-  const auto deadline =
+-      std::chrono::steady_clock::now() + std::chrono::milliseconds{timeout_ms};
+-  int spin_sec = 0;
+-  while (!_handle.event->waitUntilSignaledValue(_handle.value, 1000)) {
+-    ++spin_sec;
+-    stall_hunt_note_host_wait_c(_handle.event, static_cast<unsigned long long>(_handle.value), spin_sec);
+-    if (std::chrono::steady_clock::now() >= deadline) {
+-      std::ostringstream message;
+-      message << "metal_node_event: timed out after " << timeout_ms
+-              << " ms waiting for shared-event value " << _handle.value
+-              << "; current value is " << _handle.event->signaledValue();
+-      register_error(make_error(__acpp_here(), error_info{message.str()}));
+-      return;
+-    }
+-    std::this_thread::yield();
+-  }
++  std::ostringstream message;
++  message << "metal_node_event: timed out after " << timeout.count()
++          << " ms waiting for shared-event value " << _handle.value
++          << "; current value is " << _handle.event->signaledValue();
++  register_error(make_error(__acpp_here(), error_info{message.str()}));
+ }
+ 
+ metal_event_handle metal_node_event::request_backend_event() {
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index 5fc8a12..f23485f 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -9,7 +9,9 @@
+  */
+ // SPDX-License-Identifier: BSD-2-Clause
+ #include "hipSYCL/runtime/metal/metal_queue.hpp"
++#include "hipSYCL/runtime/metal/metal_command_buffer_status.hpp"
+ #include "hipSYCL/runtime/metal/metal_code_object.hpp"
++#include "metal_timeout.hpp"
+ #include "hipSYCL/runtime/metal/metal_aot_cache_identity.hpp"
+ #include "hipSYCL/runtime/metal/metal_event.hpp"
+ #include "hipSYCL/runtime/metal/metal_jit_guard.hpp"
+@@ -23,6 +25,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cstdint>
+@@ -381,6 +384,12 @@ extern "C" void stall_hunt_note_host_wait_c(void* evt, unsigned long long want,
+ namespace hipsycl {
+ namespace rt {
+ 
++struct metal_command_buffer_wait_state {
++  std::mutex mutex;
++  std::condition_variable completion;
++  bool completed = false;
++};
++
+ namespace {
+ 
+ // Metal supports at most 31 [[buffer(N)]] arguments in flat mode.
+@@ -398,19 +407,6 @@ static constexpr NS::UInteger metal_pointer_translation_table_buffer_index = 1;
+ static constexpr NS::UInteger metal_user_arg_buffer_offset = 2;
+ static constexpr NS::UInteger metal_pointer_translation_miss_buffer_index = 30;
+ 
+-std::chrono::milliseconds metal_command_buffer_timeout() {
+-  constexpr unsigned long long default_timeout_ms = 120'000;
+-  unsigned long long timeout_ms = default_timeout_ms;
+-  if (const char* env = std::getenv("ACPP_METAL_COMMAND_TIMEOUT_MS")) {
+-    char* end = nullptr;
+-    const auto requested = std::strtoull(env, &end, 10);
+-    if (end != env && *end == '\0' && requested > 0) {
+-      timeout_ms = requested;
+-    }
+-  }
+-  return std::chrono::milliseconds{timeout_ms};
+-}
+-
+ const char* metal_command_buffer_status_name(MTL::CommandBufferStatus status) {
+   switch (status) {
+   case MTL::CommandBufferStatusNotEnqueued: return "not-enqueued";
+@@ -423,53 +419,51 @@ const char* metal_command_buffer_status_name(MTL::CommandBufferStatus status) {
+   return "unknown";
+ }
+ 
+-result wait_for_metal_command_buffer(MTL::CommandBuffer* command_buffer,
+-                                     const char* operation) {
+-  const auto deadline =
+-      std::chrono::steady_clock::now() + metal_command_buffer_timeout();
+-  auto status = command_buffer->status();
+-  // Back off from 2 us up to 1 ms instead of sleeping a flat 1 ms per poll.
+-  // Derivation: a flat 1 ms floor costs ~1 ms on EVERY wait that is not already
+-  // complete. At ~205 launches/step and ~3.1 waits/kernel that is ~640 waits/step;
+-  // if ~46% of them sleep once, that is ~292 ms/step of pure sleep, which is what
+-  // we measured: 36 -> 328 ms/step on a 1024^2 PPC1 deck (a 9x wall regression).
+-  // Metal command buffers typically retire in tens of microseconds, so starting at
+-  // 2 us and doubling keeps the common case in the microsecond range, while the
+-  // 1 ms cap bounds wakeups for genuinely long waits. Deadline semantics unchanged.
+-  auto backoff = std::chrono::microseconds{2};
+-  const auto max_backoff = std::chrono::microseconds{1000};
+-  int spins = 0;
+-  constexpr int max_spins = 256;
+-  while (status != MTL::CommandBufferStatusCompleted &&
+-         status != MTL::CommandBufferStatusError) {
+-    if (std::chrono::steady_clock::now() >= deadline) {
+-      std::ostringstream message;
+-      message << "metal_queue: " << operation << " timed out after "
+-              << metal_command_buffer_timeout().count()
+-              << " ms; command buffer remained "
+-              << metal_command_buffer_status_name(status);
+-      return make_error(__acpp_here(), error_info{message.str()});
+-    }
+-    // Phase 1: yield-spin. Measured residual under pure backoff was ~30 us/wait
+-    // (19.4 ms/step over ~640 waits/step), which is just the 2+4+8+16 geometric
+-    // sum needed to cover a typical ~30 us command-buffer retirement. A yield
+-    // costs well under a microsecond, so ~256 of them cover that same window at
+-    // far finer granularity than a 2 us sleep floor can. Phase 2: fall back to
+-    // the exponential backoff for genuinely long waits so we do not burn a core.
+-    if (spins < max_spins) {
+-      ++spins;
+-      std::this_thread::yield();
+-    } else {
+-      std::this_thread::sleep_for(backoff);
+-      if (backoff < max_backoff) {
+-        backoff *= 2;
+-        if (backoff > max_backoff) { backoff = max_backoff; }
+-      }
+-    }
+-    status = command_buffer->status();
++std::shared_ptr<metal_command_buffer_wait_state>
++make_metal_command_buffer_wait_state() {
++  return std::make_shared<metal_command_buffer_wait_state>();
++}
++
++void complete_metal_command_buffer_wait(
++    const std::shared_ptr<metal_command_buffer_wait_state>& state) {
++  {
++    std::lock_guard<std::mutex> lock{state->mutex};
++    state->completed = true;
+   }
++  state->completion.notify_all();
++}
+ 
+-  if (status == MTL::CommandBufferStatusError) {
++std::shared_ptr<metal_command_buffer_wait_state>
++install_metal_command_buffer_wait(MTL::CommandBuffer* command_buffer) {
++  auto state = make_metal_command_buffer_wait_state();
++  command_buffer->addCompletedHandler([state](MTL::CommandBuffer*) {
++    complete_metal_command_buffer_wait(state);
++  });
++  return state;
++}
++
++result wait_for_metal_command_buffer(
++    MTL::CommandBuffer* command_buffer,
++    const std::shared_ptr<metal_command_buffer_wait_state>& state,
++    const std::shared_ptr<metal_async_error_state>& async_error_state,
++    const char* operation) {
++  const auto timeout = metal_command_timeout();
++  std::unique_lock<std::mutex> lock{state->mutex};
++  const bool completed = state->completion.wait_for(
++      lock, timeout, [&state] { return state->completed; });
++  lock.unlock();
++
++  const auto status = command_buffer->status();
++  return capture_metal_command_buffer_wait_result(
++      async_error_state, completed, status,
++      [timeout, status, operation]() -> result {
++    std::ostringstream message;
++    message << "metal_queue: " << operation << " timed out after "
++            << timeout.count() << " ms; command buffer remained "
++            << metal_command_buffer_status_name(status);
++    return make_error(__acpp_here(), error_info{message.str()});
++      },
++      [command_buffer, operation]() -> result {
+     std::string message = "metal_queue: ";
+     message += operation;
+     message += " failed";
+@@ -480,9 +474,7 @@ result wait_for_metal_command_buffer(MTL::CommandBuffer* command_buffer,
+       }
+     }
+     return make_error(__acpp_here(), error_info{message});
+-  }
+-
+-  return make_success();
++      });
+ }
+ 
+ inline unsigned align_up(unsigned x, unsigned a) {
+@@ -935,17 +927,6 @@ void encode_arguments_argbuffer(
+ 
+ } // anonymous namespace
+ 
+-void record_metal_async_failure(
+-    const std::shared_ptr<metal_async_error_state>& state, result failure) {
+-  if (state) {
+-    std::lock_guard<std::mutex> lock{state->mutex};
+-    if (state->error.is_success()) {
+-      state->error = failure;
+-    }
+-  }
+-  register_error(failure);
+-}
+-
+ namespace {
+ 
+ result launch_kernel_from_library(
+@@ -964,7 +945,8 @@ result launch_kernel_from_library(
+   std::size_t num_args,
+   const rt::hcf_kernel_info* kernel_info,
+   const std::optional<std::vector<int>>& retained_indices,
+-  const std::shared_ptr<metal_async_error_state>& async_error_state)
++  const std::shared_ptr<metal_async_error_state>& async_error_state,
++  const std::shared_ptr<metal_command_buffer_wait_state>& completion_state)
+ {
+   if (!library) {
+     return make_error(__acpp_here(),
+@@ -1106,7 +1088,8 @@ result launch_kernel_from_library(
+                                        kernel_name_for_handler,
+                                        launch_table_count,
+                                        launch_table_capacity,
+-                                       async_error_state](MTL::CommandBuffer* command_buffer) {
++                                       async_error_state,
++                                       completion_state](MTL::CommandBuffer* command_buffer) {
+     auto* flag = reinterpret_cast<const metal_pointer_translation_miss_flag*>(
+         miss_buffer_for_handler->contents());
+     if (flag && flag->code != 0) {
+@@ -1127,6 +1110,7 @@ result launch_kernel_from_library(
+ 
+     HIPSYCL_DEBUG_INFO << "metal: Kernel '" << kernel_name_for_handler
+                       << "' executed successfully" << std::endl;
++    complete_metal_command_buffer_wait(completion_state);
+   });
+ 
+   stall_hunt::watch_cb(command_buffer, /*shared*/ nullptr,
+@@ -1143,7 +1127,8 @@ result memset_device(
+   void* ptr,
+   unsigned char pattern,
+   std::size_t num_bytes,
+-  const std::shared_ptr<metal_async_error_state>& async_error_state)
++  const std::shared_ptr<metal_async_error_state>& async_error_state,
++  const std::shared_ptr<metal_command_buffer_wait_state>& completion_state)
+ {
+   auto [buffer, offset, _3] = allocator->get_usm_block(ptr);
+   if (!buffer) {
+@@ -1160,7 +1145,8 @@ result memset_device(
+   blit_encoder->fillBuffer(buffer, NS::Range::Make(offset, num_bytes), pattern);
+   blit_encoder->endEncoding();
+ 
+-  command_buffer->addCompletedHandler([async_error_state](MTL::CommandBuffer* command_buffer) {
++  command_buffer->addCompletedHandler(
++      [async_error_state, completion_state](MTL::CommandBuffer* command_buffer) {
+     if (NS::Error* err = command_buffer->error()) {
+       std::string msg = "metal_queue: Memset failed: ";
+       if (err->localizedDescription()) {
+@@ -1169,6 +1155,7 @@ result memset_device(
+       record_metal_async_failure(async_error_state,
+                                  make_error(__acpp_here(), error_info{msg}));
+     }
++    complete_metal_command_buffer_wait(completion_state);
+   });
+ 
+   command_buffer->commit();
+@@ -1212,35 +1199,34 @@ MTL::CommandBuffer* metal_inorder_queue::new_command_buffer() {
+ }
+ 
+ void metal_inorder_queue::remember_submitted_command_buffer(
+-    MTL::CommandBuffer* command_buffer) {
++    MTL::CommandBuffer* command_buffer,
++    std::shared_ptr<metal_command_buffer_wait_state> completion_state) {
+   command_buffer->retain();
+   std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
+   if (_last_submitted_command_buffer) {
+     _last_submitted_command_buffer->release();
+   }
++  _last_submitted_command_buffer_wait_state = std::move(completion_state);
+   _last_submitted_command_buffer = command_buffer;
+ }
+ 
+ result metal_inorder_queue::wait_for_last_submitted_command_buffer(
+     const char* operation) {
+   MTL::CommandBuffer* command_buffer = nullptr;
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
+   {
+     std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
+     command_buffer = std::exchange(_last_submitted_command_buffer, nullptr);
++    completion_state =
++        std::move(_last_submitted_command_buffer_wait_state);
+   }
+   if (!command_buffer) {
+     return make_success();
+   }
+ 
+-  auto completion = wait_for_metal_command_buffer(command_buffer, operation);
++  auto completion = wait_for_metal_command_buffer(
++      command_buffer, completion_state, _async_error_state, operation);
+   command_buffer->release();
+-  if (!completion.is_success()) {
+-    // The command buffer has already been forgotten above, so a subsequent
+-    // wait() would find nothing outstanding and report success even though this
+-    // one never reached a terminal state. Latch the failure so every later wait
+-    // keeps failing instead of declaring a wedged queue healthy.
+-    record_metal_async_failure(_async_error_state, completion);
+-  }
+   return completion;
+ }
+ 
+@@ -1281,8 +1267,9 @@ std::shared_ptr<dag_node_event> metal_inorder_queue::insert_event() {
+   stall_hunt::watch_cb(cmd_buf, _shared_event,
+     "insert_event signal=" + std::to_string(val),
+     pending_wait, val);
++  auto completion_state = install_metal_command_buffer_wait(cmd_buf);
+   cmd_buf->commit();
+-  remember_submitted_command_buffer(cmd_buf);
++  remember_submitted_command_buffer(cmd_buf, std::move(completion_state));
+ 
+   return std::make_shared<metal_node_event>(metal_event_handle{_shared_event, val});
+ }
+@@ -1491,14 +1478,15 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     // terminal state, and only then expose the staging bytes. This avoids a
+     // GPU-signal -> CPU-listener -> GPU-wait shared-event cycle that could
+     // remain scheduled forever without reporting a Metal error.
++    auto completion_state =
++        install_metal_command_buffer_wait(command_buffer);
+     command_buffer->commit();
+ 
+-    auto completion =
+-        wait_for_metal_command_buffer(command_buffer, "device-to-host memcpy");
++    auto completion = wait_for_metal_command_buffer(
++        command_buffer, completion_state, _async_error_state,
++        "device-to-host memcpy");
+     if (!completion.is_success()) {
+-      // Fail closed: the staging bytes were never published, so the queue must
+-      // not look healthy to a later wait.
+-      record_metal_async_failure(_async_error_state, completion);
++      // Fail closed: the staging bytes were never published.
+       return completion;
+     }
+ 
+@@ -1520,17 +1508,21 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       command_buffer->encodeSignalEvent(_shared_event, deferred_h2d_done_event);
+       _pending_cpu_event = deferred_h2d_done_event;
+     }
++    auto completion_state = make_metal_command_buffer_wait_state();
+     command_buffer->addCompletedHandler(
+-        [async_error_state = _async_error_state](MTL::CommandBuffer* cb) {
++        [async_error_state = _async_error_state,
++         completion_state](MTL::CommandBuffer* cb) {
+       if (NS::Error* err = cb->error()) {
+         std::string msg = "metal_queue: Memcpy failed: ";
+         if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
+         record_metal_async_failure(async_error_state,
+                                    make_error(__acpp_here(), error_info{msg}));
+       }
++      complete_metal_command_buffer_wait(completion_state);
+     });
+     command_buffer->commit();
+-    remember_submitted_command_buffer(command_buffer);
++    remember_submitted_command_buffer(
++        command_buffer, std::move(completion_state));
+   }
+ 
+   return make_success();
+@@ -1583,10 +1575,13 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
+       error_info{"metal_queue: Failed to create command buffer for memset"});
+   }
+ 
++  auto completion_state = make_metal_command_buffer_wait_state();
+   auto submission = memset_device(command_buffer, _allocator, ptr, pattern,
+-                                  num_bytes, _async_error_state);
++                                  num_bytes, _async_error_state,
++                                  completion_state);
+   if (submission.is_success()) {
+-    remember_submitted_command_buffer(command_buffer);
++    remember_submitted_command_buffer(
++        command_buffer, std::move(completion_state));
+   }
+   return submission;
+ }
+@@ -1606,8 +1601,9 @@ result metal_inorder_queue::submit_queue_wait_for(const dag_node_ptr& node) {
+   stall_hunt::watch_cb(cmd_buf, handle.event,
+     "queue_wait value=" + std::to_string(handle.value),
+     handle.value ? handle.value : pending_wait, 0);
++  auto completion_state = install_metal_command_buffer_wait(cmd_buf);
+   cmd_buf->commit();
+-  remember_submitted_command_buffer(cmd_buf);
++  remember_submitted_command_buffer(cmd_buf, std::move(completion_state));
+ 
+   return make_success();
+ }
+@@ -1625,18 +1621,13 @@ result metal_inorder_queue::submit_external_wait_for(const dag_node_ptr& node) {
+ result metal_inorder_queue::wait() {
+   HIPSYCL_DEBUG_INFO << "metal_queue: Waiting for queue completion..." << std::endl;
+ 
+-  auto get_async_error = [this]() {
+-    std::lock_guard<std::mutex> lock{_async_error_state->mutex};
+-    return _async_error_state->error;
+-  };
+-
+   auto producer_completion =
+       wait_for_last_submitted_command_buffer("queue completion");
+   if (!producer_completion.is_success()) {
+     return producer_completion;
+   }
+ 
+-  return get_async_error();
++  return read_metal_async_failure(_async_error_state);
+ }
+ 
+ device_id metal_inorder_queue::get_device() const {
+@@ -2033,6 +2024,7 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+       use_binary_archive ? metal_obj->get_binary_archive_path()
+                          : empty_archive_path;
+   auto* command_buffer = new_command_buffer();
++  auto completion_state = make_metal_command_buffer_wait_state();
+   auto submission = launch_kernel_from_library(
+     library, _device, launch_archive, launch_archive_path, command_buffer, _allocator,
+     kernel_name,
+@@ -2042,9 +2034,11 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+     _arg_mapper.get_mapped_num_args(),
+     kernel_info,
+     retained_indices,
+-    _async_error_state);
++    _async_error_state,
++    completion_state);
+   if (submission.is_success()) {
+-    remember_submitted_command_buffer(command_buffer);
++    remember_submitted_command_buffer(
++        command_buffer, std::move(completion_state));
+   }
+   return submission;
+ 
+diff --git a/src/runtime/metal/metal_timeout.hpp b/src/runtime/metal/metal_timeout.hpp
+new file mode 100644
+index 0000000..9c9ce1d
+--- /dev/null
++++ b/src/runtime/metal/metal_timeout.hpp
+@@ -0,0 +1,107 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * Copyright The AdaptiveCpp Contributors
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#ifndef HIPSYCL_METAL_TIMEOUT_HPP
++#define HIPSYCL_METAL_TIMEOUT_HPP
++
++#include "hipSYCL/common/debug.hpp"
++
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++
++namespace hipsycl {
++namespace rt {
++namespace detail {
++
++constexpr unsigned long long metal_command_timeout_default_ms = 120'000;
++constexpr unsigned long long metal_command_timeout_policy_max_ms =
++    24ULL * 60 * 60 * 1'000;
++constexpr std::chrono::milliseconds metal_event_max_wait_slice{1'000};
++
++struct metal_command_timeout_parse_result {
++  std::chrono::milliseconds timeout;
++  bool accepted;
++};
++
++inline metal_command_timeout_parse_result
++parse_metal_command_timeout(const char* value) {
++  const auto fallback = std::chrono::milliseconds{
++      static_cast<std::chrono::milliseconds::rep>(
++          metal_command_timeout_default_ms)};
++  if (!value || *value == '\0') {
++    return {fallback, value == nullptr};
++  }
++
++  for (const char* digit = value; *digit != '\0'; ++digit) {
++    if (*digit < '0' || *digit > '9') {
++      return {fallback, false};
++    }
++  }
++
++  errno = 0;
++  char* end = nullptr;
++  const auto requested = std::strtoull(value, &end, 10);
++  const auto duration_max = static_cast<unsigned long long>(
++      std::chrono::milliseconds::max().count());
++  if (errno == ERANGE || end == value || *end != '\0' || requested == 0 ||
++      requested > duration_max ||
++      requested > metal_command_timeout_policy_max_ms) {
++    return {fallback, false};
++  }
++
++  return {std::chrono::milliseconds{
++              static_cast<std::chrono::milliseconds::rep>(requested)},
++          true};
++}
++
++template <class Clock = std::chrono::steady_clock, class WaitForSlice>
++bool wait_until_metal_event_deadline(
++    typename Clock::time_point deadline, WaitForSlice&& wait_for_slice) {
++  while (true) {
++    const auto now = Clock::now();
++    if (now >= deadline) {
++      return false;
++    }
++    const auto remaining_duration = deadline - now;
++    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
++        remaining_duration);
++    if (remaining < remaining_duration) {
++      remaining += std::chrono::milliseconds{1};
++    }
++    const auto slice = remaining < metal_event_max_wait_slice
++                           ? remaining
++                           : metal_event_max_wait_slice;
++    if (wait_for_slice(slice)) {
++      return true;
++    }
++  }
++}
++
++} // namespace detail
++
++inline std::chrono::milliseconds metal_command_timeout() {
++  static const auto timeout = [] {
++    const auto parsed = detail::parse_metal_command_timeout(
++        std::getenv("ACPP_METAL_COMMAND_TIMEOUT_MS"));
++    if (!parsed.accepted) {
++      HIPSYCL_DEBUG_WARNING
++          << "Rejected invalid ACPP_METAL_COMMAND_TIMEOUT_MS value; using "
++          << detail::metal_command_timeout_default_ms << " ms default\n";
++    }
++    return parsed.timeout;
++  }();
++  return timeout;
++}
++
++} // namespace rt
++} // namespace hipsycl
++
++#endif // HIPSYCL_METAL_TIMEOUT_HPP
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 0604dbd..74eb6a3 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,6 +1,8 @@
+ cmake_minimum_required(VERSION 3.12)
+ project(adaptivecpp-tests)
+ 
++enable_testing()
++
+ set(Boost_USE_STATIC_LIBS off)
+ set(BUILD_SHARED_LIBS on)
+ set(REDUCED_LOCAL_MEM_USAGE OFF CACHE BOOL "Only run tests with reduced local memory usage to allow running on hardware with little local memory.")
+@@ -128,6 +130,63 @@ endif()
+ 
+ add_sycl_to_target(TARGET sycl_tests)
+ 
++add_executable(metal_timeout_tests runtime/metal_timeout.cpp)
++target_include_directories(metal_timeout_tests PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/../include
++  ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime/metal)
++target_compile_features(metal_timeout_tests PRIVATE cxx_std_17)
++add_test(NAME metal_timeout_tests COMMAND metal_timeout_tests)
++add_test(NAME metal_timeout_accessor_valid
++  COMMAND metal_timeout_tests --check-accessor 5 9 5)
++add_test(NAME metal_timeout_accessor_invalid_fallback
++  COMMAND metal_timeout_tests --check-accessor -1 9 120000)
++
++find_library(ACPP_TEST_RUNTIME_LIBRARY NAMES acpp-rt
++  HINTS ${CMAKE_PREFIX_PATH}
++  PATH_SUFFIXES lib lib/hipSYCL)
++if(NOT ACPP_TEST_RUNTIME_LIBRARY)
++  message(FATAL_ERROR "Could not find the installed AdaptiveCpp runtime library")
++endif()
++target_link_libraries(metal_timeout_tests PRIVATE ${ACPP_TEST_RUNTIME_LIBRARY})
++
++add_executable(metal_wait_result_tests runtime/metal_wait_result.cpp)
++target_include_directories(metal_wait_result_tests PRIVATE
++  ${CMAKE_CURRENT_SOURCE_DIR}/../include)
++target_compile_features(metal_wait_result_tests PRIVATE cxx_std_17)
++target_link_libraries(metal_wait_result_tests PRIVATE
++  ${ACPP_TEST_RUNTIME_LIBRARY})
++add_test(NAME metal_wait_result_tests COMMAND metal_wait_result_tests)
++
++if(APPLE)
++  find_path(METAL_CPP_INCLUDE_DIR Metal/Metal.hpp
++    HINTS $ENV{METAL_CPP_DIR}
++    PATH_SUFFIXES include)
++  if(NOT METAL_CPP_INCLUDE_DIR)
++    message(FATAL_ERROR
++      "Metal-cpp headers are required for Metal timeout integration tests")
++  endif()
++
++  add_executable(metal_event_timeout_integration_tests
++    runtime/metal_event_timeout.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime/metal/metal_event.cpp)
++  target_include_directories(metal_event_timeout_integration_tests PRIVATE
++    ${CMAKE_CURRENT_SOURCE_DIR}/../include
++    ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime/metal
++    ${METAL_CPP_INCLUDE_DIR})
++  target_compile_features(metal_event_timeout_integration_tests PRIVATE
++    cxx_std_17)
++  target_compile_options(metal_event_timeout_integration_tests PRIVATE
++    -fblocks)
++  target_link_libraries(metal_event_timeout_integration_tests PRIVATE
++    ${ACPP_TEST_RUNTIME_LIBRARY}
++    "-framework Foundation" "-framework Metal" "-framework QuartzCore"
++    objc)
++  add_test(NAME metal_event_timeout_integration_tests
++    COMMAND metal_event_timeout_integration_tests)
++  set_tests_properties(metal_event_timeout_integration_tests PROPERTIES
++    ENVIRONMENT "ACPP_METAL_COMMAND_TIMEOUT_MS=1")
++endif()
++
+ add_executable(rt_tests 
+   runtime/runtime_test_suite.cpp 
+   runtime/dag_builder.cpp
+diff --git a/tests/runtime/metal_event_timeout.cpp b/tests/runtime/metal_event_timeout.cpp
+new file mode 100644
+index 0000000..d5dcb23
+--- /dev/null
++++ b/tests/runtime/metal_event_timeout.cpp
+@@ -0,0 +1,104 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * Copyright The AdaptiveCpp Contributors
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#define NS_PRIVATE_IMPLEMENTATION
++#define CA_PRIVATE_IMPLEMENTATION
++#define MTL_PRIVATE_IMPLEMENTATION
++
++#include "hipSYCL/runtime/application.hpp"
++#include "hipSYCL/runtime/async_errors.hpp"
++#include "hipSYCL/runtime/metal/metal_command_buffer_status.hpp"
++#include "hipSYCL/runtime/metal/metal_event.hpp"
++
++#include <Metal/Metal.hpp>
++
++#include <cstdlib>
++#include <iostream>
++#include <memory>
++#include <string>
++
++extern "C" void stall_hunt_note_host_wait_c(
++    void*, unsigned long long, int) {}
++
++namespace {
++
++hipsycl::rt::result failure(const char* text) {
++  return hipsycl::rt::make_error(
++      hipsycl::rt::source_location{"metal-integration-test",
++                                   "metal-integration-test", 1},
++      hipsycl::rt::error_info{text});
++}
++
++} // namespace
++
++int main() {
++  hipsycl::rt::application::errors().pop_each_error(
++      [](const hipsycl::rt::result&) {});
++
++  auto* pool = NS::AutoreleasePool::alloc()->init();
++  auto* device = MTL::CreateSystemDefaultDevice();
++  if (!device) {
++    std::cerr << "METAL_EVENT_TIMEOUT_TEST_FAIL: no Metal device\n";
++    pool->release();
++    return 2;
++  }
++
++  auto* shared_event = device->newSharedEvent();
++  if (!shared_event) {
++    std::cerr << "METAL_EVENT_TIMEOUT_TEST_FAIL: no shared event\n";
++    device->release();
++    pool->release();
++    return 3;
++  }
++
++  {
++    hipsycl::rt::metal_node_event event{
++        hipsycl::rt::metal_event_handle{shared_event, 1}};
++    event.wait();
++  }
++
++  int error_count = 0;
++  std::string error_text;
++  hipsycl::rt::application::errors().pop_each_error(
++      [&](const hipsycl::rt::result& error) {
++        ++error_count;
++        error_text = error.what();
++      });
++
++  shared_event->release();
++  device->release();
++  pool->release();
++
++  if (error_count != 1 ||
++      error_text.find("timed out after 1 ms") == std::string::npos ||
++      error_text.find("shared-event value 1") == std::string::npos) {
++    std::cerr << "METAL_EVENT_TIMEOUT_TEST_FAIL: count=" << error_count
++              << " error=" << error_text << '\n';
++    return 1;
++  }
++
++  auto state = std::make_shared<hipsycl::rt::metal_async_error_state>();
++  auto completion = hipsycl::rt::capture_metal_command_buffer_wait_result(
++      state, true, MTL::CommandBufferStatusError,
++      [] { return failure("unexpected timeout"); },
++      [] { return failure("command-buffer error"); });
++  const auto later_wait = hipsycl::rt::read_metal_async_failure(state);
++  if (completion.is_success() || later_wait.is_success() ||
++      later_wait.what().find("command-buffer error") == std::string::npos ||
++      hipsycl::rt::metal_command_buffer_status_is_error(
++          MTL::CommandBufferStatusCompleted)) {
++    std::cerr << "METAL_EVENT_TIMEOUT_TEST_FAIL: error status was not "
++                 "sticky\n";
++    return 1;
++  }
++
++  std::cout << "METAL_EVENT_TIMEOUT_TEST_PASS\n";
++  return 0;
++}
+diff --git a/tests/runtime/metal_timeout.cpp b/tests/runtime/metal_timeout.cpp
+new file mode 100644
+index 0000000..b6e6f6c
+--- /dev/null
++++ b/tests/runtime/metal_timeout.cpp
+@@ -0,0 +1,210 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * Copyright The AdaptiveCpp Contributors
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#include "metal_timeout.hpp"
++
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <iostream>
++#include <string>
++#include <vector>
++
++namespace {
++
++using milliseconds = std::chrono::milliseconds;
++using hipsycl::rt::detail::metal_command_timeout_default_ms;
++using hipsycl::rt::detail::metal_command_timeout_policy_max_ms;
++using hipsycl::rt::detail::parse_metal_command_timeout;
++using hipsycl::rt::detail::wait_until_metal_event_deadline;
++
++struct fake_steady_clock {
++  using duration = std::chrono::microseconds;
++  using rep = duration::rep;
++  using period = duration::period;
++  using time_point = std::chrono::time_point<fake_steady_clock>;
++  static constexpr bool is_steady = true;
++
++  static time_point now() noexcept { return current; }
++  static time_point current;
++};
++
++fake_steady_clock::time_point fake_steady_clock::current{};
++
++void require(bool condition, const char* message) {
++  if (!condition) {
++    std::cerr << "METAL_TIMEOUT_TESTS_FAIL: " << message << '\n';
++    std::exit(1);
++  }
++}
++
++void expect_rejected(const char* value) {
++  const auto parsed = parse_metal_command_timeout(value);
++  require(!parsed.accepted, "invalid timeout was accepted");
++  require(parsed.timeout == milliseconds{metal_command_timeout_default_ms},
++          "invalid timeout did not select the default");
++}
++
++void test_parsing() {
++  const auto missing = parse_metal_command_timeout(nullptr);
++  require(missing.accepted, "missing timeout did not accept the default");
++  require(missing.timeout == milliseconds{metal_command_timeout_default_ms},
++          "missing timeout did not select the default");
++
++  expect_rejected("");
++  expect_rejected("   ");
++  expect_rejected(" 5");
++  expect_rejected("5 ");
++  expect_rejected("+5");
++  expect_rejected("-1");
++  expect_rejected("18446744073709551616");
++  expect_rejected("0");
++  expect_rejected("not-a-number");
++  expect_rejected("2501ms");
++
++  const auto exact_cap = parse_metal_command_timeout("86400000");
++  require(exact_cap.accepted, "exact 24-hour cap was rejected");
++  require(exact_cap.timeout == milliseconds{metal_command_timeout_policy_max_ms},
++          "exact 24-hour cap changed value");
++  expect_rejected("86400001");
++
++  errno = ERANGE;
++  const auto stale_errno = parse_metal_command_timeout("5");
++  require(stale_errno.accepted,
++          "valid timeout inherited a stale ERANGE value");
++  require(stale_errno.timeout == milliseconds{5},
++          "valid timeout with stale errno changed value");
++
++  const auto one = parse_metal_command_timeout("1");
++  require(one.accepted, "1 ms timeout was rejected");
++  require(one.timeout == milliseconds{1}, "1 ms timeout changed value");
++
++  const auto multi_slice = parse_metal_command_timeout("2501");
++  require(multi_slice.accepted, "multi-slice timeout was rejected");
++  require(multi_slice.timeout == milliseconds{2501},
++          "multi-slice timeout changed value");
++}
++
++void test_normal_multi_slice_wait() {
++  fake_steady_clock::current = {};
++  const auto timeout = parse_metal_command_timeout("2501").timeout;
++  const auto deadline = fake_steady_clock::now() + timeout;
++  std::vector<milliseconds::rep> slices;
++  const bool signaled = wait_until_metal_event_deadline<fake_steady_clock>(
++      deadline, [&slices](milliseconds slice) {
++        slices.push_back(slice.count());
++        fake_steady_clock::current += slice;
++        return false;
++      });
++  require(!signaled, "unsignaled multi-slice wait reported completion");
++  require((slices == std::vector<milliseconds::rep>{1000, 1000, 501}),
++          "multi-slice wait did not clamp to the absolute deadline");
++}
++
++void test_positive_fractional_remaining_rounds_to_one_ms() {
++  fake_steady_clock::current = {};
++  const auto deadline = fake_steady_clock::now() + milliseconds{1};
++  fake_steady_clock::current += std::chrono::microseconds{100};
++  std::vector<milliseconds::rep> slices;
++  const bool signaled = wait_until_metal_event_deadline<fake_steady_clock>(
++      deadline, [&slices](milliseconds slice) {
++        slices.push_back(slice.count());
++        fake_steady_clock::current += slice;
++        return false;
++      });
++  require(!signaled, "unsignaled 1 ms wait reported completion");
++  require((slices == std::vector<milliseconds::rep>{1}),
++          "positive sub-millisecond remainder skipped the Metal wait");
++}
++
++void test_invalid_timeout_unsignaled_wait_uses_default_deadline() {
++  const auto parsed = parse_metal_command_timeout("-1");
++  require(!parsed.accepted, "signed timeout was accepted");
++  require(parsed.timeout == milliseconds{metal_command_timeout_default_ms},
++          "signed timeout did not select the default");
++
++  fake_steady_clock::current = {};
++  const auto started_at = fake_steady_clock::now();
++  const auto deadline = started_at + parsed.timeout;
++  milliseconds::rep total_requested = 0;
++  int wait_calls = 0;
++  const bool signaled = wait_until_metal_event_deadline<fake_steady_clock>(
++      deadline, [&total_requested, &wait_calls](milliseconds slice) {
++        ++wait_calls;
++        total_requested += slice.count();
++        fake_steady_clock::current += slice;
++        return false;
++      });
++  require(!signaled, "invalid-timeout unsignaled wait reported completion");
++  require(fake_steady_clock::now() - started_at ==
++              milliseconds{metal_command_timeout_default_ms},
++          "invalid-timeout wait did not reach the default deadline");
++  require(total_requested == metal_command_timeout_default_ms,
++          "invalid-timeout wait requested the wrong total duration");
++  require(wait_calls == 120,
++          "invalid-timeout wait did not use bounded one-second slices");
++}
++
++void test_scheduler_overhead_reduces_later_slices() {
++  fake_steady_clock::current = {};
++  const auto deadline = fake_steady_clock::now() + milliseconds{2501};
++  std::vector<milliseconds::rep> slices;
++  const bool signaled = wait_until_metal_event_deadline<fake_steady_clock>(
++      deadline, [&slices](milliseconds slice) {
++        slices.push_back(slice.count());
++        fake_steady_clock::current += slice + milliseconds{17};
++        return false;
++      });
++  require(!signaled, "overhead simulation reported completion");
++  require((slices == std::vector<milliseconds::rep>{1000, 1000, 467}),
++          "scheduler overhead was not deducted from remaining time");
++}
++
++void set_environment(const char* key, const char* value) {
++#if defined(_WIN32)
++  require(_putenv_s(key, value) == 0, "failed to set test environment");
++#else
++  require(setenv(key, value, 1) == 0, "failed to set test environment");
++#endif
++}
++
++int check_cached_accessor(const char* first_value, const char* second_value,
++                          const char* expected_value) {
++  set_environment("ACPP_METAL_EVENT_WAIT_TIMEOUT_SEC", "7");
++  set_environment("ACPP_METAL_COMMAND_TIMEOUT_MS", first_value);
++  const auto first = hipsycl::rt::metal_command_timeout();
++
++  set_environment("ACPP_METAL_COMMAND_TIMEOUT_MS", second_value);
++  const auto second = hipsycl::rt::metal_command_timeout();
++  const auto expected = milliseconds{std::strtoll(expected_value, nullptr, 10)};
++
++  require(first == expected,
++          "cached accessor ignored the command-timeout environment key or fallback");
++  require(second == expected,
++          "cached accessor was not one-shot after the environment changed");
++  std::cout << "METAL_TIMEOUT_ACCESSOR_TEST_PASS\n";
++  return 0;
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++  if (argc == 5 && std::string{argv[1]} == "--check-accessor") {
++    return check_cached_accessor(argv[2], argv[3], argv[4]);
++  }
++  require(argc == 1, "unknown test arguments");
++  test_parsing();
++  test_normal_multi_slice_wait();
++  test_positive_fractional_remaining_rounds_to_one_ms();
++  test_invalid_timeout_unsignaled_wait_uses_default_deadline();
++  test_scheduler_overhead_reduces_later_slices();
++  std::cout << "METAL_TIMEOUT_TESTS_PASS\n";
++  return 0;
++}
+diff --git a/tests/runtime/metal_wait_result.cpp b/tests/runtime/metal_wait_result.cpp
+new file mode 100644
+index 0000000..5022d3c
+--- /dev/null
++++ b/tests/runtime/metal_wait_result.cpp
+@@ -0,0 +1,99 @@
++/*
++ * This file is part of AdaptiveCpp, an implementation of SYCL and C++ standard
++ * parallelism for CPUs and GPUs.
++ *
++ * Copyright The AdaptiveCpp Contributors
++ *
++ * AdaptiveCpp is released under the BSD 2-Clause "Simplified" License.
++ * See file LICENSE in the project root for full license details.
++ */
++// SPDX-License-Identifier: BSD-2-Clause
++#include "hipSYCL/runtime/metal/metal_wait_result.hpp"
++
++#include <cstdlib>
++#include <iostream>
++#include <memory>
++#include <string>
++
++namespace {
++
++using hipsycl::rt::capture_metal_command_buffer_wait_result;
++using hipsycl::rt::error_info;
++using hipsycl::rt::make_error;
++using hipsycl::rt::metal_async_error_state;
++using hipsycl::rt::read_metal_async_failure;
++using hipsycl::rt::result;
++using hipsycl::rt::source_location;
++
++enum class fake_command_buffer_status { completed, error };
++
++void require(bool condition, const char* message) {
++  if (!condition) {
++    std::cerr << "METAL_WAIT_RESULT_TESTS_FAIL: " << message << '\n';
++    std::exit(1);
++  }
++}
++
++result failure(const char* text) {
++  return make_error(source_location{"metal-wait-test", "metal-wait-test", 1},
++                    error_info{text});
++}
++
++result capture(const std::shared_ptr<metal_async_error_state>& state,
++               bool completed, fake_command_buffer_status status) {
++  return capture_metal_command_buffer_wait_result(
++      state, completed, status == fake_command_buffer_status::error,
++      [] { return failure("timeout failure"); },
++      [] { return failure("command-buffer error"); });
++}
++
++void test_timeout_latches_for_later_wait() {
++  auto state = std::make_shared<metal_async_error_state>();
++  auto completion =
++      capture(state, false, fake_command_buffer_status::completed);
++  require(!completion.is_success(), "timeout classification returned success");
++  const auto later_wait = read_metal_async_failure(state);
++  require(!later_wait.is_success(), "later wait forgot the timeout failure");
++  require(later_wait.what().find("timeout failure") != std::string::npos,
++          "later wait returned the wrong timeout failure");
++}
++
++void test_error_status_latches_for_later_wait() {
++  auto state = std::make_shared<metal_async_error_state>();
++  auto completion = capture(state, true, fake_command_buffer_status::error);
++  require(!completion.is_success(),
++          "command-buffer error status returned success");
++  const auto later_wait = read_metal_async_failure(state);
++  require(!later_wait.is_success(),
++          "later wait forgot the command-buffer error");
++  require(later_wait.what().find("command-buffer error") != std::string::npos,
++          "later wait returned the wrong command-buffer error");
++}
++
++void test_success_does_not_poison_later_wait() {
++  auto state = std::make_shared<metal_async_error_state>();
++  auto completion = capture(state, true, fake_command_buffer_status::completed);
++  require(completion.is_success(), "completed status returned failure");
++  require(read_metal_async_failure(state).is_success(),
++          "completed status poisoned a later wait");
++}
++
++void test_first_failure_remains_sticky() {
++  auto state = std::make_shared<metal_async_error_state>();
++  capture(state, false, fake_command_buffer_status::completed);
++  capture(state, true, fake_command_buffer_status::error);
++  const auto later_wait = read_metal_async_failure(state);
++  require(later_wait.what().find("timeout failure") != std::string::npos,
++          "a later failure replaced the first sticky failure");
++}
++
++} // namespace
++
++int main() {
++  test_timeout_latches_for_later_wait();
++  test_error_status_latches_for_later_wait();
++  test_success_does_not_poison_later_wait();
++  test_first_failure_remains_sticky();
++  std::cout << "METAL_WAIT_RESULT_TESTS_PASS\n";
++  return 0;
++}
