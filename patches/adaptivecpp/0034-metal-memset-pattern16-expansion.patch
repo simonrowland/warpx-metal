@@ -1,0 +1,142 @@
+Subject: [PATCH] Expand memset_pattern16 before Metal lowering
+
+Lower the LLVM memset_pattern16 library call into explicit byte stores before
+address-space inference. Handle the supported zero, partial, and full patterns
+with typed pointer/address-space preservation so Metal receives ordinary stores
+instead of an unresolved runtime helper.
+
+diff --git a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+--- a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
++++ b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+@@ -447,8 +447,123 @@
+ };
+ 
+ } // namespace
+ 
+ 
++struct ExpandMemsetPattern16Libcalls : llvm::PassInfoMixin<ExpandMemsetPattern16Libcalls> {
++  static llvm::Function* getCallee(llvm::CallBase* CB) {
++    if (auto* F = CB->getCalledFunction()) {
++      return F;
++    }
++    return llvm::dyn_cast<llvm::Function>(CB->getCalledOperand()->stripPointerCasts());
++  }
++
++  static bool expand(llvm::CallBase* CB) {
++    if (CB->arg_size() != 3 || !CB->getType()->isVoidTy()) {
++      return false;
++    }
++
++    auto* Dst = CB->getArgOperand(0);
++    auto* Pattern = CB->getArgOperand(1);
++    auto* Length = CB->getArgOperand(2);
++    auto* LengthTy = llvm::dyn_cast<llvm::IntegerType>(Length->getType());
++    if (!Dst->getType()->isPointerTy() || !Pattern->getType()->isPointerTy() || !LengthTy) {
++      return false;
++    }
++
++    auto* ByteTy = llvm::Type::getInt8Ty(CB->getContext());
++    if (auto* ConstantLength = llvm::dyn_cast<llvm::ConstantInt>(Length)) {
++      llvm::IRBuilder<> Builder(CB);
++      const uint64_t Count = ConstantLength->getValue().getLimitedValue();
++      for (uint64_t Offset = 0; Offset < Count; ++Offset) {
++        auto* Index = llvm::ConstantInt::get(LengthTy, Offset);
++        auto* DstByte = Builder.CreateGEP(ByteTy, Dst, Index, "memset_pattern16.dst");
++        auto* PatternByte = Builder.CreateGEP(
++            ByteTy, Pattern,
++            llvm::ConstantInt::get(LengthTy, Offset & 15),
++            "memset_pattern16.pattern");
++        auto* Value = Builder.CreateLoad(ByteTy, PatternByte, "memset_pattern16.value");
++        Builder.CreateStore(Value, DstByte);
++      }
++      CB->eraseFromParent();
++      return true;
++    }
++
++    auto* Function = CB->getFunction();
++    auto& Context = Function->getContext();
++    auto* Original = CB->getParent();
++    auto* After = Original->splitBasicBlock(CB->getIterator(), "memset_pattern16.after");
++    Original->getTerminator()->eraseFromParent();
++
++    auto* Header = llvm::BasicBlock::Create(Context, "memset_pattern16.loop", Function, After);
++    auto* Body = llvm::BasicBlock::Create(Context, "memset_pattern16.body", Function, After);
++    auto* Latch = llvm::BasicBlock::Create(Context, "memset_pattern16.latch", Function, After);
++    auto* Exit = llvm::BasicBlock::Create(Context, "memset_pattern16.exit", Function, After);
++
++    llvm::IRBuilder<> OriginalBuilder(Original);
++    OriginalBuilder.CreateBr(Header);
++
++    llvm::IRBuilder<> HeaderBuilder(Header);
++    auto* Index = HeaderBuilder.CreatePHI(LengthTy, 2, "memset_pattern16.index");
++    auto* Zero = llvm::ConstantInt::get(LengthTy, 0);
++    Index->addIncoming(Zero, Original);
++    auto* InRange = HeaderBuilder.CreateICmpULT(Index, Length, "memset_pattern16.in_range");
++    HeaderBuilder.CreateCondBr(InRange, Body, Exit);
++
++    llvm::IRBuilder<> BodyBuilder(Body);
++    auto* DstByte = BodyBuilder.CreateGEP(ByteTy, Dst, Index, "memset_pattern16.dst");
++    auto* PatternOffset = BodyBuilder.CreateAnd(
++        Index, llvm::ConstantInt::get(LengthTy, 15), "memset_pattern16.pattern_offset");
++    auto* PatternByte = BodyBuilder.CreateGEP(ByteTy, Pattern, PatternOffset,
++                                               "memset_pattern16.pattern");
++    auto* Value = BodyBuilder.CreateLoad(ByteTy, PatternByte, "memset_pattern16.value");
++    BodyBuilder.CreateStore(Value, DstByte);
++    BodyBuilder.CreateBr(Latch);
++
++    llvm::IRBuilder<> LatchBuilder(Latch);
++    auto* Next = LatchBuilder.CreateAdd(Index, llvm::ConstantInt::get(LengthTy, 1),
++                                        "memset_pattern16.next");
++    LatchBuilder.CreateBr(Header);
++    Index->addIncoming(Next, Latch);
++
++    llvm::IRBuilder<> ExitBuilder(Exit);
++    ExitBuilder.CreateBr(After);
++
++    CB->eraseFromParent();
++    return true;
++  }
++
++  llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
++    llvm::SmallVector<llvm::CallBase*, 16> Calls;
++    for (auto& Function : M) {
++      for (auto& BB : Function) {
++        for (auto& I : BB) {
++          auto* CB = llvm::dyn_cast<llvm::CallBase>(&I);
++          if (!CB) {
++            continue;
++          }
++          auto* Callee = getCallee(CB);
++          if (Callee && Callee->getName() == "memset_pattern16") {
++            Calls.push_back(CB);
++          }
++        }
++      }
++    }
++
++    bool Changed = false;
++    for (auto* CB : Calls) {
++      if (CB->getParent()) {
++        Changed |= expand(CB);
++      }
++    }
++
++    if (auto* Callee = M.getFunction("memset_pattern16"); Callee && Callee->use_empty()) {
++      Callee->eraseFromParent();
++    }
++
++    return Changed ? llvm::PreservedAnalyses::none() : llvm::PreservedAnalyses::all();
++  }
++};
++
+ LLVMToMetalTranslator::LLVMToMetalTranslator(const std::vector<std::string>& KernelNames)
+   : LLVMToBackendTranslator{static_cast<int>(sycl::AdaptiveCpp_jit::compiler_backend::metal), KernelNames, KernelNames}
+   , KernelNames(KernelNames)
+@@ -543,6 +658,7 @@
+     FPM.addPass(llvm::SimplifyCFGPass());
+     AddressSpaceInferencePass ASIPass{ASMap};
+     llvm::ModulePassManager MPM;
++    MPM.addPass(ExpandMemsetPattern16Libcalls{});
+     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+     MPM.addPass(std::move(ASIPass));
+     MPM.addPass(PointerTranslationAnnotationPass(ASMap[AddressSpace::Global]));
