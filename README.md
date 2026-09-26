@@ -45,6 +45,11 @@ standard PIC benchmark suite used during the June baseline campaign. See each
 report under [`reports/`](reports/) for what later package deltas do and do not
 claim.
 
+The default Metal build covers 1D, 2D, RZ, and 3D. Qualification is
+geometry-specific: RZ direct deposition is qualified, while the RZ
+Esirkepov/Vay/Villasenor current paths and RZ charge/gather paths have not yet
+been exercised on Metal.
+
 ## Reliability
 
 The backend includes reliability controls for heavy runs:

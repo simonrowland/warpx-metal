@@ -16,7 +16,7 @@ source "${SCRIPT_DIR}/env.sh"
 
 WARPX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/warpx"
 ACPP="${ACPP_INSTALL_PREFIX}/bin/acpp"
-METAL_DIMS="${WARPX_METAL_DIMS:-2;3}"
+METAL_DIMS="${WARPX_METAL_DIMS:-1;2;RZ;3}"
 
 # Verify acpp is available
 if [ ! -x "${ACPP}" ]; then
