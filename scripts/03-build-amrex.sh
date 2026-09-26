@@ -10,6 +10,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
+ACPP_ATTESTATION="${ACPP_INSTALL_PREFIX}/bin/BUILD-ATTESTATION.json"
+if [ ! -f "${ACPP_ATTESTATION}" ]; then
+    echo "[FAIL] AdaptiveCpp attestation not found at ${ACPP_ATTESTATION}"
+    echo "       Run ./scripts/01-build-adaptivecpp.sh first."
+    exit 1
+fi
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind adaptivecpp \
+    --verify-attestation "${ACPP_ATTESTATION}" \
+    --binary-dir "${ACPP_INSTALL_PREFIX}/bin" \
+    --artifact-dir "${ACPP_INSTALL_PREFIX}/lib" \
+    --external AdaptiveCpp
+
 AMREX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/amrex"
 AMREX_INSTALL_PREFIX="${WARPX_METAL_ROOT}/opt/amrex"
 ACPP="${ACPP_INSTALL_PREFIX}/bin/acpp"
@@ -199,23 +213,33 @@ else
     echo "  [OK] No AMReX post-replacement patch directory"
 fi
 
+BUILD_DIR="${WARPX_METAL_ROOT}/build/amrex-acpp"
+rm -rf "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}"
+SOURCE_INTEGRITY_FILE="${AMREX_INSTALL_PREFIX}/SOURCE-INTEGRITY.json"
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind amrex \
+    --record-source-integrity \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp \
+    --external AMReX
+
 echo ""
 echo "=== Step 3: Configure AMReX with CMake ==="
 
-BUILD_DIR="${AMREX_SOURCE_DIR}/build-acpp"
-rm -rf "${BUILD_DIR}"
-mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
 # macOS SDK sysroot (needed for Homebrew LLVM)
 MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
-cmake .. \
+cmake "${AMREX_SOURCE_DIR}" \
     -G Ninja \
     -DCMAKE_INSTALL_PREFIX="${AMREX_INSTALL_PREFIX}" \
     -DCMAKE_CXX_COMPILER="${ACPP}" \
     -DCMAKE_OSX_SYSROOT="${MACOS_SDK}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DAMReX_GPU_BACKEND=SYCL \
     -DAMReX_PRECISION=SINGLE \
     -DAMReX_PARTICLES_PRECISION=SINGLE \
@@ -242,10 +266,12 @@ echo "=== Step 6: Verify installation ==="
 
 if [ -f "${AMREX_INSTALL_PREFIX}/lib/cmake/AMReX/AMReXConfig.cmake" ]; then
     echo "  [OK] AMReX CMake config found"
+    AMREX_LIBRARY_DIR="${AMREX_INSTALL_PREFIX}/lib"
 else
     # Some installs put it in lib64
     if [ -f "${AMREX_INSTALL_PREFIX}/lib64/cmake/AMReX/AMReXConfig.cmake" ]; then
         echo "  [OK] AMReX CMake config found (lib64)"
+        AMREX_LIBRARY_DIR="${AMREX_INSTALL_PREFIX}/lib64"
     else
         echo "  [FAIL] AMReX CMake config not found in ${AMREX_INSTALL_PREFIX}"
         exit 1
@@ -259,6 +285,16 @@ else
     echo "  [FAIL] AMReX libraries not found"
     exit 1
 fi
+
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --destination "${AMREX_INSTALL_PREFIX}/BUILD-ATTESTATION.json" \
+    --binary-dir "${AMREX_LIBRARY_DIR}" \
+    --kind amrex \
+    --build-dir "${BUILD_DIR}" \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp \
+    --external AMReX
 
 echo ""
 echo "=== AMReX build complete ==="

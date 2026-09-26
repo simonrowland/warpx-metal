@@ -23,6 +23,19 @@ if [ ! -x "${ACPP}" ]; then
     echo "       Run ./scripts/01-build-adaptivecpp.sh first."
     exit 1
 fi
+ACPP_ATTESTATION="${ACPP_INSTALL_PREFIX}/bin/BUILD-ATTESTATION.json"
+if [ ! -f "${ACPP_ATTESTATION}" ]; then
+    echo "[FAIL] AdaptiveCpp attestation not found at ${ACPP_ATTESTATION}"
+    echo "       Run ./scripts/01-build-adaptivecpp.sh first."
+    exit 1
+fi
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind adaptivecpp \
+    --verify-attestation "${ACPP_ATTESTATION}" \
+    --binary-dir "${ACPP_INSTALL_PREFIX}/bin" \
+    --artifact-dir "${ACPP_INSTALL_PREFIX}/lib" \
+    --external AdaptiveCpp
 
 # Verify AMReX source is available (for patches)
 if [ ! -d "${AMREX_SOURCE_DIR}/.git" ]; then
@@ -55,6 +68,10 @@ fi
 echo ""
 echo "=== Step 2: Apply AMReX patches ==="
 echo "  (WarpX builds AMReX from source — patches must be applied to AMReX tree)"
+
+BUILD_DIR="${WARPX_SOURCE_DIR}/build-acpp"
+rm -rf "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}"
 
 cd "${AMREX_SOURCE_DIR}"
 git checkout -- .
@@ -231,12 +248,19 @@ if [ -d "${WARPX_PATCH_DIR}" ]; then
     fi
 fi
 
+SOURCE_INTEGRITY_FILE="${BUILD_DIR}/SOURCE-INTEGRITY.json"
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind warpx-metal \
+    --record-source-integrity \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp \
+    --external AMReX \
+    --external WarpX
+
 echo ""
 echo "=== Step 4: Configure WarpX with CMake ==="
 
-BUILD_DIR="${WARPX_SOURCE_DIR}/build-acpp"
-rm -rf "${BUILD_DIR}"
-mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
 # macOS SDK sysroot
@@ -249,6 +273,7 @@ cmake -S "${WARPX_SOURCE_DIR}" -B . \
     -DCMAKE_CXX_COMPILER="${ACPP}" \
     -DCMAKE_OSX_SYSROOT="${MACOS_SDK}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DWarpX_COMPUTE=SYCL \
     -DWarpX_PRECISION=SINGLE \
     -DWarpX_PARTICLE_PRECISION=SINGLE \
@@ -281,6 +306,19 @@ for dim in 2d 3d; do
         fi
     fi
 done
+
+BIN_DIR="${BUILD_DIR}/bin"
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --destination "${BIN_DIR}/BUILD-ATTESTATION.json" \
+    --binary-dir "${BIN_DIR}" \
+    --artifact-dir "${BUILD_DIR}" \
+    --kind warpx-metal \
+    --build-dir "${BUILD_DIR}" \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp \
+    --external AMReX \
+    --external WarpX
 
 echo ""
 echo "=== WarpX build complete ==="

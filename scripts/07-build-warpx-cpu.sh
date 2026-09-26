@@ -15,6 +15,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
+ACPP_ATTESTATION="${ACPP_INSTALL_PREFIX}/bin/BUILD-ATTESTATION.json"
+if [ ! -f "${ACPP_ATTESTATION}" ]; then
+    echo "[FAIL] AdaptiveCpp attestation not found at ${ACPP_ATTESTATION}"
+    echo "       Run ./scripts/01-build-adaptivecpp.sh first."
+    exit 1
+fi
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind adaptivecpp \
+    --verify-attestation "${ACPP_ATTESTATION}" \
+    --binary-dir "${ACPP_INSTALL_PREFIX}/bin" \
+    --artifact-dir "${ACPP_INSTALL_PREFIX}/lib" \
+    --external AdaptiveCpp
+
 # CPU build uses system Apple Clang (not LLVM 20)
 CPU_CXX="$(xcrun -find clang++)"
 CPU_CC="$(xcrun -find clang)"
@@ -100,6 +114,17 @@ rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
+SOURCE_INTEGRITY_FILE="${BUILD_DIR}/SOURCE-INTEGRITY.json"
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind warpx-cpu \
+    --record-source-integrity \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp \
+    --external AMReX \
+    --external WarpX \
+    --skip-input-dir patches/amrex-post
+
 MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
 cmake -S "${WARPX_SOURCE_DIR}" -B . \
@@ -108,6 +133,7 @@ cmake -S "${WARPX_SOURCE_DIR}" -B . \
     -DCMAKE_C_COMPILER="${CPU_CC}" \
     -DCMAKE_OSX_SYSROOT="${MACOS_SDK}" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DCMAKE_CXX_FLAGS="-Xpreprocessor -fopenmp -I${LIBOMP_PREFIX}/include" \
     -DCMAKE_EXE_LINKER_FLAGS="-L${LIBOMP_PREFIX}/lib -lomp" \
     -DCMAKE_SHARED_LINKER_FLAGS="-L${LIBOMP_PREFIX}/lib -lomp" \
@@ -129,6 +155,7 @@ ninja -j"${NPROC}"
 echo ""
 echo "=== Step 4: Verify build ==="
 
+BIN_DIR="${BUILD_DIR}/bin"
 CPU_2D=""
 CPU_3D=""
 for dim in 2d 3d; do
@@ -141,6 +168,19 @@ for dim in 2d 3d; do
         echo "  [WARN] WarpX ${dim} CPU executable not found in ${BUILD_DIR}/bin"
     fi
 done
+
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --destination "${BIN_DIR}/BUILD-ATTESTATION.json" \
+    --binary-dir "${BIN_DIR}" \
+    --artifact-dir "${BUILD_DIR}" \
+    --kind warpx-cpu \
+    --build-dir "${BUILD_DIR}" \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp \
+    --external AMReX \
+    --external WarpX \
+    --skip-input-dir patches/amrex-post
 
 echo ""
 echo "=== CPU WarpX build complete ==="

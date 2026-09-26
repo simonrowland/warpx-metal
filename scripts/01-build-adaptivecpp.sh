@@ -59,11 +59,19 @@ else
     echo "  [OK] No patches to apply"
 fi
 
+BUILD_DIR="${ACPP_SOURCE_DIR}/build"
+mkdir -p "${BUILD_DIR}"
+SOURCE_INTEGRITY_FILE="${BUILD_DIR}/SOURCE-INTEGRITY.json"
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --kind adaptivecpp \
+    --record-source-integrity \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp
+
 echo ""
 echo "=== Step 3: Configure with CMake ==="
 
-BUILD_DIR="${ACPP_SOURCE_DIR}/build"
-mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
 # libomp is keg-only on Homebrew; help CMake find it
@@ -99,7 +107,8 @@ cmake .. \
     -DWITH_ROCM_BACKEND=OFF \
     -DWITH_OPENCL_BACKEND=OFF \
     -DWITH_LEVEL_ZERO_BACKEND=OFF \
-    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 echo ""
 echo "=== Step 4: Build ==="
@@ -138,6 +147,16 @@ else
     echo "  [FAIL] acpp-info not found at ${ACPP_INSTALL_PREFIX}/bin/acpp-info"
     exit 1
 fi
+
+python3 "${SCRIPT_DIR}/write-build-attestation.py" \
+    --root "${WARPX_METAL_ROOT}" \
+    --destination "${ACPP_INSTALL_PREFIX}/bin/BUILD-ATTESTATION.json" \
+    --binary-dir "${ACPP_INSTALL_PREFIX}/bin" \
+    --artifact-dir "${ACPP_INSTALL_PREFIX}/lib" \
+    --kind adaptivecpp \
+    --build-dir "${BUILD_DIR}" \
+    --source-integrity-file "${SOURCE_INTEGRITY_FILE}" \
+    --external AdaptiveCpp
 
 echo ""
 echo "=== AdaptiveCpp build complete ==="
