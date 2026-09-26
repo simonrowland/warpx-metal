@@ -43,7 +43,7 @@ if [ -d "${ACPP_INSTALL_PREFIX}/bin" ]; then
 fi
 
 # Build parallelism
-export NPROC="$(sysctl -n hw.ncpu)"
+export NPROC="${NPROC:-$(sysctl -n hw.ncpu)}"
 
 echo "=== WarpX-on-Metal Environment ==="
 echo "  Project root:    ${WARPX_METAL_ROOT}"
