@@ -1,0 +1,1239 @@
+Subject: [PATCH] Make Metal runtime waits bounded and fail closed
+
+Use bounded host waits with sticky asynchronous errors across Metal event,
+queue, dependency, and staging paths. Retain the explicit producer completion
+barrier before device-to-host copies and wait for the copy to complete before
+publishing host bytes. Keep queue status tied to tracked validation and host
+completion, and bound literal pattern expansion before falling back to the
+existing loop.
+diff --git a/include/hipSYCL/runtime/metal/metal_event.hpp b/include/hipSYCL/runtime/metal/metal_event.hpp
+index 14beaef8..4aed5a57 100644
+--- a/include/hipSYCL/runtime/metal/metal_event.hpp
++++ b/include/hipSYCL/runtime/metal/metal_event.hpp
+@@ -13,6 +13,7 @@
+ 
+ #include "../inorder_queue_event.hpp"
+ #include "../signal_channel.hpp"
++#include "../error.hpp"
+ #include <memory>
+ 
+ namespace MTL {
+@@ -22,6 +23,8 @@ class SharedEvent;
+ namespace hipsycl {
+ namespace rt {
+ 
++struct metal_async_error_state;
++
+ struct metal_event_handle {
+   MTL::SharedEvent* event;
+   uint64_t value;
+@@ -36,6 +39,7 @@ public:
+ 
+   virtual bool is_complete() const override;
+   virtual void wait() override;
++  result wait_for(const std::shared_ptr<metal_async_error_state>& error_state);
+ 
+   virtual metal_event_handle request_backend_event() override;
+ 
+diff --git a/include/hipSYCL/runtime/metal/metal_queue.hpp b/include/hipSYCL/runtime/metal/metal_queue.hpp
+index d5a5bc9f..728ae6e3 100644
+--- a/include/hipSYCL/runtime/metal/metal_queue.hpp
++++ b/include/hipSYCL/runtime/metal/metal_queue.hpp
+@@ -25,9 +25,6 @@
+ 
+ #include <mach/mach_time.h>
+ 
+-#include <memory>
+-#include <mutex>
+-
+ namespace MTL {
+ 
+ class Device;
+@@ -161,7 +158,8 @@ public:
+   virtual ~metal_inorder_queue();
+ 
+ private:
+-  MTL::CommandBuffer* new_command_buffer();
++  MTL::CommandBuffer* new_command_buffer(
++      std::shared_ptr<metal_command_buffer_wait_state>* completion_state = nullptr);
+   void remember_submitted_command_buffer(
+       MTL::CommandBuffer* command_buffer,
+       std::shared_ptr<metal_command_buffer_wait_state> completion_state);
+@@ -181,19 +179,13 @@ private:
+   uint64_t _pending_cpu_event{0};
+   uint64_t _pending_gpu_event{0};
+ 
+-  // Metal may overlap command buffers from the same command queue. Retain the
+-  // most recently submitted producer so host readback can establish an
+-  // explicit completion boundary before encoding its blit.
+   MTL::CommandBuffer* _last_submitted_command_buffer = nullptr;
+   std::shared_ptr<metal_command_buffer_wait_state>
+-    _last_submitted_command_buffer_wait_state;
++      _last_submitted_command_buffer_wait_state;
+   std::mutex _last_submitted_command_buffer_mutex;
+ 
+-  // Command-buffer callbacks outlive individual submissions. Keep their first
+-  // asynchronous failure available to queue waits so a published completion
+-  // value cannot make invalid device-to-host data look usable.
+   std::shared_ptr<metal_async_error_state> _async_error_state =
+-    std::make_shared<metal_async_error_state>();
++      std::make_shared<metal_async_error_state>();
+ 
+   metal_allocator* _allocator = nullptr;
+   device_id _device_id;
+diff --git a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+index 63a54ba8..0b0dc4d3 100644
+--- a/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
++++ b/src/compiler/llvm-to-backend/metal/LLVMToMetal.cpp
+@@ -472,20 +472,24 @@ struct ExpandMemsetPattern16Libcalls : llvm::PassInfoMixin<ExpandMemsetPattern16
+ 
+     auto* ByteTy = llvm::Type::getInt8Ty(CB->getContext());
+     if (auto* ConstantLength = llvm::dyn_cast<llvm::ConstantInt>(Length)) {
+-      llvm::IRBuilder<> Builder(CB);
+-      const uint64_t Count = ConstantLength->getValue().getLimitedValue();
+-      for (uint64_t Offset = 0; Offset < Count; ++Offset) {
+-        auto* Index = llvm::ConstantInt::get(LengthTy, Offset);
+-        auto* DstByte = Builder.CreateGEP(ByteTy, Dst, Index, "memset_pattern16.dst");
+-        auto* PatternByte = Builder.CreateGEP(
+-            ByteTy, Pattern,
+-            llvm::ConstantInt::get(LengthTy, Offset & 15),
+-            "memset_pattern16.pattern");
+-        auto* Value = Builder.CreateLoad(ByteTy, PatternByte, "memset_pattern16.value");
+-        Builder.CreateStore(Value, DstByte);
++      constexpr uint64_t MaxLiteralBytes = 4096;
++      const uint64_t Count = ConstantLength->getValue().getLimitedValue(
++          MaxLiteralBytes + 1);
++      if (Count <= MaxLiteralBytes) {
++        llvm::IRBuilder<> Builder(CB);
++        for (uint64_t Offset = 0; Offset < Count; ++Offset) {
++          auto* Index = llvm::ConstantInt::get(LengthTy, Offset);
++          auto* DstByte = Builder.CreateGEP(ByteTy, Dst, Index, "memset_pattern16.dst");
++          auto* PatternByte = Builder.CreateGEP(
++              ByteTy, Pattern,
++              llvm::ConstantInt::get(LengthTy, Offset & 15),
++              "memset_pattern16.pattern");
++          auto* Value = Builder.CreateLoad(ByteTy, PatternByte, "memset_pattern16.value");
++          Builder.CreateStore(Value, DstByte);
++        }
++        CB->eraseFromParent();
++        return true;
+       }
+-      CB->eraseFromParent();
+-      return true;
+     }
+ 
+     auto* Function = CB->getFunction();
+diff --git a/src/runtime/metal/metal_event.cpp b/src/runtime/metal/metal_event.cpp
+index 11538f6e..128db58e 100644
+--- a/src/runtime/metal/metal_event.cpp
++++ b/src/runtime/metal/metal_event.cpp
+@@ -9,6 +9,7 @@
+  */
+ // SPDX-License-Identifier: BSD-2-Clause
+ #include "hipSYCL/runtime/metal/metal_event.hpp"
++#include "hipSYCL/runtime/metal/metal_wait_result.hpp"
+ #include "metal_timeout.hpp"
+ 
+ #include <Metal/Metal.hpp>
+@@ -16,9 +17,6 @@
+ #include <chrono>
+ #include <sstream>
+ 
+-// stall-hunt trampoline (defined in metal_queue.cpp)
+-extern "C" void stall_hunt_note_host_wait_c(void* evt, unsigned long long want, int spin_sec);
+-
+ namespace hipsycl {
+ namespace rt {
+ 
+@@ -35,39 +33,34 @@ bool metal_node_event::is_complete() const {
+   return _handle.event->signaledValue() >= _handle.value;
+ }
+ 
+-void metal_node_event::wait() {
++result metal_node_event::wait_for(
++    const std::shared_ptr<metal_async_error_state>& error_state) {
+   const auto timeout = metal_command_timeout();
+   const auto started_at = std::chrono::steady_clock::now();
+   const auto deadline = started_at + timeout;
+-  int last_noted_second = 0;
+   const bool signaled = detail::wait_until_metal_event_deadline(
+-      deadline, [this, started_at,
+-                 &last_noted_second](std::chrono::milliseconds slice) {
+-        const bool slice_signaled = _handle.event->waitUntilSignaledValue(
++      deadline, [this](std::chrono::milliseconds slice) {
++        return _handle.event->waitUntilSignaledValue(
+             _handle.value, static_cast<unsigned long long>(slice.count()));
+-        if (!slice_signaled) {
+-          const int waited_seconds = static_cast<int>(
+-              std::chrono::duration_cast<std::chrono::seconds>(
+-                  std::chrono::steady_clock::now() - started_at)
+-                  .count());
+-          if (waited_seconds > last_noted_second) {
+-            last_noted_second = waited_seconds;
+-            stall_hunt_note_host_wait_c(
+-                _handle.event, static_cast<unsigned long long>(_handle.value),
+-                waited_seconds);
+-          }
+-        }
+-        return slice_signaled;
+       });
+-  if (signaled) {
+-    return;
++  if (!signaled) {
++    std::ostringstream message;
++    message << "metal_node_event: timed out after " << timeout.count()
++            << " ms waiting for shared-event value " << _handle.value
++            << "; current value is " << _handle.event->signaledValue();
++    auto failure = make_error(__acpp_here(), error_info{message.str()});
++    if (error_state) {
++      record_metal_async_failure(error_state, failure);
++    } else {
++      register_error(failure);
++    }
++    return failure;
+   }
++  return make_success();
++}
+ 
+-  std::ostringstream message;
+-  message << "metal_node_event: timed out after " << timeout.count()
+-          << " ms waiting for shared-event value " << _handle.value
+-          << "; current value is " << _handle.event->signaledValue();
+-  register_error(make_error(__acpp_here(), error_info{message.str()}));
++void metal_node_event::wait() {
++  wait_for(nullptr);
+ }
+ 
+ metal_event_handle metal_node_event::request_backend_event() {
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+index cad434c8..604b4e08 100644
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -11,10 +11,10 @@
+ #include "hipSYCL/runtime/metal/metal_queue.hpp"
+ #include "hipSYCL/runtime/metal/metal_command_buffer_status.hpp"
+ #include "hipSYCL/runtime/metal/metal_code_object.hpp"
+-#include "metal_timeout.hpp"
+ #include "hipSYCL/runtime/metal/metal_aot_cache_identity.hpp"
+ #include "hipSYCL/runtime/metal/metal_event.hpp"
+ #include "hipSYCL/runtime/metal/metal_jit_guard.hpp"
++#include "metal_timeout.hpp"
+ #include "hipSYCL/compiler/llvm-to-backend/metal/LLVMToMetalFactory.hpp"
+ #include "hipSYCL/glue/llvm-sscp/jit.hpp"
+ #include "hipSYCL/glue/llvm-sscp/jit-reflection/reflection_map.hpp"
+@@ -23,7 +23,6 @@
+ 
+ #include <Metal/Metal.hpp>
+ #include <algorithm>
+-#include <atomic>
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdlib>
+@@ -33,354 +32,11 @@
+ #include <memory>
+ #include <mutex>
+ #include <sstream>
+-#include <thread>
+ #include <unordered_map>
+ #include <utility>
+ 
+ #undef nil
+ 
+-// ==== STALL-HUNT CAPTURE BEGIN (2026-08-05) ====
+-#include <chrono>
+-#include <thread>
+-#include <vector>
+-#include <string>
+-#include <atomic>
+-#include <mutex>
+-#include <sstream>
+-#include <deque>
+-#include <cstdio>
+-
+-namespace stall_hunt {
+-
+-inline int watchdog_timeout_sec() {
+-  static int t = []() -> int {
+-    const char* env = std::getenv("ACPP_METAL_CMDBUF_WATCHDOG_SEC");
+-    if (!env || !env[0]) return 0;
+-    char* end = nullptr;
+-    long v = std::strtol(env, &end, 10);
+-    if (end == env || v <= 0) return 0;
+-    if (v > 3600) v = 3600;
+-    return static_cast<int>(v);
+-  }();
+-  return t;
+-}
+-
+-inline const char* status_name(MTL::CommandBufferStatus s) {
+-  switch (s) {
+-    case MTL::CommandBufferStatusNotEnqueued: return "NotEnqueued";
+-    case MTL::CommandBufferStatusEnqueued: return "Enqueued";
+-    case MTL::CommandBufferStatusCommitted: return "Committed";
+-    case MTL::CommandBufferStatusScheduled: return "Scheduled";
+-    case MTL::CommandBufferStatusCompleted: return "Completed";
+-    case MTL::CommandBufferStatusError: return "Error";
+-  }
+-  return "Unknown";
+-}
+-
+-inline std::string err_str(NS::Error* error) {
+-  if (!error) return "none";
+-  std::ostringstream out;
+-  out << "domain=";
+-  if (error->domain() && error->domain()->utf8String())
+-    out << error->domain()->utf8String();
+-  else
+-    out << "null";
+-  out << " code=" << error->code() << " desc=";
+-  if (error->localizedDescription() && error->localizedDescription()->utf8String())
+-    out << error->localizedDescription()->utf8String();
+-  else
+-    out << "null";
+-  return out.str();
+-}
+-
+-struct LaunchRec {
+-  std::uint64_t seq = 0;
+-  std::string label;
+-  std::uint64_t wait_value = 0;
+-  std::uint64_t signal_value = 0;
+-  std::uint64_t shared_signalled_at_submit = 0;
+-  std::chrono::steady_clock::time_point t;
+-};
+-
+-struct CBRec {
+-  std::uint64_t id = 0;
+-  std::string label;
+-  MTL::CommandBuffer* cb = nullptr;
+-  MTL::SharedEvent* shared_event = nullptr;
+-  std::uint64_t encode_wait_value = 0;
+-  std::uint64_t encode_signal_value = 0;
+-  std::uint64_t shared_signalled_at_submit = 0;
+-  std::chrono::steady_clock::time_point created_at;
+-  std::atomic<bool> completed{false};
+-  std::atomic<bool> timeout_logged{false};
+-};
+-
+-inline std::mutex& g_mu() { static std::mutex m; return m; }
+-inline std::vector<std::shared_ptr<CBRec>>& g_cbs() {
+-  static std::vector<std::shared_ptr<CBRec>> v; return v;
+-}
+-inline std::deque<LaunchRec>& g_launches() {
+-  static std::deque<LaunchRec> d; return d;
+-}
+-inline std::atomic<std::uint64_t>& g_next_id() {
+-  static std::atomic<std::uint64_t> n{0}; return n;
+-}
+-inline std::atomic<std::uint64_t>& g_launch_seq() {
+-  static std::atomic<std::uint64_t> n{0}; return n;
+-}
+-inline std::atomic<bool>& g_watchdog_started() {
+-  static std::atomic<bool> b{false}; return b;
+-}
+-inline std::atomic<MTL::SharedEvent*>& g_primary_shared() {
+-  static std::atomic<MTL::SharedEvent*> p{nullptr}; return p;
+-}
+-inline std::atomic<std::uint64_t>& g_last_signal_submitted() {
+-  static std::atomic<std::uint64_t> n{0}; return n;
+-}
+-inline std::atomic<std::uint64_t>& g_last_wait_submitted() {
+-  static std::atomic<std::uint64_t> n{0}; return n;
+-}
+-inline std::atomic<bool>& g_table_dumped() {
+-  static std::atomic<bool> b{false}; return b;
+-}
+-
+-inline void record_launch(const std::string& label, std::uint64_t wait_v,
+-                          std::uint64_t signal_v, std::uint64_t signalled) {
+-  LaunchRec r;
+-  r.seq = ++g_launch_seq();
+-  r.label = label;
+-  r.wait_value = wait_v;
+-  r.signal_value = signal_v;
+-  r.shared_signalled_at_submit = signalled;
+-  r.t = std::chrono::steady_clock::now();
+-  std::lock_guard<std::mutex> lock(g_mu());
+-  g_launches().push_back(std::move(r));
+-  while (g_launches().size() > 20) g_launches().pop_front();
+-}
+-
+-inline void dump_table(const char* reason, MTL::SharedEvent* evt_hint = nullptr) {
+-  bool first = !g_table_dumped().exchange(true);
+-  auto now = std::chrono::steady_clock::now();
+-  std::uint64_t signalled = 0;
+-  MTL::SharedEvent* evt = evt_hint ? evt_hint : g_primary_shared().load();
+-  if (evt) signalled = evt->signaledValue();
+-
+-  std::ostringstream out;
+-  out << "\n======== STALL_HUNT_CB_TABLE reason=" << reason
+-      << " first=" << (first ? 1 : 0) << " =========\n";
+-  out << "shared_event_ptr=" << static_cast<const void*>(evt)
+-      << " shared_signalled_value=" << signalled
+-      << " last_signal_submitted=" << g_last_signal_submitted().load()
+-      << " last_wait_submitted=" << g_last_wait_submitted().load()
+-      << "\n";
+-  out << "--- outstanding / recent CBs ---\n";
+-  out << "id\tage_sec\tstatus\terror\tencode_wait\tencode_signal\t"
+-         "signalled_at_submit\tcompleted\tlabel\n";
+-
+-  std::vector<std::shared_ptr<CBRec>> snap;
+-  std::deque<LaunchRec> launches;
+-  {
+-    std::lock_guard<std::mutex> lock(g_mu());
+-    snap = g_cbs();
+-    launches = g_launches();
+-  }
+-
+-  int outstanding = 0;
+-  for (auto& rec : snap) {
+-    if (!rec || !rec->cb) continue;
+-    auto age = std::chrono::duration_cast<std::chrono::seconds>(
+-        now - rec->created_at).count();
+-    auto* cb = rec->cb;
+-    auto st = cb->status();
+-    std::string stn = status_name(st);
+-    std::string er = err_str(cb->error());
+-    bool done = rec->completed.load();
+-    if (!done) outstanding++;
+-    if (!done || age < 5) {
+-      out << rec->id << "\t" << age << "\t" << stn << "\t\"" << er << "\"\t"
+-          << rec->encode_wait_value << "\t" << rec->encode_signal_value << "\t"
+-          << rec->shared_signalled_at_submit << "\t" << (done ? 1 : 0) << "\t\""
+-          << rec->label << "\"\n";
+-    }
+-  }
+-  out << "outstanding_count=" << outstanding << "\n";
+-
+-  out << "--- last ~20 launches (most recent last) ---\n";
+-  out << "seq\twait\tsignal\tsignalled_at_submit\tlabel\n";
+-  for (const auto& L : launches) {
+-    out << L.seq << "\t" << L.wait_value << "\t" << L.signal_value << "\t"
+-        << L.shared_signalled_at_submit << "\t\"" << L.label << "\"\n";
+-  }
+-
+-  out << "--- classification_hints ---\n";
+-  bool row1 = false, row2 = false, row3 = false;
+-  for (auto& rec : snap) {
+-    if (!rec || !rec->cb || rec->completed.load()) continue;
+-    auto st = rec->cb->status();
+-    std::uint64_t need = rec->encode_wait_value;
+-    if (need > 0 && signalled < need &&
+-        (st == MTL::CommandBufferStatusCommitted ||
+-         st == MTL::CommandBufferStatusScheduled ||
+-         st == MTL::CommandBufferStatusEnqueued)) {
+-      row1 = true;
+-      out << "HINT_ROW1 id=" << rec->id
+-          << " CB waiting encodeWait=" << need
+-          << " but signalled=" << signalled << "\n";
+-    } else if (st == MTL::CommandBufferStatusCompleted) {
+-      row2 = true;
+-      out << "HINT_ROW2 id=" << rec->id
+-          << " CB Completed but still tracked outstanding\n";
+-    } else if ((st == MTL::CommandBufferStatusCommitted ||
+-                st == MTL::CommandBufferStatusScheduled) &&
+-               (need == 0 || signalled >= need)) {
+-      row3 = true;
+-      out << "HINT_ROW3 id=" << rec->id
+-          << " CB " << status_name(st)
+-          << " waits_satisfied (need=" << need
+-          << " signalled=" << signalled
+-          << ") but GPU has not retired\n";
+-    } else {
+-      out << "HINT_OTHER id=" << rec->id << " status=" << status_name(st)
+-          << " wait=" << need << " signalled=" << signalled << "\n";
+-    }
+-  }
+-  out << "summary_row1_unsatisfied_wait=" << (row1 ? 1 : 0)
+-      << " row2_completed_host_blind=" << (row2 ? 1 : 0)
+-      << " row3_driver_non_retire=" << (row3 ? 1 : 0) << "\n";
+-  out << "======== END STALL_HUNT_CB_TABLE ========\n";
+-
+-  std::cerr << out.str() << std::flush;
+-  if (const char* path = std::getenv("STALL_HUNT_CAPTURE_PATH")) {
+-    if (path[0]) {
+-      FILE* f = std::fopen(path, "a");
+-      if (f) {
+-        std::fputs(out.str().c_str(), f);
+-        std::fclose(f);
+-      }
+-    }
+-  }
+-}
+-
+-inline void watchdog_loop() {
+-  for (;;) {
+-    std::this_thread::sleep_for(std::chrono::seconds(1));
+-    const int timeout = watchdog_timeout_sec();
+-    if (timeout <= 0) continue;
+-    auto now = std::chrono::steady_clock::now();
+-    std::vector<std::shared_ptr<CBRec>> pending;
+-    bool fire = false;
+-    {
+-      std::lock_guard<std::mutex> lock(g_mu());
+-      pending.reserve(g_cbs().size());
+-      for (auto& rec : g_cbs()) {
+-        if (!rec || !rec->cb) continue;
+-        if (rec->completed.load()) {
+-          if (rec->cb) {
+-            rec->cb->release();
+-            rec->cb = nullptr;
+-          }
+-          continue;
+-        }
+-        auto age = std::chrono::duration_cast<std::chrono::seconds>(
+-            now - rec->created_at).count();
+-        if (age >= timeout && !rec->timeout_logged.exchange(true)) {
+-          fire = true;
+-          auto* cb = rec->cb;
+-          std::cerr << "B001_METAL_CMDBUF_TIMEOUT"
+-                    << " id=" << rec->id
+-                    << " age_sec=" << age
+-                    << " timeout_sec=" << timeout
+-                    << " status=" << status_name(cb->status())
+-                    << " error=\"" << err_str(cb->error()) << "\""
+-                    << " encode_wait=" << rec->encode_wait_value
+-                    << " encode_signal=" << rec->encode_signal_value
+-                    << " signalled_now="
+-                    << (rec->shared_event ? rec->shared_event->signaledValue() : 0)
+-                    << " label=\"" << rec->label << "\""
+-                    << std::endl;
+-        }
+-        pending.push_back(rec);
+-      }
+-      g_cbs().swap(pending);
+-    }
+-    if (fire) {
+-      dump_table("watchdog_timeout");
+-    }
+-  }
+-}
+-
+-inline void watch_cb(MTL::CommandBuffer* cb, MTL::SharedEvent* shared,
+-                     std::string label, std::uint64_t wait_v, std::uint64_t signal_v) {
+-  if (!cb) return;
+-  // Always track when env set; also when STALL_HUNT_ALWAYS_TRACK=1
+-  if (!std::getenv("ACPP_METAL_CMDBUF_WATCHDOG_SEC") &&
+-      !std::getenv("STALL_HUNT_ALWAYS_TRACK")) {
+-    return;
+-  }
+-  if (shared) g_primary_shared().store(shared);
+-  if (signal_v) g_last_signal_submitted().store(signal_v);
+-  if (wait_v) g_last_wait_submitted().store(wait_v);
+-
+-  std::uint64_t signalled = shared ? shared->signaledValue() : 0;
+-  record_launch(label, wait_v, signal_v, signalled);
+-
+-  auto rec = std::make_shared<CBRec>();
+-  rec->id = ++g_next_id();
+-  rec->label = std::move(label);
+-  rec->cb = cb->retain();
+-  rec->shared_event = shared;
+-  rec->encode_wait_value = wait_v;
+-  rec->encode_signal_value = signal_v;
+-  rec->shared_signalled_at_submit = signalled;
+-  rec->created_at = std::chrono::steady_clock::now();
+-
+-  cb->addCompletedHandler([rec](MTL::CommandBuffer* c) {
+-    rec->completed.store(true);
+-    if (c && c->status() == MTL::CommandBufferStatusError) {
+-      std::cerr << "B001_METAL_CMDBUF_ERROR id=" << rec->id
+-                << " error=\"" << err_str(c->error()) << "\""
+-                << " label=\"" << rec->label << "\"" << std::endl;
+-    }
+-  });
+-
+-  {
+-    std::lock_guard<std::mutex> lock(g_mu());
+-    g_cbs().push_back(rec);
+-  }
+-  bool expected = false;
+-  if (g_watchdog_started().compare_exchange_strong(expected, true)) {
+-    std::thread{watchdog_loop}.detach();
+-    std::cerr << "STALL_HUNT_WATCHDOG_STARTED timeout_sec="
+-              << watchdog_timeout_sec() << std::endl;
+-  }
+-}
+-
+-inline void note_host_wait_spin(MTL::SharedEvent* evt, std::uint64_t want, int spin_sec) {
+-  static std::atomic<int> last_dump_at{-1};
+-  if (spin_sec < 5) return;
+-  bool should = (spin_sec == 5 || spin_sec == 15 || spin_sec == 30 ||
+-                 (spin_sec > 30 && spin_sec % 30 == 0));
+-  if (!should) return;
+-  int prev = last_dump_at.load();
+-  if (prev == spin_sec) return;
+-  last_dump_at.store(spin_sec);
+-  std::uint64_t have = evt ? evt->signaledValue() : 0;
+-  std::cerr << "STALL_HUNT_HOST_WAIT_SPIN sec=" << spin_sec
+-            << " want=" << want << " have=" << have
+-            << " delta=" << (want > have ? want - have : 0) << std::endl;
+-  dump_table("host_wait_spin", evt);
+-}
+-
+-} // namespace stall_hunt
+-
+-// C-linkage trampoline for metal_event.cpp
+-extern "C" void stall_hunt_note_host_wait_c(void* evt, unsigned long long want, int spin_sec) {
+-  stall_hunt::note_host_wait_spin(reinterpret_cast<MTL::SharedEvent*>(evt),
+-                                  static_cast<std::uint64_t>(want), spin_sec);
+-}
+-// ==== STALL-HUNT CAPTURE END ====
+-
+-
+ namespace hipsycl {
+ namespace rt {
+ 
+@@ -388,29 +44,32 @@ struct metal_command_buffer_wait_state {
+   std::mutex mutex;
+   std::condition_variable completion;
+   bool completed = false;
++  bool cancelled = false;
++  bool host_copy_in_progress = false;
++  bool defer_completion = true;
+ };
+ 
+ namespace {
+ 
+-void wait_for_shared_event(MTL::SharedEvent* event, uint64_t value) {
+-  while (!event->waitUntilSignaledValue(value, 1000)) {
++result wait_for_shared_event(MTL::SharedEvent* event, uint64_t value,
++                             const char* operation) {
++  const auto timeout = metal_command_timeout();
++  const auto deadline = std::chrono::steady_clock::now() + timeout;
++  const bool signaled = detail::wait_until_metal_event_deadline(
++      deadline, [event, value](std::chrono::milliseconds slice) {
++        return event->waitUntilSignaledValue(
++            value, static_cast<unsigned long long>(slice.count()));
++      });
++  if (signaled) {
++    return make_success();
+   }
+-}
+ 
+-// Metal supports at most 31 [[buffer(N)]] arguments in flat mode.
+-// When a kernel has more than metal_max_args_for_flat_mode parameters,
+-// all arguments are packed into a single argument buffer struct instead.
+-// This value is passed to the compiler via kernel_build_option::metal_max_args_for_flat_mode,
+-// which sets MetalEmitterOptions::maxArgsForFlatMode in LLVMToMetal.
+-static constexpr int metal_max_args_for_flat_mode = 6;
+-// 4096 entries keeps the device lookup linear and cheap enough for the
+-// point-of-use nested-pointer path, while covering production decks that exceed
+-// the old 128-entry single-box-era table by a wide margin.
+-static constexpr std::size_t metal_pointer_translation_max_entries = 4096;
+-static constexpr NS::UInteger metal_local_mem_size_buffer_index = 0;
+-static constexpr NS::UInteger metal_pointer_translation_table_buffer_index = 1;
+-static constexpr NS::UInteger metal_user_arg_buffer_offset = 2;
+-static constexpr NS::UInteger metal_pointer_translation_miss_buffer_index = 30;
++  std::ostringstream message;
++  message << "metal_queue: " << operation << " timed out after "
++          << timeout.count() << " ms waiting for shared-event value " << value
++          << "; current value is " << event->signaledValue();
++  return make_error(__acpp_here(), error_info{message.str()});
++}
+ 
+ const char* metal_command_buffer_status_name(MTL::CommandBufferStatus status) {
+   switch (status) {
+@@ -439,10 +98,28 @@ void complete_metal_command_buffer_wait(
+ }
+ 
+ std::shared_ptr<metal_command_buffer_wait_state>
+-install_metal_command_buffer_wait(MTL::CommandBuffer* command_buffer) {
++install_metal_command_buffer_wait(
++    MTL::CommandBuffer* command_buffer,
++    const std::shared_ptr<metal_async_error_state>& async_error_state) {
+   auto state = make_metal_command_buffer_wait_state();
+-  command_buffer->addCompletedHandler([state](MTL::CommandBuffer*) {
+-    complete_metal_command_buffer_wait(state);
++  command_buffer->addCompletedHandler([state, async_error_state](MTL::CommandBuffer* cb) {
++    if (NS::Error* err = cb->error()) {
++      std::string message = "metal_queue: command buffer failed";
++      if (err->localizedDescription()) {
++        message += ": ";
++        message += err->localizedDescription()->utf8String();
++      }
++      record_metal_async_failure(
++          async_error_state, make_error(__acpp_here(), error_info{message}));
++    }
++    bool defer_completion = false;
++    {
++      std::lock_guard<std::mutex> lock{state->mutex};
++      defer_completion = state->defer_completion;
++    }
++    if (!defer_completion) {
++      complete_metal_command_buffer_wait(state);
++    }
+   });
+   return state;
+ }
+@@ -458,30 +135,53 @@ result wait_for_metal_command_buffer(
+       lock, timeout, [&state] { return state->completed; });
+   lock.unlock();
+ 
++  if (!completed) {
++    std::unique_lock<std::mutex> cancel_lock{state->mutex};
++    state->cancelled = true;
++    state->completion.wait(cancel_lock, [&state] {
++      return !state->host_copy_in_progress;
++    });
++  }
++
+   const auto status = command_buffer->status();
+   return capture_metal_command_buffer_wait_result(
+       async_error_state, completed, status,
+       [timeout, status, operation]() -> result {
+-    std::ostringstream message;
+-    message << "metal_queue: " << operation << " timed out after "
+-            << timeout.count() << " ms; command buffer remained "
+-            << metal_command_buffer_status_name(status);
+-    return make_error(__acpp_here(), error_info{message.str()});
++        std::ostringstream message;
++        message << "metal_queue: " << operation << " timed out after "
++                << timeout.count() << " ms; command buffer remained "
++                << metal_command_buffer_status_name(status);
++        return make_error(__acpp_here(), error_info{message.str()});
+       },
+       [command_buffer, operation]() -> result {
+-    std::string message = "metal_queue: ";
+-    message += operation;
+-    message += " failed";
+-    if (NS::Error* error = command_buffer->error()) {
+-      if (error->localizedDescription()) {
+-        message += ": ";
+-        message += error->localizedDescription()->utf8String();
+-      }
+-    }
+-    return make_error(__acpp_here(), error_info{message});
++        std::string message = "metal_queue: ";
++        message += operation;
++        message += " failed";
++        if (NS::Error* error = command_buffer->error()) {
++          if (error->localizedDescription()) {
++            message += ": ";
++            message += error->localizedDescription()->utf8String();
++          }
++        }
++        return make_error(__acpp_here(), error_info{message});
+       });
+ }
+ 
++// Metal supports at most 31 [[buffer(N)]] arguments in flat mode.
++// When a kernel has more than metal_max_args_for_flat_mode parameters,
++// all arguments are packed into a single argument buffer struct instead.
++// This value is passed to the compiler via kernel_build_option::metal_max_args_for_flat_mode,
++// which sets MetalEmitterOptions::maxArgsForFlatMode in LLVMToMetal.
++static constexpr int metal_max_args_for_flat_mode = 6;
++// 4096 entries keeps the device lookup linear and cheap enough for the
++// point-of-use nested-pointer path, while covering production decks that exceed
++// the old 128-entry fixed-capacity table by a wide margin.
++static constexpr std::size_t metal_pointer_translation_max_entries = 4096;
++static constexpr NS::UInteger metal_local_mem_size_buffer_index = 0;
++static constexpr NS::UInteger metal_pointer_translation_table_buffer_index = 1;
++static constexpr NS::UInteger metal_user_arg_buffer_offset = 2;
++static constexpr NS::UInteger metal_pointer_translation_miss_buffer_index = 30;
++
+ inline unsigned align_up(unsigned x, unsigned a) {
+   return (x + (a - 1)) & ~(a - 1);
+ }
+@@ -930,10 +630,6 @@ void encode_arguments_argbuffer(
+   encoder->setBuffer(arg_buffer_out.get(), 0, buf_offset);
+ }
+ 
+-} // anonymous namespace
+-
+-namespace {
+-
+ result launch_kernel_from_library(
+   MTL::Library* library,
+   MTL::Device* device,
+@@ -1098,10 +794,11 @@ result launch_kernel_from_library(
+     auto* flag = reinterpret_cast<const metal_pointer_translation_miss_flag*>(
+         miss_buffer_for_handler->contents());
+     if (flag && flag->code != 0) {
+-      record_metal_async_failure(async_error_state, make_error(
+-          __acpp_here(),
+-          error_info{make_pointer_translation_miss_error(
+-              kernel_name_for_handler, *flag, launch_table_count, launch_table_capacity)}));
++      record_metal_async_failure(
++          async_error_state,
++          make_error(__acpp_here(), error_info{make_pointer_translation_miss_error(
++              kernel_name_for_handler, *flag, launch_table_count,
++              launch_table_capacity)}));
+     }
+ 
+     if (NS::Error* err = command_buffer->error()) {
+@@ -1109,8 +806,8 @@ result launch_kernel_from_library(
+       if (err->localizedDescription()) {
+         msg += err->localizedDescription()->utf8String();
+       }
+-      record_metal_async_failure(async_error_state,
+-                                 make_error(__acpp_here(), error_info{msg}));
++      record_metal_async_failure(
++          async_error_state, make_error(__acpp_here(), error_info{msg}));
+     }
+ 
+     HIPSYCL_DEBUG_INFO << "metal: Kernel '" << kernel_name_for_handler
+@@ -1118,9 +815,6 @@ result launch_kernel_from_library(
+     complete_metal_command_buffer_wait(completion_state);
+   });
+ 
+-  stall_hunt::watch_cb(command_buffer, /*shared*/ nullptr,
+-    std::string("kernel ") + std::string(kernel_name),
+-    /*wait*/ 0, /*signal*/ 0);
+   command_buffer->commit();
+ 
+   return make_success();
+@@ -1157,8 +851,8 @@ result memset_device(
+       if (err->localizedDescription()) {
+         msg += err->localizedDescription()->utf8String();
+       }
+-      record_metal_async_failure(async_error_state,
+-                                 make_error(__acpp_here(), error_info{msg}));
++      record_metal_async_failure(
++          async_error_state, make_error(__acpp_here(), error_info{msg}));
+     }
+     complete_metal_command_buffer_wait(completion_state);
+   });
+@@ -1183,12 +877,35 @@ metal_inorder_queue::metal_inorder_queue(MTL::Device* device, metal_allocator* a
+   _reflection_map = glue::jit::construct_default_reflection_map(hw_ctx);
+ }
+ 
+-MTL::CommandBuffer* metal_inorder_queue::new_command_buffer() {
++MTL::CommandBuffer* metal_inorder_queue::new_command_buffer(
++    std::shared_ptr<metal_command_buffer_wait_state>* completion_state) {
++  auto async_failure = read_metal_async_failure(_async_error_state);
++  if (!async_failure.is_success()) {
++    return nullptr;
++  }
+   auto* cmd_buf = _command_queue->commandBuffer();
+-  if (auto prev = std::exchange(_pending_gpu_event, 0)) {
++  if (!cmd_buf) {
++    auto failure = make_error(
++        __acpp_here(), error_info{"metal_queue: Failed to create command buffer"});
++    record_metal_async_failure(_async_error_state, failure);
++    return nullptr;
++  }
++  if (auto prev = _pending_gpu_event) {
+     // Keep host-staging completion ordering without putting a GPU-side wait
+     // on the in-order queue.
+-    wait_for_shared_event(_shared_event, prev);
++    auto dependency = wait_for_shared_event(
++        _shared_event, prev, "pending host-staging dependency");
++    if (!dependency.is_success()) {
++      record_metal_async_failure(_async_error_state, dependency);
++      // commandBuffer() returns an autoreleased buffer. It was not retained
++      // before this dependency failed; the pool owns the failure-path release.
++      return nullptr;
++    }
++    _pending_gpu_event = 0;
++  }
++  auto state = install_metal_command_buffer_wait(cmd_buf, _async_error_state);
++  if (completion_state) {
++    *completion_state = state;
+   }
+   if (_profiling_setup) {
+     cmd_buf->addCompletedHandler([setup = std::move(_profiling_setup)](MTL::CommandBuffer* cb) {
+@@ -1224,8 +941,7 @@ result metal_inorder_queue::wait_for_last_submitted_command_buffer(
+   {
+     std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
+     command_buffer = std::exchange(_last_submitted_command_buffer, nullptr);
+-    completion_state =
+-        std::move(_last_submitted_command_buffer_wait_state);
++    completion_state = std::move(_last_submitted_command_buffer_wait_state);
+   }
+   if (!command_buffer) {
+     return make_success();
+@@ -1268,15 +984,16 @@ std::shared_ptr<dag_node_event> metal_inorder_queue::insert_event() {
+ 
+   auto val = ++_event_counter;
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+-  std::uint64_t pending_wait = _pending_gpu_event;
+-  auto* cmd_buf = new_command_buffer();
+-  cmd_buf->encodeSignalEvent(_shared_event, val);
+-  stall_hunt::watch_cb(cmd_buf, _shared_event,
+-    "insert_event signal=" + std::to_string(val),
+-    pending_wait, val);
+-  auto completion_state = install_metal_command_buffer_wait(cmd_buf);
+-  cmd_buf->commit();
+-  remember_submitted_command_buffer(cmd_buf, std::move(completion_state));
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
++  auto* cmd_buf = new_command_buffer(&completion_state);
++  if (cmd_buf) {
++    cmd_buf->encodeSignalEvent(_shared_event, val);
++    cmd_buf->addCompletedHandler([completion_state](MTL::CommandBuffer*) {
++      complete_metal_command_buffer_wait(completion_state);
++    });
++    cmd_buf->commit();
++    remember_submitted_command_buffer(cmd_buf, std::move(completion_state));
++  }
+ 
+   return std::make_shared<metal_node_event>(metal_event_handle{_shared_event, val});
+ }
+@@ -1337,19 +1054,27 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     };
+ 
+     auto prev_cpu_event = std::exchange(_pending_cpu_event, uint64_t{0});
++    auto prior_failure = read_metal_async_failure(_async_error_state);
++    if (!prior_failure.is_success()) {
++      return prior_failure;
++    }
+     if (prev_cpu_event == 0) {
+       do_h2h_copy();
+     } else {
+-      // wait for the prior CPU async work (e.g. device->host copy) to complete
+-      // before reading from src_ptr
+-      auto val_done = ++_event_counter;
+-      _shared_event->notifyListener(_event_listener, prev_cpu_event,
+-        ^(MTL::SharedEvent* evt, uint64_t) {
+-          do_h2h_copy();
+-          evt->setSignaledValue(val_done);
+-        });
+-      _pending_gpu_event = val_done;
+-      _pending_cpu_event = val_done;
++      // Wait for the prior host-staging copy before reading from src_ptr.
++      // Keeping this copy on the submitting thread prevents a listener from
++      // retaining raw host pointers beyond a failed queue wait.
++      auto dependency = wait_for_shared_event(
++          _shared_event, prev_cpu_event, "host-to-host staging dependency");
++      if (!dependency.is_success()) {
++        record_metal_async_failure(_async_error_state, dependency);
++        return dependency;
++      }
++      prior_failure = read_metal_async_failure(_async_error_state);
++      if (!prior_failure.is_success()) {
++        return prior_failure;
++      }
++      do_h2h_copy();
+     }
+     return make_success();
+   }
+@@ -1361,16 +1086,14 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+       return producer_completion;
+     }
+   }
+-
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+ 
+   profiling_setup(op, node);
+-  MTL::CommandBuffer* command_buffer = new_command_buffer();
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
++  MTL::CommandBuffer* command_buffer = new_command_buffer(&completion_state);
+   if (!command_buffer) {
+-    return make_error(__acpp_here(),
+-      error_info{"metal_queue: Failed to create command buffer for memcpy"});
++    return read_metal_async_failure(_async_error_state);
+   }
+-
+   NS::SharedPtr<MTL::Buffer> temp_buffer;
+   if (!src_is_device || !dst_is_device) {
+     temp_buffer = NS::TransferPtr(
+@@ -1388,6 +1111,7 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+ 
+   auto src_staging_offset = src_offset;;
+   auto src_staging_shape = src_allocation_shape;
++
+   if (src_is_device) {
+     auto [src_buffer, src_offset, _] = _allocator->get_usm_block(src_ptr);
+     from = src_buffer;
+@@ -1417,7 +1141,12 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+     if (prev_cpu_event != 0) {
+       // The producer command buffer is committed before its GPU value is
+       // published to this path; host-only values are already listener-live.
+-      wait_for_shared_event(_shared_event, prev_cpu_event);
++      auto dependency = wait_for_shared_event(
++          _shared_event, prev_cpu_event, "host-to-device staging dependency");
++      if (!dependency.is_success()) {
++        record_metal_async_failure(_async_error_state, dependency);
++        return dependency;
++      }
+     }
+     do_h2d_copy();
+ 
+@@ -1470,13 +1199,16 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+   blit_encoder->endEncoding();
+ 
+   if (!dst_is_device) {
+-    // A device-to-host copy is a synchronization point for its caller. Keep it
+-    // on the in-order command queue, wait for the blit itself to reach a
+-    // terminal state, and only then expose the staging bytes. This avoids a
+-    // GPU-signal -> CPU-listener -> GPU-wait shared-event cycle that could
+-    // remain scheduled forever without reporting a Metal error.
+-    auto completion_state =
+-        install_metal_command_buffer_wait(command_buffer);
++    // Device->host memcpy is synchronous for its caller. Wait for the
++    // completed command buffer before exposing the staging bytes; this keeps
++    // consumers from observing a failed or partially copied result.
++    auto val = _event_counter.fetch_add(2);
++    auto val_done = val + 2;
++
++    {
++      std::lock_guard<std::mutex> lock{completion_state->mutex};
++      completion_state->defer_completion = false;
++    }
+     command_buffer->commit();
+ 
+     auto completion = wait_for_metal_command_buffer(
+@@ -1500,22 +1232,24 @@ result metal_inorder_queue::submit_memcpy(memcpy_operation& op, const dag_node_p
+                transferred_range[2] * dest_element_size);
+       }
+     }
++
++    _shared_event->setSignaledValue(val_done);
++    _pending_gpu_event = val_done;
++    _pending_cpu_event = val_done;
+   } else {
+-    auto completion_state = make_metal_command_buffer_wait_state();
+     command_buffer->addCompletedHandler(
+         [async_error_state = _async_error_state,
+          completion_state](MTL::CommandBuffer* cb) {
+       if (NS::Error* err = cb->error()) {
+         std::string msg = "metal_queue: Memcpy failed: ";
+         if (err->localizedDescription()) msg += err->localizedDescription()->utf8String();
+-        record_metal_async_failure(async_error_state,
+-                                   make_error(__acpp_here(), error_info{msg}));
++        record_metal_async_failure(
++            async_error_state, make_error(__acpp_here(), error_info{msg}));
+       }
+       complete_metal_command_buffer_wait(completion_state);
+     });
+     command_buffer->commit();
+-    remember_submitted_command_buffer(
+-        command_buffer, std::move(completion_state));
++    remember_submitted_command_buffer(command_buffer, completion_state);
+   }
+ 
+   return make_success();
+@@ -1562,19 +1296,17 @@ result metal_inorder_queue::submit_memset(memset_operation& op, const dag_node_p
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+ 
+   profiling_setup(op, node);
+-  MTL::CommandBuffer* command_buffer = new_command_buffer();
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
++  MTL::CommandBuffer* command_buffer = new_command_buffer(&completion_state);
+   if (!command_buffer) {
+-    return make_error(__acpp_here(),
+-      error_info{"metal_queue: Failed to create command buffer for memset"});
++    return read_metal_async_failure(_async_error_state);
+   }
+ 
+-  auto completion_state = make_metal_command_buffer_wait_state();
+   auto submission = memset_device(command_buffer, _allocator, ptr, pattern,
+                                   num_bytes, _async_error_state,
+                                   completion_state);
+   if (submission.is_success()) {
+-    remember_submitted_command_buffer(
+-        command_buffer, std::move(completion_state));
++    remember_submitted_command_buffer(command_buffer, std::move(completion_state));
+   }
+   return submission;
+ }
+@@ -1588,13 +1320,22 @@ result metal_inorder_queue::submit_queue_wait_for(const dag_node_ptr& node) {
+   inorder_queue_event<metal_event_handle>* metal_evt = cast<inorder_queue_event<metal_event_handle>>(evt.get());
+   auto handle = metal_evt->request_backend_event();
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+-  std::uint64_t pending_wait = _pending_gpu_event;
+-  auto* cmd_buf = new_command_buffer();
+-  wait_for_shared_event(handle.event, handle.value);
+-  stall_hunt::watch_cb(cmd_buf, handle.event,
+-    "queue_wait value=" + std::to_string(handle.value),
+-    handle.value ? handle.value : pending_wait, 0);
+-  auto completion_state = install_metal_command_buffer_wait(cmd_buf);
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
++  auto* cmd_buf = new_command_buffer(&completion_state);
++  if (!cmd_buf) {
++    return read_metal_async_failure(_async_error_state);
++  }
++  auto dependency = wait_for_shared_event(
++      handle.event, handle.value, "cross-queue dependency");
++  if (!dependency.is_success()) {
++    record_metal_async_failure(_async_error_state, dependency);
++    // commandBuffer() returns an autoreleased buffer. It was not retained
++    // before this dependency failed; the pool owns the failure-path release.
++    return dependency;
++  }
++  cmd_buf->addCompletedHandler([completion_state](MTL::CommandBuffer*) {
++    complete_metal_command_buffer_wait(completion_state);
++  });
+   cmd_buf->commit();
+   remember_submitted_command_buffer(cmd_buf, std::move(completion_state));
+ 
+@@ -1606,20 +1347,26 @@ result metal_inorder_queue::submit_external_wait_for(const dag_node_ptr& node) {
+ 
+   assert(node);
+   auto evt = node->get_event(); assert(evt);
+-  evt->wait();
++  if (auto* metal_evt = dynamic_cast<metal_node_event*>(evt.get())) {
++    auto external_wait = metal_evt->wait_for(_async_error_state);
++    if (!external_wait.is_success()) {
++      return external_wait;
++    }
++  } else {
++    evt->wait();
++  }
+ 
+-  return make_success();
++  return read_metal_async_failure(_async_error_state);
+ }
+ 
+ result metal_inorder_queue::wait() {
+   HIPSYCL_DEBUG_INFO << "metal_queue: Waiting for queue completion..." << std::endl;
+-
++  insert_event();
+   auto producer_completion =
+       wait_for_last_submitted_command_buffer("queue completion");
+   if (!producer_completion.is_success()) {
+     return producer_completion;
+   }
+-
+   return read_metal_async_failure(_async_error_state);
+ }
+ 
+@@ -1631,17 +1378,43 @@ void* metal_inorder_queue::get_native_type() const {
+ }
+ 
+ result metal_inorder_queue::query_status(inorder_queue_status& status) {
+-  std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
+-  if (!_last_submitted_command_buffer) {
+-    status = inorder_queue_status{true};
+-    return make_success();
++  MTL::CommandBufferStatus command_status = MTL::CommandBufferStatusCompleted;
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
++  std::string command_error;
++  {
++    std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
++    if (!_last_submitted_command_buffer) {
++      status = inorder_queue_status{true};
++      return read_metal_async_failure(_async_error_state);
++    }
++    completion_state = _last_submitted_command_buffer_wait_state;
++    command_status = _last_submitted_command_buffer->status();
++    if (command_status == MTL::CommandBufferStatusError) {
++      command_error = "metal_queue: command buffer failed";
++      if (NS::Error* err = _last_submitted_command_buffer->error()) {
++        if (err->localizedDescription()) {
++          command_error += ": ";
++          command_error += err->localizedDescription()->utf8String();
++        }
++      }
++    }
++  }
++  if (command_status == MTL::CommandBufferStatusError) {
++    status = inorder_queue_status{false};
++    if (read_metal_async_failure(_async_error_state).is_success()) {
++      record_metal_async_failure(
++          _async_error_state, make_error(__acpp_here(), error_info{command_error}));
++    }
++    return read_metal_async_failure(_async_error_state);
++  }
++  bool host_completed = true;
++  if (completion_state) {
++    std::lock_guard<std::mutex> lock{completion_state->mutex};
++    host_completed = completion_state->completed;
+   }
+-
+-  const auto command_status = _last_submitted_command_buffer->status();
+   status = inorder_queue_status{
+-      command_status == MTL::CommandBufferStatusCompleted ||
+-      command_status == MTL::CommandBufferStatusError};
+-  return make_success();
++      command_status == MTL::CommandBufferStatusCompleted && host_completed};
++  return read_metal_async_failure(_async_error_state);
+ }
+ 
+ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hcf_object,
+@@ -2001,7 +1774,7 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+       error_info{"metal_queue: Metal library is null"});
+   }
+ 
+-// Path2 keeps SSCP launch on a null BinaryArchive forever (archive helpers are
++  // Path2 keeps SSCP launch on a null BinaryArchive forever (archive helpers are
+   // opt-in). The AOT overlay previously always forwarded get_binary_archive(),
+   // which made the archive PSO path live on the ordinary JIT launch and exposed
+   // NSArray arrayWithObject:nil when the archive handle was absent. Keep the
+@@ -2016,10 +1789,14 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+   const std::string& launch_archive_path =
+       use_binary_archive ? metal_obj->get_binary_archive_path()
+                          : empty_archive_path;
+-  auto* command_buffer = new_command_buffer();
+-  auto completion_state = make_metal_command_buffer_wait_state();
++  std::shared_ptr<metal_command_buffer_wait_state> completion_state;
++  auto* command_buffer = new_command_buffer(&completion_state);
++  if (!command_buffer) {
++    return read_metal_async_failure(_async_error_state);
++  }
+   auto submission = launch_kernel_from_library(
+-    library, _device, launch_archive, launch_archive_path, command_buffer, _allocator,
++    library, _device, launch_archive, launch_archive_path, command_buffer,
++    _allocator,
+     kernel_name,
+     num_groups, group_size, local_mem_size,
+     _arg_mapper.get_mapped_args(),
+@@ -2030,8 +1807,7 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+     _async_error_state,
+     completion_state);
+   if (submission.is_success()) {
+-    remember_submitted_command_buffer(
+-        command_buffer, std::move(completion_state));
++    remember_submitted_command_buffer(command_buffer, std::move(completion_state));
+   }
+   return submission;
+ 
+@@ -2045,7 +1821,14 @@ result metal_inorder_queue::submit_sscp_kernel_from_code_object(hcf_object_id hc
+ metal_inorder_queue::~metal_inorder_queue() {
+   // Drain pending work before releasing queue-owned Metal objects that may be
+   // referenced by completion handlers.
+-  wait();
++  auto drain = wait();
++  if (!drain.is_success()) {
++    HIPSYCL_DEBUG_WARNING
++      << "metal_queue: final wait failed; leaking Metal queue objects to "
++         "avoid use-after-free: "
++      << drain.what() << std::endl;
++    return;
++  }
+   {
+     std::lock_guard<std::mutex> lock{_last_submitted_command_buffer_mutex};
+     if (_last_submitted_command_buffer) {
+diff --git a/tests/runtime/metal_event_timeout.cpp b/tests/runtime/metal_event_timeout.cpp
+index d5dcb232..c126fe7f 100644
+--- a/tests/runtime/metal_event_timeout.cpp
++++ b/tests/runtime/metal_event_timeout.cpp
+@@ -72,10 +72,6 @@ int main() {
+         error_text = error.what();
+       });
+ 
+-  shared_event->release();
+-  device->release();
+-  pool->release();
+-
+   if (error_count != 1 ||
+       error_text.find("timed out after 1 ms") == std::string::npos ||
+       error_text.find("shared-event value 1") == std::string::npos) {
+@@ -84,6 +80,27 @@ int main() {
+     return 1;
+   }
+ 
++  auto consumer_state =
++      std::make_shared<hipsycl::rt::metal_async_error_state>();
++  hipsycl::rt::metal_node_event consumer_event{
++      hipsycl::rt::metal_event_handle{shared_event, 1}};
++  const auto consumer_wait = consumer_event.wait_for(consumer_state);
++  const auto consumer_latched =
++      hipsycl::rt::read_metal_async_failure(consumer_state);
++  if (consumer_wait.is_success() || consumer_latched.is_success() ||
++      consumer_latched.what().find("timed out after 1 ms") ==
++          std::string::npos) {
++    std::cerr << "METAL_EVENT_TIMEOUT_TEST_FAIL: consumer queue did not latch "
++                 "external wait timeout\n";
++    return 1;
++  }
++  hipsycl::rt::application::errors().pop_each_error(
++      [](const hipsycl::rt::result&) {});
++
++  shared_event->release();
++  device->release();
++  pool->release();
++
+   auto state = std::make_shared<hipsycl::rt::metal_async_error_state>();
+   auto completion = hipsycl::rt::capture_metal_command_buffer_wait_result(
+       state, true, MTL::CommandBufferStatusError,

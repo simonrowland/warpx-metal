@@ -1,0 +1,89 @@
+Subject: [PATCH] Replace same-queue waits with host shared-event waits
+
+Wait for pending shared-event values on the host before encoding dependent
+work, including staged host-to-device copies and cross-queue waits. Remove the
+same-queue GPU wait and deferred staging signal path so the in-order Metal
+queue does not encode a wait on its own event stream. The later runtime
+hardening patch adds bounded fail-closed behavior to this host wait.
+
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -392,6 +392,11 @@
+ 
+ namespace {
+ 
++void wait_for_shared_event(MTL::SharedEvent* event, uint64_t value) {
++  while (!event->waitUntilSignaledValue(value, 1000)) {
++  }
++}
++
+ // Metal supports at most 31 [[buffer(N)]] arguments in flat mode.
+ // When a kernel has more than metal_max_args_for_flat_mode parameters,
+ // all arguments are packed into a single argument buffer struct instead.
+@@ -1181,7 +1186,9 @@
+ MTL::CommandBuffer* metal_inorder_queue::new_command_buffer() {
+   auto* cmd_buf = _command_queue->commandBuffer();
+   if (auto prev = std::exchange(_pending_gpu_event, 0)) {
+-    cmd_buf->encodeWait(_shared_event, prev);
++    // Keep host-staging completion ordering without putting a GPU-side wait
++    // on the in-order queue.
++    wait_for_shared_event(_shared_event, prev);
+   }
+   if (_profiling_setup) {
+     cmd_buf->addCompletedHandler([setup = std::move(_profiling_setup)](MTL::CommandBuffer* cb) {
+@@ -1381,8 +1388,6 @@
+ 
+   auto src_staging_offset = src_offset;;
+   auto src_staging_shape = src_allocation_shape;
+-  uint64_t deferred_h2d_done_event = 0;
+-
+   if (src_is_device) {
+     auto [src_buffer, src_offset, _] = _allocator->get_usm_block(src_ptr);
+     from = src_buffer;
+@@ -1409,20 +1414,12 @@
+     };
+ 
+     auto prev_cpu_event = std::exchange(_pending_cpu_event, uint64_t{0});
+-    if (prev_cpu_event == 0) {
+-      do_h2d_copy();
+-    } else {
+-      auto base = _event_counter.fetch_add(2);
+-      auto val_stage_ready = base + 1;
+-      auto val_done = base + 2;
+-      command_buffer->encodeWait(_shared_event, val_stage_ready);
+-      _shared_event->notifyListener(_event_listener, prev_cpu_event,
+-      ^(MTL::SharedEvent* evt, uint64_t) {
+-        do_h2d_copy();
+-        evt->setSignaledValue(val_stage_ready);
+-      });
+-      deferred_h2d_done_event = val_done;
++    if (prev_cpu_event != 0) {
++      // The producer command buffer is committed before its GPU value is
++      // published to this path; host-only values are already listener-live.
++      wait_for_shared_event(_shared_event, prev_cpu_event);
+     }
++    do_h2d_copy();
+ 
+     src_staging_offset = id<3>{0,0,0};
+     src_staging_shape = transferred_range;
+@@ -1504,10 +1501,6 @@
+       }
+     }
+   } else {
+-    if (deferred_h2d_done_event != 0) {
+-      command_buffer->encodeSignalEvent(_shared_event, deferred_h2d_done_event);
+-      _pending_cpu_event = deferred_h2d_done_event;
+-    }
+     auto completion_state = make_metal_command_buffer_wait_state();
+     command_buffer->addCompletedHandler(
+         [async_error_state = _async_error_state,
+@@ -1597,7 +1590,7 @@
+   NS::SharedPtr<NS::AutoreleasePool> pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
+   std::uint64_t pending_wait = _pending_gpu_event;
+   auto* cmd_buf = new_command_buffer();
+-  cmd_buf->encodeWait(handle.event, handle.value);
++  wait_for_shared_event(handle.event, handle.value);
+   stall_hunt::watch_cb(cmd_buf, handle.event,
+     "queue_wait value=" + std::to_string(handle.value),
+     handle.value ? handle.value : pending_wait, 0);
