@@ -132,7 +132,7 @@ echo "=== Step 6: Verify installation ==="
 if [ -x "${ACPP_INSTALL_PREFIX}/bin/acpp-info" ]; then
     echo ""
     echo "--- acpp-info output ---"
-    ACPP_INFO_OUTPUT="$("${ACPP_INSTALL_PREFIX}/bin/acpp-info" 2>&1 || true)"
+    ACPP_INFO_OUTPUT="$("${ACPP_INSTALL_PREFIX}/bin/acpp-info" 2>&1)"
     echo "${ACPP_INFO_OUTPUT}"
     echo "------------------------"
     echo ""
