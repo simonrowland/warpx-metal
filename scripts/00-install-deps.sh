@@ -15,6 +15,9 @@ echo ""
 echo "=== Step 1: Install Homebrew packages ==="
 
 PACKAGES=(llvm@20 llvm@18 boost ninja cmake libomp)
+if [ "${WARPX_CPU_MPI:-OFF}" = "ON" ] || [ "${WARPX_CPU_MPI:-OFF}" = "TRUE" ]; then
+    PACKAGES+=(open-mpi)
+fi
 for pkg in "${PACKAGES[@]}"; do
     if brew list --formula "$pkg" &>/dev/null; then
         echo "  [OK] $pkg already installed"

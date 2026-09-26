@@ -30,8 +30,27 @@ python3 "${SCRIPT_DIR}/write-build-attestation.py" \
     --external AdaptiveCpp
 
 # CPU build uses system Apple Clang (not LLVM 20)
-CPU_CXX="$(xcrun -find clang++)"
-CPU_CC="$(xcrun -find clang)"
+CPU_MPI="${WARPX_CPU_MPI:-OFF}"
+CPU_PRECISION="${WARPX_CPU_PRECISION:-SINGLE}"
+CPU_PARTICLE_PRECISION="${WARPX_CPU_PARTICLE_PRECISION:-SINGLE}"
+CPU_DIMS="${WARPX_CPU_DIMS:-2;3}"
+if [ "${CPU_MPI}" = "ON" ] || [ "${CPU_MPI}" = "TRUE" ]; then
+    CPU_CXX="${WARPX_CPU_CXX:-$(command -v mpicxx || true)}"
+    CPU_CC="${WARPX_CPU_CC:-$(command -v mpicc || true)}"
+else
+    CPU_CXX="${WARPX_CPU_CXX:-$(xcrun -find clang++)}"
+    CPU_CC="${WARPX_CPU_CC:-$(xcrun -find clang)}"
+fi
+if [ -z "${CPU_CXX}" ] || [ -z "${CPU_CC}" ]; then
+    echo "[FAIL] CPU compiler wrappers are unavailable (MPI=${CPU_MPI})"
+    exit 1
+fi
+export WARPX_CPU_MPI="${CPU_MPI}"
+export WARPX_CPU_PRECISION="${CPU_PRECISION}"
+export WARPX_CPU_PARTICLE_PRECISION="${CPU_PARTICLE_PRECISION}"
+export WARPX_CPU_DIMS="${CPU_DIMS}"
+export WARPX_CPU_CXX="${CPU_CXX}"
+export WARPX_CPU_CC="${CPU_CC}"
 
 LIBOMP_PREFIX="$(brew --prefix libomp 2>/dev/null || echo /opt/homebrew/opt/libomp)"
 BUILD_DIR="${WARPX_SOURCE_DIR}/build-cpu"
@@ -39,6 +58,9 @@ BUILD_DIR="${WARPX_SOURCE_DIR}/build-cpu"
 echo ""
 echo "=== CPU WarpX Build Configuration ==="
 echo "  Compiler: ${CPU_CXX}"
+echo "  MPI:      ${CPU_MPI}"
+echo "  Precision:${CPU_PRECISION}/${CPU_PARTICLE_PRECISION}"
+echo "  Dims:     ${CPU_DIMS}"
 echo "  OpenMP:   ${LIBOMP_PREFIX}"
 echo "  Source:   ${WARPX_SOURCE_DIR}"
 echo "  Build:    ${BUILD_DIR}"
@@ -138,10 +160,10 @@ cmake -S "${WARPX_SOURCE_DIR}" -B . \
     -DCMAKE_EXE_LINKER_FLAGS="-L${LIBOMP_PREFIX}/lib -lomp" \
     -DCMAKE_SHARED_LINKER_FLAGS="-L${LIBOMP_PREFIX}/lib -lomp" \
     -DWarpX_COMPUTE=OMP \
-    -DWarpX_PRECISION=SINGLE \
-    -DWarpX_PARTICLE_PRECISION=SINGLE \
-    -DWarpX_DIMS="2;3" \
-    -DWarpX_MPI=OFF \
+    -DWarpX_PRECISION="${CPU_PRECISION}" \
+    -DWarpX_PARTICLE_PRECISION="${CPU_PARTICLE_PRECISION}" \
+    -DWarpX_DIMS="${CPU_DIMS}" \
+    -DWarpX_MPI="${CPU_MPI}" \
     -DWarpX_FFT=OFF \
     -DWarpX_QED=OFF \
     -DWarpX_OPENPMD=OFF \

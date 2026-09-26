@@ -16,6 +16,7 @@ source "${SCRIPT_DIR}/env.sh"
 
 WARPX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/warpx"
 ACPP="${ACPP_INSTALL_PREFIX}/bin/acpp"
+METAL_DIMS="${WARPX_METAL_DIMS:-2;3}"
 
 # Verify acpp is available
 if [ ! -x "${ACPP}" ]; then
@@ -277,7 +278,7 @@ cmake -S "${WARPX_SOURCE_DIR}" -B . \
     -DWarpX_COMPUTE=SYCL \
     -DWarpX_PRECISION=SINGLE \
     -DWarpX_PARTICLE_PRECISION=SINGLE \
-    -DWarpX_DIMS="2;3" \
+    -DWarpX_DIMS="${METAL_DIMS}" \
     -DWarpX_MPI=OFF \
     -DWarpX_FFT=OFF \
     -DWarpX_QED=OFF \
