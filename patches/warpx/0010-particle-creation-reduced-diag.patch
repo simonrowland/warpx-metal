@@ -1,0 +1,1818 @@
+Subject: [PATCH] Add particle-creation reduced diagnostics
+
+Record particle creation counts, IDs, amounts, and source channels through the
+reduced-diagnostics framework, including checkpoint preparation and restart
+state. Thread the channel through initialization, continuous, flux, collision,
+and paired-flux creation paths. Preserve named injector channels, retain ID
+accounting before MPI redistribution, classify charge exchange separately from
+two-product reactions, and attribute parent destruction to the event that
+exhausts its removed weight. This rebased patch preserves the existing
+source-identity and paired-flux interfaces of the port.
+
+diff --git a/Source/Diagnostics/FlushFormats/FlushFormatCheckpoint.cpp b/Source/Diagnostics/FlushFormats/FlushFormatCheckpoint.cpp
+index f1ed10e7c..e01eedb32 100644
+--- a/Source/Diagnostics/FlushFormats/FlushFormatCheckpoint.cpp
++++ b/Source/Diagnostics/FlushFormats/FlushFormatCheckpoint.cpp
+@@ -191,6 +191,9 @@ FlushFormatCheckpoint::WriteToFile (
+ 
+     WriteDMaps(checkpointname, nlev);
+ 
++    // Reduced diagnostics may need a collective reduction before the I/O rank
++    // writes their checkpoint state.
++    warpx.reduced_diags->PrepareCheckpointData();
+     WriteReducedDiagsData(checkpointname);
+ 
+     VisMF::SetHeaderVersion(current_version);
+diff --git a/Source/Diagnostics/ReducedDiags/CMakeLists.txt b/Source/Diagnostics/ReducedDiags/CMakeLists.txt
+index c548553b8..043af78f4 100644
+--- a/Source/Diagnostics/ReducedDiags/CMakeLists.txt
++++ b/Source/Diagnostics/ReducedDiags/CMakeLists.txt
+@@ -24,6 +24,7 @@ foreach(D IN LISTS WarpX_DIMS)
+         ParticleHistogram2D.cpp
+         ParticleMomentum.cpp
+         ParticleNumber.cpp
++        ParticleCreation.cpp
+         ReducedDiags.cpp
+         RhoMaximum.cpp
+         Timestep.cpp
+diff --git a/Source/Diagnostics/ReducedDiags/Make.package b/Source/Diagnostics/ReducedDiags/Make.package
+index 98fa093e2..2319a8fe7 100644
+--- a/Source/Diagnostics/ReducedDiags/Make.package
++++ b/Source/Diagnostics/ReducedDiags/Make.package
+@@ -20,6 +20,7 @@ CEXE_sources += ParticleHistogram.cpp
+ CEXE_sources += ParticleHistogram2D.cpp
+ CEXE_sources += ParticleMomentum.cpp
+ CEXE_sources += ParticleNumber.cpp
++CEXE_sources += ParticleCreation.cpp
+ CEXE_sources += RhoMaximum.cpp
+ CEXE_sources += Timestep.cpp
+ 
+diff --git a/Source/Diagnostics/ReducedDiags/MultiReducedDiags.H b/Source/Diagnostics/ReducedDiags/MultiReducedDiags.H
+index bf43d0c6d..5632dc87b 100644
+--- a/Source/Diagnostics/ReducedDiags/MultiReducedDiags.H
++++ b/Source/Diagnostics/ReducedDiags/MultiReducedDiags.H
+@@ -64,6 +64,9 @@ public:
+      *  @param[in] dir checkpoint directory */
+     void WriteCheckpointData (std::string const & dir);
+ 
++    /** Loop over all ReducedDiags and prepare checkpoint state collectively. */
++    void PrepareCheckpointData ();
++
+     /** \brief Loop over all ReducedDiags and call their ReadCheckpointData
+      *  @param[in] dir checkpoint directory */
+     void ReadCheckpointData (std::string const & dir);
+diff --git a/Source/Diagnostics/ReducedDiags/MultiReducedDiags.cpp b/Source/Diagnostics/ReducedDiags/MultiReducedDiags.cpp
+index 2b9772eaf..2acc2f71e 100644
+--- a/Source/Diagnostics/ReducedDiags/MultiReducedDiags.cpp
++++ b/Source/Diagnostics/ReducedDiags/MultiReducedDiags.cpp
+@@ -25,6 +25,7 @@
+ #include "ParticleHistogram2D.H"
+ #include "ParticleMomentum.H"
+ #include "ParticleNumber.H"
++#include "ParticleCreation.H"
+ #include "RhoMaximum.H"
+ #include "Timestep.H"
+ #include "Utils/TextMsg.H"
+@@ -66,6 +67,7 @@ MultiReducedDiags::MultiReducedDiags ()
+             {"ParticleHistogram2D",   [](CS s){return std::make_unique<ParticleHistogram2D>(s);}},
+             {"ParticleMomentum",      [](CS s){return std::make_unique<ParticleMomentum>(s);}},
+             {"ParticleNumber",        [](CS s){return std::make_unique<ParticleNumber>(s);}},
++            {"ParticleCreation",      [](CS s){return std::make_unique<ParticleCreationDiag>(s);}},
+             {"FieldEnergy",           [](CS s){return std::make_unique<FieldEnergy>(s);}},
+             {"FieldMaximum",          [](CS s){return std::make_unique<FieldMaximum>(s);}},
+             {"FieldMomentum",         [](CS s){return std::make_unique<FieldMomentum>(s);}},
+@@ -152,7 +154,7 @@ void MultiReducedDiags::WriteToFile (int step)
+     for (int i_rd = 0; i_rd < static_cast<int>(m_rd_names.size()); ++i_rd)
+     {
+         // Judge if the diags should be done
+-        if (!m_multi_rd[i_rd]->m_intervals.contains(step+1)) { continue; }
++        if (!m_multi_rd[i_rd]->DoDiags(step)) { continue; }
+ 
+         // call the write to file function
+         m_multi_rd[i_rd]->WriteToFile(step);
+@@ -186,6 +188,13 @@ void MultiReducedDiags::WriteCheckpointData (std::string const & dir)
+     // end loop over all reduced diags
+ }
+ 
++void MultiReducedDiags::PrepareCheckpointData ()
++{
++    for (int i_rd = 0; i_rd < static_cast<int>(m_rd_names.size()); ++i_rd) {
++        m_multi_rd[i_rd]->PrepareCheckpointData();
++    }
++}
++
+ void MultiReducedDiags::ReadCheckpointData (std::string const & dir)
+ {
+     // loop over all reduced diags
+diff --git a/Source/Diagnostics/ReducedDiags/ReducedDiags.H b/Source/Diagnostics/ReducedDiags/ReducedDiags.H
+index 7e11768d6..a72571de3 100644
+--- a/Source/Diagnostics/ReducedDiags/ReducedDiags.H
++++ b/Source/Diagnostics/ReducedDiags/ReducedDiags.H
+@@ -98,7 +98,7 @@ public:
+     virtual void WriteToFile (int step) const;
+ 
+     /** Check if diag should be done */
+-    [[nodiscard]] bool DoDiags(int step) const { return m_intervals.contains(step+1); }
++    [[nodiscard]] virtual bool DoDiags(int step) const { return m_intervals.contains(step+1); }
+ 
+     /**
+      * \brief Write out checkpoint related data
+@@ -107,6 +107,9 @@ public:
+      */
+     virtual void WriteCheckpointData (std::string const & dir);
+ 
++    /** Prepare rank-local diagnostic state for a checkpoint write. */
++    virtual void PrepareCheckpointData ();
++
+     /**
+      * \brief Read in checkpoint related data
+      *
+diff --git a/Source/Diagnostics/ReducedDiags/ReducedDiags.cpp b/Source/Diagnostics/ReducedDiags/ReducedDiags.cpp
+index b0e20584a..2dd9fe5f1 100644
+--- a/Source/Diagnostics/ReducedDiags/ReducedDiags.cpp
++++ b/Source/Diagnostics/ReducedDiags/ReducedDiags.cpp
+@@ -106,6 +106,12 @@ void ReducedDiags::WriteCheckpointData (std::string const & /*dir*/)
+     // the checkpoint.
+ }
+ 
++void ReducedDiags::PrepareCheckpointData ()
++{
++    // Defines an empty function to be overwritten if needed.  This hook is
++    // called collectively before the I/O rank writes checkpoint data.
++}
++
+ void ReducedDiags::ReadCheckpointData (std::string const & /*dir*/)
+ {
+     // Defines an empty function ReadCheckpointData() to be overwritten if needed.
+diff --git a/Source/Initialization/PlasmaInjector.H b/Source/Initialization/PlasmaInjector.H
+index 91e332d20..0e87a712b 100644
+--- a/Source/Initialization/PlasmaInjector.H
++++ b/Source/Initialization/PlasmaInjector.H
+@@ -81,6 +81,9 @@ public:
+     // bool: whether the flux injection of particles should be done.
+     [[nodiscard]] bool doFluxInjection () const noexcept { return h_flux_pos != nullptr;}
+ 
++    /** Name from species.injection_sources; empty for the default injector. */
++    [[nodiscard]] std::string const& getSourceName () const noexcept { return source_name; }
++
+     // bool: whether flux injection is requested from an embedded boundary rather than a plane.
+     [[nodiscard]] bool fluxInjectionFromEB () const noexcept { return m_inject_from_eb; }
+ 
+diff --git a/Source/Initialization/WarpXInitData.cpp b/Source/Initialization/WarpXInitData.cpp
+index aa95573d1..c99f93e71 100644
+--- a/Source/Initialization/WarpXInitData.cpp
++++ b/Source/Initialization/WarpXInitData.cpp
+@@ -918,15 +918,18 @@ WarpX::InitData ()
+     }
+ 
+     if (restart_chkfile.empty() || write_diagnostics_on_restart) {
+-        // Write full diagnostics before the first iteration.
+-        multi_diags->FilterComputePackFlush(istep[0] - 1);
+-
+         // Write reduced diagnostics before the first iteration.
+         if (reduced_diags->m_plot_rd != 0)
+         {
+             reduced_diags->ComputeDiags(istep[0] - 1);
+             reduced_diags->WriteToFile(istep[0] - 1);
+         }
++
++        // Write full diagnostics before the first iteration.  Reduced
++        // diagnostics are intentionally emitted first so a checkpoint full
++        // diagnostic cannot serialize the step-0 creation ledger before it
++        // has been consumed by its row.
++        multi_diags->FilterComputePackFlush(istep[0] - 1);
+     }
+ 
+     // Computes available boxes on all levels.
+diff --git a/Source/Particles/Collision/BackgroundMCC/BackgroundMCCCollision.cpp b/Source/Particles/Collision/BackgroundMCC/BackgroundMCCCollision.cpp
+index 779276aca..34171691f 100644
+--- a/Source/Particles/Collision/BackgroundMCC/BackgroundMCCCollision.cpp
++++ b/Source/Particles/Collision/BackgroundMCC/BackgroundMCCCollision.cpp
+@@ -9,6 +9,7 @@
+ #include "ImpactIonization.H"
+ #include "Particles/Algorithms/KineticEnergy.H"
+ #include "Particles/ParticleCreation/FilterCopyTransform.H"
++#include "Diagnostics/ReducedDiags/ParticleCreation.H"
+ #include "Particles/ParticleCreation/SmartCopy.H"
+ #include "Utils/Parser/ParserUtils.H"
+ #include "Utils/TextMsg.H"
+@@ -17,6 +18,7 @@
+ 
+ #include <ablastr/profiler/ProfilerWrapper.H>
+ #include <AMReX_ParmParse.H>
++#include <AMReX_ParallelDescriptor.H>
+ #include <AMReX_REAL.H>
+ #include <AMReX_Vector.H>
+ 
+@@ -492,6 +494,7 @@ void BackgroundMCCCollision::doBackgroundIonization
+                                                    );
+ 
+     const amrex::ParticleReal sqrt_kb_m = std::sqrt(PhysConst::kb / m_background_mass);
++    std::vector<ParticleCreationEvent> creation_events;
+ 
+ #ifdef AMREX_USE_OMP
+ #pragma omp parallel if (amrex::Gpu::notInLaunchRegion())
+@@ -520,8 +523,22 @@ void BackgroundMCCCollision::doBackgroundIonization
+                                                                Filter, CopyElec, CopyIon, Transform
+                                                                );
+ 
+-        setNewParticleIDs(elec_tile, np_elec, num_added);
+-        setNewParticleIDs(ion_tile, np_ion, num_added);
++        const auto first_elec_id = setNewParticleIDs(elec_tile, np_elec, num_added);
++        const auto first_ion_id = setNewParticleIDs(ion_tile, np_ion, num_added);
++        if (ParticleCreationDiag::Active() && num_added > 0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_events)
++#endif
++            creation_events.push_back({&species1, species1.getSpeciesId(),
++                                        "ionization", first_elec_id, num_added,
++                                        amrex::ParallelDescriptor::MyProc()});
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_events)
++#endif
++            creation_events.push_back({&species2, species2.getSpeciesId(),
++                                        "ionization", first_ion_id, num_added,
++                                        amrex::ParallelDescriptor::MyProc()});
++        }
+ 
+         if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+         {
+@@ -530,4 +547,10 @@ void BackgroundMCCCollision::doBackgroundIonization
+             amrex::HostDevice::Atomic::Add( &(*cost)[pti.index()], wt);
+         }
+     }
++
++    for (auto const& event : creation_events) {
++        ParticleCreationDiag::RecordIDRange(*event.container, event.species_id,
++                                            event.channel, event.first_id, event.count,
++                                            event.creator_cpu);
++    }
+ }
+diff --git a/Source/Particles/Collision/BinaryCollision/BinaryCollision.H b/Source/Particles/Collision/BinaryCollision/BinaryCollision.H
+index ceb0589b4..782cc16a8 100644
+--- a/Source/Particles/Collision/BinaryCollision/BinaryCollision.H
++++ b/Source/Particles/Collision/BinaryCollision/BinaryCollision.H
+@@ -22,6 +22,7 @@
+ #include "Particles/Pusher/GetAndSetPosition.H"
+ #include "Particles/MultiParticleContainer.H"
+ #include "Particles/WarpXParticleContainer.H"
++#include "Diagnostics/ReducedDiags/ParticleCreation.H"
+ #include "Utils/ParticleUtils.H"
+ #include "Utils/TextMsg.H"
+ #include "Utils/WarpXAlgorithmSelection.H"
+@@ -59,6 +60,8 @@
+ 
+ #include <cmath>
++#include <limits>
+ #include <string>
++#include <vector>
+ 
+ /**
+  * \brief This class performs generic binary collisions.
+@@ -99,6 +101,42 @@ public:
+ 
+         const CollisionType collision_type = BinaryCollisionUtils::get_collision_type(collision_name, mypc);
+ 
++        if (collision_type == CollisionType::DSMC) {
++            const amrex::ParmParse pp_collision_name(collision_name);
++            amrex::Vector<std::string> scattering_processes;
++            pp_collision_name.queryarr("scattering_processes", scattering_processes);
++            bool has_non_product_process = false;
++            for (auto const& process : scattering_processes) {
++                const bool produces_products =
++                    process == "ionization" || process == "charge_exchange" ||
++                    process == "two_product_reaction";
++                has_non_product_process = has_non_product_process || !produces_products;
++            }
++            if (has_non_product_process) {
++                m_creation_split_channel = "dsmc_split";
++            }
++            if (std::find(scattering_processes.begin(), scattering_processes.end(), "ionization")
++                != scattering_processes.end()) {
++                m_creation_channel = "ionization";
++                m_creation_reaction_mask = int(ScatteringProcessType::IONIZATION);
++            } else if (std::find(scattering_processes.begin(), scattering_processes.end(), "charge_exchange")
++                       != scattering_processes.end()) {
++                m_creation_channel = "chargeexchange";
++                m_creation_reaction_mask = int(ScatteringProcessType::CHARGE_EXCHANGE);
++            } else if (std::find(scattering_processes.begin(), scattering_processes.end(), "two_product_reaction")
++                       != scattering_processes.end()) {
++                m_creation_channel = "chargeexchange";
++                m_creation_reaction_mask = int(ScatteringProcessType::TWOPRODUCT_REACTION);
++            }
++        } else {
++            const amrex::ParmParse pp_collision_name(collision_name);
++            std::string collision_type_name;
++            pp_collision_name.query("type", collision_type_name);
++            if (collision_type_name == "nuclearfusion") {
++                m_creation_channel = "fusion";
++            }
++        }
++
+         m_isSameSpecies = (m_species_names[0] == m_species_names[1]);
+ 
+         m_binary_collision_functor = CollisionFunctor(collision_name, mypc, m_isSameSpecies);
+@@ -189,6 +231,7 @@ public:
+         amrex::Vector<SmartCopyFactory> copy_factory_species2;
+         amrex::Vector<SmartCopy> copy_species1;
+         amrex::Vector<SmartCopy> copy_species2;
++        std::vector<ParticleCreationEvent> creation_events;
+         for (int i = 0; i < n_product_species; i++)
+         {
+             auto& product = mypc->GetParticleContainerFromName(m_product_species[i]);
+@@ -243,7 +286,7 @@ public:
+                 auto wt = static_cast<amrex::Real>(amrex::second());
+ 
+                 doCollisionsWithinTile( dt, lev, mfi, species1, species2, product_species_vector,
+-                                        copy_species1_data, copy_species2_data);
++                                        copy_species1_data, copy_species2_data, &creation_events);
+ 
+                 if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+                 {
+@@ -254,13 +297,16 @@ public:
+             }
+ 
+             if (m_have_product_species) {
+-                // The fact that there are product species indicates that particles of
+-                // the colliding species (`species1` and `species2`) may be removed
+-                // (i.e., marked as invalid) in the process of creating new product particles.
+                 species1.deleteInvalidParticles();
+                 if (!m_isSameSpecies) { species2.deleteInvalidParticles(); }
+             }
+         }
++
++        for (auto const& event : creation_events) {
++            ParticleCreationDiag::RecordIDRange(*event.container, event.species_id,
++                                                event.channel, event.first_id, event.count,
++                                                event.creator_cpu);
++        }
+     }
+ 
+     /** Perform all binary collisions within a tile
+@@ -280,7 +326,8 @@ public:
+         WarpXParticleContainer& species_1,
+         WarpXParticleContainer& species_2,
+         amrex::Vector<WarpXParticleContainer*> product_species_vector,
+-        SmartCopy* copy_species1, SmartCopy* copy_species2)
++        SmartCopy* copy_species1, SmartCopy* copy_species2,
++        std::vector<ParticleCreationEvent>* creation_events)
+     {
+         using namespace ParticleUtils;
+         using namespace amrex::literals;
+@@ -357,6 +404,108 @@ public:
+ #endif
+         };
+ 
++        // The collision functor and copy transform operate on device data and
++        // may invalidate a parent or reduce its weight.  Copy the reaction
++        // evidence back after that transform, before deleteInvalidParticles,
++        // and accumulate in host double precision.  This avoids unsupported
++        // Metal FP64 atomics and records the actual consumed macro-weight,
++        // including partial-weight reactions.
++        auto record_destroyed = [this] (
++            WarpXParticleContainer const& species,
++            ParticleTileType const& ptile,
++            index_type const* mask,
++            index_type const* indices,
++            index_type n_pairs,
++            amrex::ParticleReal mass,
++            int reaction_mask,
++            amrex::Gpu::HostVector<amrex::ParticleReal> const& before_weight,
++            amrex::Gpu::HostVector<amrex::ParticleReal> const& before_ux,
++            amrex::Gpu::HostVector<amrex::ParticleReal> const& before_uy,
++            amrex::Gpu::HostVector<amrex::ParticleReal> const& before_uz,
++            amrex::Gpu::HostVector<amrex::ParticleReal> const& reaction_weight,
++            std::vector<double>& consumed_weight,
++            std::vector<unsigned char>& invalid_seen)
++        {
++            if (!ParticleCreationDiag::Active() ||
++                (m_creation_channel.empty() && m_creation_split_channel.empty()) ||
++                n_pairs <= 0) {
++                return;
++            }
++
++            amrex::Gpu::synchronize();
++            amrex::Gpu::HostVector<index_type> h_mask(n_pairs);
++            amrex::Gpu::HostVector<index_type> h_indices(n_pairs);
++            amrex::Gpu::copy(amrex::Gpu::deviceToHost, mask, mask + n_pairs, h_mask.begin());
++            amrex::Gpu::copy(amrex::Gpu::deviceToHost, indices, indices + n_pairs, h_indices.begin());
++
++            const auto& ptd = ptile.getConstParticleTileData();
++            const auto n_particles = static_cast<std::size_t>(ptile.numParticles());
++            amrex::Gpu::HostVector<amrex::ParticleReal> h_weight(n_particles);
++            amrex::Gpu::HostVector<uint64_t> h_idcpu(n_particles);
++            amrex::Gpu::copy(amrex::Gpu::deviceToHost, ptd.m_idcpu,
++                             ptd.m_idcpu + n_particles, h_idcpu.begin());
++            amrex::Gpu::copy(amrex::Gpu::deviceToHost, ptd.rdata(PIdx::w),
++                             ptd.rdata(PIdx::w) + n_particles, h_weight.begin());
++            amrex::Gpu::HostVector<amrex::ParticleReal> h_reaction_weight(n_pairs);
++            std::copy(reaction_weight.begin(), reaction_weight.end(), h_reaction_weight.begin());
++
++            ParticleCreationDiag::Amount reaction_amount;
++            ParticleCreationDiag::Amount split_amount;
++            const double mass_double = static_cast<double>(mass);
++            for (index_type ip = 0; ip < n_pairs; ++ip) {
++                if (h_mask[ip] == 0) { continue; }
++                const bool is_reaction = reaction_mask == 0
++                    ? !m_creation_channel.empty() : h_mask[ip] == reaction_mask;
++                const auto& channel = is_reaction ? m_creation_channel : m_creation_split_channel;
++                if (channel.empty()) { continue; }
++                auto& amount = is_reaction ? reaction_amount : split_amount;
++                const auto parent = static_cast<std::size_t>(h_indices[ip]);
++                if (parent >= n_particles) { continue; }
++                const double weight_before = static_cast<double>(before_weight[parent]);
++                const double weight_after = static_cast<double>(h_weight[parent]);
++                const double actual_removed = std::max(0.0, weight_before - weight_after);
++                const double requested = static_cast<double>(h_reaction_weight[ip]);
++                const double consumed_before = consumed_weight[parent];
++                const double available = std::max(0.0, actual_removed - consumed_before);
++                const double weight = std::min(requested, available);
++                consumed_weight[parent] = consumed_before + weight;
++                const double ux = static_cast<double>(before_ux[parent]);
++                const double uy = static_cast<double>(before_uy[parent]);
++                const double uz = static_cast<double>(before_uz[parent]);
++                const double u2 = ux*ux + uy*uy + uz*uz;
++                const double gamma = std::sqrt(1.0 + u2 * PhysConst::inv_c2_v<double>);
++                amount.weight += weight;
++                amount.kinetic_energy += weight * mass_double * u2 / (1.0 + gamma);
++                const double removal_tolerance =
++                    static_cast<double>(std::numeric_limits<amrex::ParticleReal>::epsilon()) *
++                    actual_removed;
++                const bool exhausts_parent = actual_removed > 0.0 &&
++                    consumed_weight[parent] + removal_tolerance >= actual_removed;
++                if (invalid_seen[parent] == 0 && exhausts_parent &&
++                    !amrex::ParticleIDWrapper{h_idcpu[parent]}.is_valid()) {
++                    amount.count += 1;
++                    invalid_seen[parent] = 1;
++                }
++            }
++
++            if (reaction_amount.count != 0 || reaction_amount.weight != 0.0 ||
++                reaction_amount.kinetic_energy != 0.0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_amounts)
++#endif
++                ParticleCreationDiag::RecordAmount(species.getSpeciesId(),
++                                                    m_creation_channel, reaction_amount, true);
++            }
++            if (split_amount.count != 0 || split_amount.weight != 0.0 ||
++                split_amount.kinetic_energy != 0.0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_amounts)
++#endif
++                ParticleCreationDiag::RecordAmount(species.getSpeciesId(),
++                                                    m_creation_split_channel, split_amount, true);
++            }
++        };
++
+         if ( m_isSameSpecies ) // species_1 == species_2
+         {
+             // Extract particles in the tile that `mfi` points to
+@@ -633,6 +776,28 @@ public:
+             ABLASTR_PROFILE_VAR_STOP(prof_findDensityTemperatures_shuffle);
+             ABLASTR_PROFILE_VAR_STOP(prof_findDensityTemperatures);
+ 
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_weight_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_ux_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_uy_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_uz_1;
++            if (ParticleCreationDiag::Active() &&
++                (!m_creation_channel.empty() || !m_creation_split_channel.empty())) {
++                const auto n_before = static_cast<std::size_t>(ptile_1.numParticles());
++                before_weight_1.resize(n_before);
++                before_ux_1.resize(n_before);
++                before_uy_1.resize(n_before);
++                before_uz_1.resize(n_before);
++                const auto& before_ptd = ptile_1.getConstParticleTileData();
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd.rdata(PIdx::w),
++                                 before_ptd.rdata(PIdx::w) + n_before, before_weight_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd.rdata(PIdx::ux),
++                                 before_ptd.rdata(PIdx::ux) + n_before, before_ux_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd.rdata(PIdx::uy),
++                                 before_ptd.rdata(PIdx::uy) + n_before, before_uy_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd.rdata(PIdx::uz),
++                                 before_ptd.rdata(PIdx::uz) + n_before, before_uz_1.begin());
++            }
++
+             // Loop over independent particle pairs
+             // To speed up binary collisions on GPU, we try to expose as much parallelism
+             // as possible (while avoiding race conditions): Instead of looping with one GPU
+@@ -706,9 +871,81 @@ public:
+                                                     p_pair_indices_1, p_pair_indices_2,
+                                                     p_pair_reaction_weight, p_product_data);
+ 
++            if (ParticleCreationDiag::Active() &&
++                (!m_creation_channel.empty() || !m_creation_split_channel.empty())) {
++                amrex::Gpu::HostVector<amrex::ParticleReal> h_pair_reaction_weight(n_total_pairs);
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, p_pair_reaction_weight,
++                                 p_pair_reaction_weight + n_total_pairs,
++                                 h_pair_reaction_weight.begin());
++                std::vector<unsigned char> invalid_seen_1(
++                    static_cast<std::size_t>(ptile_1.numParticles()), 0);
++                std::vector<double> consumed_weight_1(
++                    static_cast<std::size_t>(ptile_1.numParticles()), 0.0);
++                record_destroyed(species_1, ptile_1, p_mask, p_pair_indices_1,
++                                 n_total_pairs, m1,
++                                 m_creation_reaction_mask,
++                                 before_weight_1, before_ux_1, before_uy_1, before_uz_1,
++                                 h_pair_reaction_weight,
++                                 consumed_weight_1,
++                                 invalid_seen_1);
++                record_destroyed(species_1, ptile_1, p_mask, p_pair_indices_2,
++                                 n_total_pairs, m1,
++                                 m_creation_reaction_mask,
++                                 before_weight_1, before_ux_1, before_uy_1, before_uz_1,
++                                 h_pair_reaction_weight,
++                                 consumed_weight_1,
++                                 invalid_seen_1);
++            }
++
+             for (int i = 0; i < n_product_species; i++)
+             {
+-                setNewParticleIDs(*(tile_products_data[i]), static_cast<int>(products_np[i]), num_added[i]);
++                const auto first_id = setNewParticleIDs(
++                    *(tile_products_data[i]), static_cast<int>(products_np[i]), num_added[i]);
++                if (ParticleCreationDiag::Active() &&
++                    (!m_creation_channel.empty() || !m_creation_split_channel.empty()) &&
++                    num_added[i] > 0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_events)
++#endif
++                    {
++                        int split_count = 0;
++                        int reaction_count = num_added[i];
++                        if (m_creation_reaction_mask != 0) {
++                            amrex::Gpu::HostVector<index_type> h_mask(n_total_pairs);
++                            amrex::Gpu::copy(amrex::Gpu::deviceToHost, p_mask,
++                                             p_mask + n_total_pairs, h_mask.begin());
++                            const int nonproduct_total = static_cast<int>(std::count_if(
++                                h_mask.begin(), h_mask.end(), [](index_type mask) {
++                                    return mask > 0 &&
++                                        mask != int(ScatteringProcessType::IONIZATION) &&
++                                        mask != int(ScatteringProcessType::TWOPRODUCT_REACTION) &&
++                                        mask != int(ScatteringProcessType::CHARGE_EXCHANGE);
++                                }));
++                            if (i < 2) { split_count = std::min(num_added[i], nonproduct_total); }
++                            reaction_count = num_added[i] - split_count;
++                            if (m_creation_channel == "chargeexchange" && i < 2) {
++                                reaction_count = 0;
++                            }
++                        } else if (m_creation_channel.empty()) {
++                            split_count = num_added[i];
++                            reaction_count = 0;
++                        }
++                            if (!m_creation_split_channel.empty() && split_count > 0) {
++                            creation_events->push_back({product_species_vector[i],
++                                                        product_species_vector[i]->getSpeciesId(),
++                                                        m_creation_split_channel, first_id,
++                                                        split_count,
++                                                        amrex::ParallelDescriptor::MyProc()});
++                        }
++                        if (!m_creation_channel.empty() && reaction_count > 0) {
++                            creation_events->push_back({product_species_vector[i],
++                                                        product_species_vector[i]->getSpeciesId(),
++                                                        m_creation_channel,
++                                                        first_id + split_count, reaction_count,
++                                                        amrex::ParallelDescriptor::MyProc()});
++                        }
++                    }
++                }
+             }
+ 
+             if (m_correct_energy_momentum) {
+@@ -1231,6 +1467,46 @@ public:
+             ABLASTR_PROFILE_VAR_STOP(prof_findDensityTemperatures_shuffle);
+ 
+         ABLASTR_PROFILE_VAR_STOP(prof_findDensityTemperatures);
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_weight_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_ux_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_uy_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_uz_1;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_weight_2;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_ux_2;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_uy_2;
++            amrex::Gpu::HostVector<amrex::ParticleReal> before_uz_2;
++            if (ParticleCreationDiag::Active() &&
++                (!m_creation_channel.empty() || !m_creation_split_channel.empty())) {
++                const auto n_before_1 = static_cast<std::size_t>(ptile_1.numParticles());
++                const auto n_before_2 = static_cast<std::size_t>(ptile_2.numParticles());
++                before_weight_1.resize(n_before_1);
++                before_ux_1.resize(n_before_1);
++                before_uy_1.resize(n_before_1);
++                before_uz_1.resize(n_before_1);
++                before_weight_2.resize(n_before_2);
++                before_ux_2.resize(n_before_2);
++                before_uy_2.resize(n_before_2);
++                before_uz_2.resize(n_before_2);
++                const auto& before_ptd_1 = ptile_1.getConstParticleTileData();
++                const auto& before_ptd_2 = ptile_2.getConstParticleTileData();
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_1.rdata(PIdx::w),
++                                 before_ptd_1.rdata(PIdx::w) + n_before_1, before_weight_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_1.rdata(PIdx::ux),
++                                 before_ptd_1.rdata(PIdx::ux) + n_before_1, before_ux_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_1.rdata(PIdx::uy),
++                                 before_ptd_1.rdata(PIdx::uy) + n_before_1, before_uy_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_1.rdata(PIdx::uz),
++                                 before_ptd_1.rdata(PIdx::uz) + n_before_1, before_uz_1.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_2.rdata(PIdx::w),
++                                 before_ptd_2.rdata(PIdx::w) + n_before_2, before_weight_2.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_2.rdata(PIdx::ux),
++                                 before_ptd_2.rdata(PIdx::ux) + n_before_2, before_ux_2.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_2.rdata(PIdx::uy),
++                                 before_ptd_2.rdata(PIdx::uy) + n_before_2, before_uy_2.begin());
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, before_ptd_2.rdata(PIdx::uz),
++                                 before_ptd_2.rdata(PIdx::uz) + n_before_2, before_uz_2.begin());
++            }
++
+             // Loop over independent particle pairs
+             // To speed up binary collisions on GPU, we try to expose as much parallelism
+             // as possible (while avoiding race conditions): Instead of looping with one GPU
+@@ -1312,9 +1588,85 @@ public:
+                                                     p_pair_indices_1, p_pair_indices_2,
+                                                     p_pair_reaction_weight, p_product_data);
+ 
++            if (ParticleCreationDiag::Active() &&
++                (!m_creation_channel.empty() || !m_creation_split_channel.empty())) {
++                amrex::Gpu::HostVector<amrex::ParticleReal> h_pair_reaction_weight(n_total_pairs);
++                amrex::Gpu::copy(amrex::Gpu::deviceToHost, p_pair_reaction_weight,
++                                 p_pair_reaction_weight + n_total_pairs,
++                                 h_pair_reaction_weight.begin());
++                std::vector<unsigned char> invalid_seen_1(
++                    static_cast<std::size_t>(ptile_1.numParticles()), 0);
++                std::vector<double> consumed_weight_1(
++                    static_cast<std::size_t>(ptile_1.numParticles()), 0.0);
++                std::vector<double> consumed_weight_2(
++                    static_cast<std::size_t>(ptile_2.numParticles()), 0.0);
++                std::vector<unsigned char> invalid_seen_2(
++                    static_cast<std::size_t>(ptile_2.numParticles()), 0);
++                record_destroyed(species_1, ptile_1, p_mask, p_pair_indices_1,
++                                 n_total_pairs, m1,
++                                 m_creation_reaction_mask,
++                                 before_weight_1, before_ux_1, before_uy_1, before_uz_1,
++                                 h_pair_reaction_weight,
++                                 consumed_weight_1,
++                                 invalid_seen_1);
++                record_destroyed(species_2, ptile_2, p_mask, p_pair_indices_2,
++                                 n_total_pairs, m2,
++                                 m_creation_reaction_mask,
++                                 before_weight_2, before_ux_2, before_uy_2, before_uz_2,
++                                 h_pair_reaction_weight,
++                                 consumed_weight_2,
++                                 invalid_seen_2);
++            }
++
+             for (int i = 0; i < n_product_species; i++)
+             {
+-                setNewParticleIDs(*(tile_products_data[i]), static_cast<int>(products_np[i]), num_added[i]);
++                const auto first_id = setNewParticleIDs(
++                    *(tile_products_data[i]), static_cast<int>(products_np[i]), num_added[i]);
++                if (ParticleCreationDiag::Active() &&
++                    (!m_creation_channel.empty() || !m_creation_split_channel.empty()) &&
++                    num_added[i] > 0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_events)
++#endif
++                    {
++                        int split_count = 0;
++                        int reaction_count = num_added[i];
++                        if (m_creation_reaction_mask != 0) {
++                            amrex::Gpu::HostVector<index_type> h_mask(n_total_pairs);
++                            amrex::Gpu::copy(amrex::Gpu::deviceToHost, p_mask,
++                                             p_mask + n_total_pairs, h_mask.begin());
++                            const int nonproduct_total = static_cast<int>(std::count_if(
++                                h_mask.begin(), h_mask.end(), [](index_type mask) {
++                                    return mask > 0 &&
++                                        mask != int(ScatteringProcessType::IONIZATION) &&
++                                        mask != int(ScatteringProcessType::TWOPRODUCT_REACTION) &&
++                                        mask != int(ScatteringProcessType::CHARGE_EXCHANGE);
++                                }));
++                            if (i < 2) { split_count = std::min(num_added[i], nonproduct_total); }
++                            reaction_count = num_added[i] - split_count;
++                            if (m_creation_channel == "chargeexchange" && i < 2) {
++                                reaction_count = 0;
++                            }
++                        } else if (m_creation_channel.empty()) {
++                            split_count = num_added[i];
++                            reaction_count = 0;
++                        }
++                        if (!m_creation_split_channel.empty() && split_count > 0) {
++                            creation_events->push_back({product_species_vector[i],
++                                                        product_species_vector[i]->getSpeciesId(),
++                                                        m_creation_split_channel, first_id,
++                                                        split_count,
++                                                        amrex::ParallelDescriptor::MyProc()});
++                        }
++                        if (!m_creation_channel.empty() && reaction_count > 0) {
++                            creation_events->push_back({product_species_vector[i],
++                                                        product_species_vector[i]->getSpeciesId(),
++                                                        m_creation_channel,
++                                                        first_id + split_count, reaction_count,
++                                                        amrex::ParallelDescriptor::MyProc()});
++                        }
++                    }
++                }
+             }
+ 
+             if (m_correct_energy_momentum) {
+@@ -1531,6 +1882,9 @@ private:
+     enum energy_correction_sort_by_weight_flags : int { no_sort, sort };
+ 
+     amrex::Vector<std::string> m_product_species;
++    std::string m_creation_channel;
++    std::string m_creation_split_channel;
++    int m_creation_reaction_mask = 0;
+     // functor that performs collisions within a cell
+     CollisionFunctor m_binary_collision_functor;
+     // functor that creates new particles and initializes their parameters
+diff --git a/Source/Particles/MultiParticleContainer.cpp b/Source/Particles/MultiParticleContainer.cpp
+index f9a5833ee..1001c0647 100644
+--- a/Source/Particles/MultiParticleContainer.cpp
++++ b/Source/Particles/MultiParticleContainer.cpp
+@@ -22,6 +22,7 @@
+ #endif
+ #include "Particles/LaserParticleContainer.H"
+ #include "Particles/ParticleCreation/FilterCopyTransform.H"
++#include "Diagnostics/ReducedDiags/ParticleCreation.H"
+ #ifdef WARPX_QED
+ #   include "Particles/ParticleCreation/FilterCreateTransformFromFAB.H"
+ #endif
+@@ -1226,6 +1227,7 @@ MultiParticleContainer::doFieldIonization (int lev,
+         pc_product->defineAllParticleTiles();
+ 
+         auto info = getMFItInfo(*pc_source, *pc_product);
++        std::vector<ParticleCreationEvent> creation_events;
+ 
+ #ifdef AMREX_USE_OMP
+ #pragma omp parallel if (Gpu::notInLaunchRegion())
+@@ -1249,7 +1251,15 @@ MultiParticleContainer::doFieldIonization (int lev,
+             const auto num_added = filterCopyTransformParticles<1>(*pc_product, dst_tile, src_tile, np_dst,
+                                                                    Filter, Copy, Transform);
+ 
+-            setNewParticleIDs(dst_tile, np_dst, num_added);
++            const auto first_id = setNewParticleIDs(dst_tile, np_dst, num_added);
++            if (ParticleCreationDiag::Active() && num_added > 0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_events)
++#endif
++                creation_events.push_back({pc_product.get(), pc_product->getSpeciesId(),
++                                           "ionization", first_id, num_added,
++                                           ParallelDescriptor::MyProc()});
++            }
+ 
+             if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+             {
+@@ -1258,6 +1268,12 @@ MultiParticleContainer::doFieldIonization (int lev,
+                 amrex::HostDevice::Atomic::Add( &(*cost)[pti.index()], wt);
+             }
+         }
++
++        for (auto const& event : creation_events) {
++            ParticleCreationDiag::RecordIDRange(*event.container, event.species_id,
++                                                event.channel, event.first_id, event.count,
++                                                event.creator_cpu);
++        }
+     }
+ }
+ 
+diff --git a/Source/Particles/ParticleCreation/AddParticles.cpp b/Source/Particles/ParticleCreation/AddParticles.cpp
+index 7617906ee..f86c4ee2c 100644
+--- a/Source/Particles/ParticleCreation/AddParticles.cpp
++++ b/Source/Particles/ParticleCreation/AddParticles.cpp
+@@ -5,6 +5,7 @@
+  * License: BSD-3-Clause-LBNL
+  */
+ #include "Particles/PhysicalParticleContainer.H"
++#include "Diagnostics/ReducedDiags/ParticleCreation.H"
+ 
+ #include "AddPlasmaUtilities.H"
+ #include "DefaultInitialization.H"
+@@ -271,7 +272,6 @@ PhysicalParticleContainer::AddParticles (int lev)
+     ABLASTR_PROFILE("PhysicalParticleContainer::AddParticles()");
+ 
+     for (auto const& plasma_injector : plasma_injectors) {
+-
+         if (plasma_injector->add_single_particle) {
+             if (WarpX::gamma_boost > 1.) {
+                 MapParticletoBoostedFrame(plasma_injector->single_particle_pos[0],
+@@ -290,7 +290,7 @@ PhysicalParticleContainer::AddParticles (int lev)
+             const amrex::Vector<amrex::Vector<ParticleReal>> attr = {{plasma_injector->single_particle_weight}};
+             const amrex::Vector<amrex::Vector<int>> attr_int;
+             AddNParticles(lev, 1, xp, yp, zp, uxp, uyp, uzp,
+-                          1, attr, 0, attr_int, 0);
++                          1, attr, 0, attr_int, 0, -1, "initial");
+             return;
+         }
+ 
+@@ -315,21 +315,21 @@ PhysicalParticleContainer::AddParticles (int lev)
+                           plasma_injector->multiple_particles_ux,
+                           plasma_injector->multiple_particles_uy,
+                           plasma_injector->multiple_particles_uz,
+-                          1, attr, 0, attr_int, 0);
++                          1, attr, 0, attr_int, 0, -1, "initial");
+         }
+ 
+         if (plasma_injector->gaussian_beam) {
+-            AddGaussianBeam(*plasma_injector);
++            AddGaussianBeam(*plasma_injector, "initial");
+         }
+ 
+         if (plasma_injector->external_file) {
+             AddPlasmaFromFile(*plasma_injector,
+                               plasma_injector->q_tot,
+-                              plasma_injector->z_shift);
++                              plasma_injector->z_shift, "initial");
+         }
+ 
+         if ( plasma_injector->doInjection() ) {
+-            AddPlasma(*plasma_injector, lev);
++            AddPlasma(*plasma_injector, lev, amrex::RealBox(), "initial");
+         }
+     }
+ }
+@@ -343,7 +343,9 @@ PhysicalParticleContainer::ContinuousInjection (const amrex::RealBox& injection_
+     // Inject plasma on level 0. Particles will be redistributed.
+     const int lev=0;
+     for (auto const& plasma_injector : plasma_injectors) {
+-        AddPlasma(*plasma_injector, lev, injection_box);
++        const auto& source_name = plasma_injector->getSourceName();
++        const std::string channel = source_name.empty() ? "continuous" : source_name;
++        AddPlasma(*plasma_injector, lev, injection_box, channel);
+     }
+ }
+ 
+@@ -356,9 +358,11 @@ PhysicalParticleContainer::ContinuousFluxInjection (amrex::Real t, amrex::Real d
+         if (plasma_injector->doFluxInjection()){
+             // Check the optional parameters for start and stop of injection
+             if ( ((plasma_injector->flux_tmin<0) || (t>=plasma_injector->flux_tmin)) &&
+-                 ((plasma_injector->flux_tmax<0) || (t< plasma_injector->flux_tmax)) ){
++                ((plasma_injector->flux_tmax<0) || (t< plasma_injector->flux_tmax)) ){
+ 
+-                AddPlasmaFlux(*plasma_injector, dt);
++                const auto& source_name = plasma_injector->getSourceName();
++                const std::string channel = source_name.empty() ? "flux" : source_name;
++                AddPlasmaFlux(*plasma_injector, dt, channel);
+ 
+             }
+         }
+@@ -438,7 +442,8 @@ PhysicalParticleContainer::CheckAndAddParticle (
+ }
+ 
+ void
+-PhysicalParticleContainer::AddGaussianBeam (PlasmaInjector const& plasma_injector){
++PhysicalParticleContainer::AddGaussianBeam (PlasmaInjector const& plasma_injector,
++                                            std::string const& creation_channel){
+ 
+     const amrex::Real x_m = plasma_injector.x_m;
+     const amrex::Real y_m = plasma_injector.y_m;
+@@ -675,13 +680,14 @@ PhysicalParticleContainer::AddGaussianBeam (PlasmaInjector const& plasma_injecto
+     const amrex::Vector<amrex::Vector<int>> attr_int;
+ 
+     AddNParticles(0, np, xp,  yp,  zp, uxp, uyp, uzp,
+-                  1, attr, 0, attr_int, 1);
++                  1, attr, 0, attr_int, 1, -1, creation_channel);
+ }
+ 
+ void
+ PhysicalParticleContainer::AddPlasmaFromFile(PlasmaInjector & plasma_injector,
+                                              amrex::ParticleReal q_tot,
+-                                             amrex::ParticleReal z_shift)
++                                             amrex::ParticleReal z_shift,
++                                             std::string const& creation_channel)
+ {
+     // Declare temporary vectors on the CPU
+     amrex::Gpu::HostVector<ParticleReal> particle_x;
+@@ -810,14 +816,16 @@ PhysicalParticleContainer::AddPlasmaFromFile(PlasmaInjector & plasma_injector,
+     const amrex::Vector<amrex::Vector<int>> attr_int;
+ 
+     AddNParticles(0, np, xp,  yp,  zp, uxp, uyp, uzp,
+-                  1, attr, 0, attr_int, 1);
++                  1, attr, 0, attr_int, 1, -1, creation_channel);
+ #endif // WARPX_USE_OPENPMD
+ 
+-    ignore_unused(plasma_injector, q_tot, z_shift);
++    ignore_unused(plasma_injector, q_tot, z_shift, creation_channel);
+ }
+ 
+ void
+-PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev, amrex::RealBox part_realbox)
++PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
++                                      amrex::RealBox part_realbox,
++                                      std::string const& creation_channel)
+ {
+     ABLASTR_PROFILE("PhysicalParticleContainer::AddPlasma()");
+ 
+@@ -847,6 +855,7 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
+     amrex::Box fine_injection_box;
+     amrex::IntVect rrfac(AMREX_D_DECL(1,1,1));
+     const bool refine_injection = findRefinedInjectionBox(fine_injection_box, rrfac);
++    std::vector<ParticleCreationEvent> creation_events;
+ 
+     InjectorPosition* inj_pos = plasma_injector.getInjectorPosition();
+     InjectorMomentum* inj_mom = plasma_injector.getInjectorMomentumDevice();
+@@ -1279,6 +1288,15 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
+ 
+         amrex::Gpu::synchronize();
+ 
++        if (ParticleCreationDiag::Active() && max_new_particles > 0) {
++#ifdef AMREX_USE_OMP
++#pragma omp critical (particle_creation_ranges)
++#endif
++            creation_events.push_back({this, getSpeciesId(), creation_channel,
++                                       pid, max_new_particles,
++                                       ParallelDescriptor::MyProc()});
++        }
++
+         if (cost && WarpX::load_balance_costs_update_algo == LoadBalanceCostsUpdateAlgo::Timers)
+         {
+             wt = static_cast<amrex::Real>(amrex::second()) - wt;
+@@ -1299,11 +1317,19 @@ PhysicalParticleContainer::AddPlasma (PlasmaInjector& plasma_injector, int lev,
+     }
+ #endif
+ 
++    for (auto const& event : creation_events) {
++        ParticleCreationDiag::RecordIDRange(*event.container, event.species_id,
++                                            event.channel, event.first_id, event.count,
++                                            event.creator_cpu);
++    }
++
+     // The function that calls this is responsible for redistributing particles.
+ }
+ 
+ void
+-PhysicalParticleContainer::AddPlasmaFlux (PlasmaInjector const& plasma_injector, amrex::Real dt)
++PhysicalParticleContainer::AddPlasmaFlux (PlasmaInjector const& plasma_injector,
++                                          amrex::Real dt,
++                                          std::string const& creation_channel)
+ {
+     ABLASTR_PROFILE("PhysicalParticleContainer::AddPlasmaFlux()");
+ 
+@@ -1837,8 +1863,21 @@ PhysicalParticleContainer::AddPlasmaFlux (PlasmaInjector const& plasma_injector,
+     // are in the right tile.)
+     tmp_pc.Redistribute();
+ 
++    if (ParticleCreationDiag::Active()) {
++        // tmp_pc is fresh and contains only accepted particles after
++        // redistribution.  Scanning it here counts the final survivors on
++        // their destination ranks, avoiding creator-rank metadata exchange.
++        ParticleCreationDiag::RecordAmount(
++            getSpeciesId(), creation_channel,
++            ParticleCreationDiag::Capture(
++                tmp_pc, static_cast<double>(getMass()),
++                this->AmIA<PhysicalSpecies::photon>()).amount,
++            false);
++    }
++
+     // Add the particles to the current container
+     this->addParticles(tmp_pc, true);
++
+ }
+ 
+ void
+@@ -2324,10 +2363,14 @@ PhysicalParticleContainer::AddPlasmaFluxPair (PhysicalParticleContainer& partner
+     const auto npair = static_cast<amrex::Long>(pair_x.size());
++    const std::string creation_channel_a =
++        injector_a->getSourceName().empty() ? "flux" : injector_a->getSourceName();
++    const std::string creation_channel_b =
++        injector_b->getSourceName().empty() ? "flux" : injector_b->getSourceName();
+     tmp_pc_a.AddNParticles(0, npair, pair_x, pair_y, pair_z,
+                            pair_ux_a, pair_uy_a, pair_uz_a,
+-                           1, attr_real_a, 0, attr_int, 1);
++                           1, attr_real_a, 0, attr_int, 1, -1, "");
+     tmp_pc_b.AddNParticles(0, npair, pair_x, pair_y, pair_z,
+                            pair_ux_b, pair_uy_b, pair_uz_b,
+-                           1, attr_real_b, 0, attr_int, 1);
++                           1, attr_real_b, 0, attr_int, 1, -1, "");
+ 
+ #ifdef AMREX_USE_EB
+     if (EB::enabled())
+@@ -2353,7 +2392,22 @@ PhysicalParticleContainer::AddPlasmaFluxPair (PhysicalParticleContainer& partner
+ #endif
+ 
++    if (ParticleCreationDiag::Active()) {
++        ParticleCreationDiag::RecordAmount(
++            getSpeciesId(), creation_channel_a,
++            ParticleCreationDiag::Capture(
++                tmp_pc_a, static_cast<double>(getMass()),
++                this->AmIA<PhysicalSpecies::photon>()).amount,
++            false);
++        ParticleCreationDiag::RecordAmount(
++            partner.getSpeciesId(), creation_channel_b,
++            ParticleCreationDiag::Capture(
++                tmp_pc_b, static_cast<double>(partner.getMass()),
++                partner.AmIA<PhysicalSpecies::photon>()).amount,
++            false);
++    }
++
+     tmp_pc_a.Redistribute();
+     tmp_pc_b.Redistribute();
+     this->addParticles(tmp_pc_a, true);
+     partner.addParticles(tmp_pc_b, true);
+ }
+diff --git a/Source/Particles/ParticleCreation/SmartUtils.H b/Source/Particles/ParticleCreation/SmartUtils.H
+index 358c2b1a7..f38d75bb6 100644
+--- a/Source/Particles/ParticleCreation/SmartUtils.H
++++ b/Source/Particles/ParticleCreation/SmartUtils.H
+@@ -49,7 +49,7 @@ SmartCopyTag getSmartCopyTag (std::vector<std::string> const & src, std::vector<
+  * \param num_added the number of particles to set the ids for.
+  */
+ template <typename PTile>
+-void setNewParticleIDs (PTile& ptile, amrex::Long old_size, amrex::Long num_added)
++amrex::Long setNewParticleIDs (PTile& ptile, amrex::Long old_size, amrex::Long num_added)
+ {
+     amrex::Long pid;
+ #ifdef AMREX_USE_OMP
+@@ -68,6 +68,8 @@ void setNewParticleIDs (PTile& ptile, amrex::Long old_size, amrex::Long num_adde
+         auto const new_id = lip + old_size;
+         ptd.m_idcpu[new_id] = amrex::SetParticleIDandCPU(pid+lip, cpuid);
+     });
++
++    return pid;
+ }
+ 
+ #endif //WARPX_SMART_UTILS_H_
+diff --git a/Source/Particles/PhysicalParticleContainer.H b/Source/Particles/PhysicalParticleContainer.H
+index b61b91760..9ad1d2ab3 100644
+--- a/Source/Particles/PhysicalParticleContainer.H
++++ b/Source/Particles/PhysicalParticleContainer.H
+@@ -247,7 +247,9 @@ public:
+      * (this box should correspond to an integer number of cells in each direction,
+      * but its boundaries need not be aligned with the actual cells of the simulation)
+     */
+-    void AddPlasma (PlasmaInjector& plasma_injector, int lev, amrex::RealBox part_realbox = amrex::RealBox());
++    void AddPlasma (PlasmaInjector& plasma_injector, int lev,
++                    amrex::RealBox part_realbox = amrex::RealBox(),
++                    std::string const& creation_channel = "initial");
+ 
+     /**
+      * Create new macroparticles for this species, with a fixed
+@@ -255,7 +257,8 @@ public:
+      * @param[in] plasma_injector the PlasmaInjector instance holding the input parameters
+      * @param[in] dt time step size, used to partially advance the particles
+     */
+-    void AddPlasmaFlux (PlasmaInjector const& plasma_injector, amrex::Real dt);
++    void AddPlasmaFlux (PlasmaInjector const& plasma_injector, amrex::Real dt,
++                        std::string const& creation_channel = "flux");
+ 
+     /** Create a paired flux injection using shared plane samples. */
+     void AddPlasmaFluxPair (PhysicalParticleContainer& partner,
+@@ -265,7 +268,8 @@ public:
+                                     amrex::ParticleReal& ux, amrex::ParticleReal& uy, amrex::ParticleReal& uz,
+                                     amrex::Real t_lab = 0.) const;
+ 
+-    void AddGaussianBeam (PlasmaInjector const& plasma_injector);
++    void AddGaussianBeam (PlasmaInjector const& plasma_injector,
++                          std::string const& creation_channel = "");
+ 
+     /** Load a particle beam from an external file
+      * @param[in] plasma_injector the PlasmaInjector instance holding the input parameters
+@@ -274,7 +278,8 @@ public:
+      */
+     void AddPlasmaFromFile (PlasmaInjector & plasma_injector,
+                             amrex::ParticleReal q_tot,
+-                            amrex::ParticleReal z_shift);
++                            amrex::ParticleReal z_shift,
++                            std::string const& creation_channel = "");
+ 
+     void CheckAndAddParticle (
+         amrex::ParticleReal x, amrex::ParticleReal y, amrex::ParticleReal z,
+diff --git a/Source/Particles/WarpXParticleContainer.H b/Source/Particles/WarpXParticleContainer.H
+index 81b93db6c..928389ce8 100644
+--- a/Source/Particles/WarpXParticleContainer.H
++++ b/Source/Particles/WarpXParticleContainer.H
+@@ -526,7 +526,8 @@ public:
+                         int nattr_real,
+                         amrex::Vector<amrex::Vector<amrex::ParticleReal>> const & attr_real,
+                         int nattr_int, amrex::Vector<amrex::Vector<int>> const & attr_int,
+-                        int uniqueparticles, amrex::Long id=-1);
++                        int uniqueparticles, amrex::Long id=-1,
++                        std::string const& creation_channel = "");
+ 
+     /** Remove particles with invalid ID
+     *
+@@ -583,6 +584,10 @@ public:
+ 
+     int DoFieldIonization() const { return do_field_ionization; }
+ 
++    int DoResampling() const { return do_resampling; }
++
++    int DoSplitting() const { return do_splitting; }
++
+ #ifdef WARPX_QED
+     //Species for which QED effects are relevant should override these methods
+     virtual bool has_quantum_sync() const {return false;}
+diff --git a/Source/Particles/WarpXParticleContainer.cpp b/Source/Particles/WarpXParticleContainer.cpp
+index e45307bb6..92b444d9e 100644
+--- a/Source/Particles/WarpXParticleContainer.cpp
++++ b/Source/Particles/WarpXParticleContainer.cpp
+@@ -17,6 +17,7 @@
+ #include "Deposition/MassMatricesDeposition.H"
+ #include "Deposition/SharedDepositionUtils.H"
+ #include "EmbeddedBoundary/Enabled.H"
++#include "Diagnostics/ReducedDiags/ParticleCreation.H"
+ #include "Fields.H"
+ #include "Pusher/GetAndSetPosition.H"
+ #include "Pusher/UpdatePosition.H"
+@@ -191,7 +192,8 @@ WarpXParticleContainer::AddNParticles (int /*lev*/, long n,
+                                        amrex::Vector<amrex::Vector<amrex::ParticleReal>> const & attr_real,
+                                        const int nattr_int,
+                                        amrex::Vector<amrex::Vector<int>> const & attr_int,
+-                                       int uniqueparticles, amrex::Long id)
++                                       int uniqueparticles, amrex::Long id,
++                                       std::string const& creation_channel)
+ {
+     using namespace amrex::literals;
+     using warpx::fields::FieldType;
+@@ -238,6 +240,8 @@ WarpXParticleContainer::AddNParticles (int /*lev*/, long n,
+     amrex::Vector<amrex::ParticleReal> phi(np);
+ #endif
+ 
++    amrex::Long first_id = 0;
++    const int creation_cpu = ParallelDescriptor::MyProc();
+     for (auto i = ibegin; i < iend; ++i)
+     {
+         auto & idcpu_data = pinned_tile.GetStructOfArrays().GetIdCPUData();
+@@ -245,6 +249,9 @@ WarpXParticleContainer::AddNParticles (int /*lev*/, long n,
+         amrex::Long current_id = id;  // copy input
+         if (id == -1) {
+             current_id = ParticleType::NextID();
++            if (i == ibegin) {
++                first_id = current_id;
++            }
+         }
+         idcpu_data.push_back(amrex::SetParticleIDandCPU(current_id, ParallelDescriptor::MyProc()));
+ 
+@@ -338,19 +338,30 @@ WarpXParticleContainer::AddNParticles (int /*lev*/, long n,
+     }
+ 
++    if (ParticleCreationDiag::Active() && !creation_channel.empty() && np > 0) {
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            id == -1,
++            "ParticleCreation diagnostics require generated particle IDs; "
++            "explicit particle IDs are not supported for a creation channel.");
++        ParticleCreationDiag::RecordIDRange(
++            *this, getSpeciesId(), creation_channel, first_id,
++            static_cast<amrex::Long>(np),
++            creation_cpu);
++    }
++
+     // Move particles to their appropriate tiles
+     Redistribute();
+ 
+     // Remove particles that are inside the embedded boundaries
+ #ifdef AMREX_USE_EB
+     if (EB::enabled()) {
+         auto & warpx = WarpX::GetInstance();
+         scrapeParticlesAtEB(
+             *this,
+             warpx.m_fields.get_mr_levels(FieldType::distance_to_eb, warpx.finestLevel()),
+             ParticleBoundaryProcess::Absorb());
+         deleteInvalidParticles();
+     }
+ #endif
+ }
+ 
+ void
+@@ -1452,6 +1467,7 @@ WarpXParticleContainer::DepositCurrent (
+         }
+ #endif
+     }
++
+ }
+ 
+ void WarpXParticleContainer::DepositCurrent (
+diff --git a/Source/Python/Particles/WarpXParticleContainer.cpp b/Source/Python/Particles/WarpXParticleContainer.cpp
+index c7f10717f..f971930d3 100644
+--- a/Source/Python/Particles/WarpXParticleContainer.cpp
++++ b/Source/Python/Particles/WarpXParticleContainer.cpp
+@@ -71,7 +71,7 @@ void init_WarpXParticleContainer (py::module& m)
+ 
+                 pc.AddNParticles(
+                     lev, n, xp, yp, zp, uxp, uyp, uzp, nattr_real, attr,
+-                    nattr_int, iattr, uniqueparticles, id
++                    nattr_int, iattr, uniqueparticles, id, "inject"
+                 );
+             },
+             py::arg("lev"), py::arg("n"),
+diff --git a/Source/Diagnostics/ReducedDiags/ParticleCreation.H b/Source/Diagnostics/ReducedDiags/ParticleCreation.H
+new file mode 100644
+index 000000000..e3f44c23d
+--- /dev/null
++++ b/Source/Diagnostics/ReducedDiags/ParticleCreation.H
+@@ -0,0 +1,121 @@
++/* Copyright 2026 The WarpX Community
++ *
++ * This file is part of WarpX.
++ *
++ * License: BSD-3-Clause-LBNL
++ */
++#ifndef WARPX_DIAGNOSTICS_REDUCEDDIAGS_PARTICLECREATION_H_
++#define WARPX_DIAGNOSTICS_REDUCEDDIAGS_PARTICLECREATION_H_
++
++#include "ReducedDiags.H"
++
++#include <AMReX_INT.H>
++
++#include <string>
++#include <vector>
++
++class WarpXParticleContainer;
++
++/** A host-side event queued by a creation path after it has assigned IDs. */
++struct ParticleCreationEvent
++{
++    WarpXParticleContainer* container = nullptr;
++    int species_id = -1;
++    std::string channel;
++    amrex::Long first_id = 0;
++    amrex::Long count = 0;
++    int creator_cpu = -1;
++};
++
++/**
++ * Reduced diagnostic for exact per-channel particle creation and destruction.
++ *
++ * Hooks call this class only after their device work has synchronized.  The
++ * particle scan is host-side so the Metal path never emits FP64 arithmetic or
++ * dynamic channel indexing in a device kernel.  MPI reduction is performed
++ * once, over the fixed output layout, in ComputeDiags.
++ */
++class ParticleCreationDiag final : public ReducedDiags
++{
++public:
++    struct Amount
++    {
++        amrex::Long count = 0;
++        double weight = 0.0;
++        double kinetic_energy = 0.0;
++    };
++
++    struct Snapshot
++    {
++        Amount amount;
++    };
++
++    explicit ParticleCreationDiag (const std::string& rd_name);
++    ~ParticleCreationDiag () override;
++
++    ParticleCreationDiag (ParticleCreationDiag const&) = delete;
++    ParticleCreationDiag& operator= (ParticleCreationDiag const&) = delete;
++
++    /** True when the pcreate reduced diagnostic is configured. */
++    static bool Active () noexcept;
++
++    /** Take a rank-local, double-precision snapshot of one species. */
++    static Snapshot Capture (WarpXParticleContainer const& pc,
++                             double mass_override = -1.0,
++                             bool is_photon_override = false);
++
++    /** Record accepted particles occupying a newly assigned ID range. */
++    static void RecordIDRange (WarpXParticleContainer const& pc, int species_id,
++                               const std::string& channel, amrex::Long first_id,
++                               amrex::Long count, int creator_cpu = -1);
++
++    /** Record an amount already measured at the creation/destruction hook. */
++    static void RecordAmount (int species_id, const std::string& channel,
++                              Amount const& amount, bool destroyed);
++
++    /** Consume pending amounts for the row selected by the reduced-diag interval. */
++    void ComputeDiags (int step) final;
++
++    /** The initial inventory is always emitted as the step-0 opening row. */
++    [[nodiscard]] bool DoDiags (int step) const final {
++        return step == -1 || ReducedDiags::DoDiags(step);
++    }
++
++    /** Write the exact integer/double row without passing through m_data<Real>. */
++    void WriteToFile (int step) const final;
++
++    void PrepareCheckpointData () final;
++    void WriteCheckpointData (std::string const& dir) final;
++    void ReadCheckpointData (std::string const& dir) final;
++
++    /** Register a channel while the input-derived layout is being built. */
++    void addChannel (int species_id, const std::string& channel, bool has_destroyed);
++
++private:
++    struct Channel
++    {
++        std::string name;
++        bool has_destroyed = false;
++        std::size_t column = 0; // index of the created Amount group
++    };
++
++    struct Species
++    {
++        std::string name;
++        std::vector<Channel> channels;
++    };
++
++    static ParticleCreationDiag* s_instance;
++
++    std::vector<Species> m_species;
++    std::vector<Amount> m_pending;
++    std::vector<Amount> m_checkpoint_pending;
++    std::vector<std::string> m_layout_names;
++    mutable std::vector<Amount> m_row;
++
++    void record (int species_id, const std::string& channel,
++                 Amount const& amount, bool destroyed);
++    void writeHeader () const;
++};
++
++#endif // WARPX_DIAGNOSTICS_REDUCEDDIAGS_PARTICLECREATION_H_
+diff --git a/Source/Diagnostics/ReducedDiags/ParticleCreation.cpp b/Source/Diagnostics/ReducedDiags/ParticleCreation.cpp
+new file mode 100644
+index 000000000..5bd11c8e6
+--- /dev/null
++++ b/Source/Diagnostics/ReducedDiags/ParticleCreation.cpp
+@@ -0,0 +1,490 @@
++/* Copyright 2026 The WarpX Community
++ *
++ * This file is part of WarpX.
++ *
++ * License: BSD-3-Clause-LBNL
++ */
++#include "ParticleCreation.H"
++
++#include "Initialization/PlasmaInjector.H"
++#include "Particles/MultiParticleContainer.H"
++#include "Particles/WarpXParticleContainer.H"
++#include "Utils/TextMsg.H"
++#include "Utils/WarpXConst.H"
++#include "WarpX.H"
++
++#include <AMReX_GpuContainers.H>
++#include <AMReX_ParIter.H>
++#include <AMReX_ParallelDescriptor.H>
++#include <AMReX_ParmParse.H>
++#include <AMReX_Particle.H>
++
++#include <algorithm>
++#include <cmath>
++#include <fstream>
++#include <iomanip>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++using namespace amrex;
++
++ParticleCreationDiag* ParticleCreationDiag::s_instance = nullptr;
++
++namespace
++{
++    enum class ReductionMode { Valid, IDRange };
++
++    double kineticEnergyDouble (double ux, double uy, double uz,
++                                double mass, bool is_photon) noexcept
++    {
++        const double u2 = ux*ux + uy*uy + uz*uz;
++        if (is_photon) {
++            return static_cast<double>(PhysConst::m_e) * static_cast<double>(PhysConst::c)
++                * std::sqrt(u2);
++        }
++        const double gamma = std::sqrt(1.0 + u2 * PhysConst::inv_c2_v<double>);
++        return mass * u2 / (1.0 + gamma);
++    }
++
++    ParticleCreationDiag::Amount scanParticles (
++        WarpXParticleContainer const& pc, ReductionMode mode,
++        amrex::Long first_id = 0, amrex::Long id_count = 0,
++        int creator_cpu = -1, double mass_override = -1.0,
++        bool is_photon_override = false)
++    {
++        ParticleCreationDiag::Amount result;
++        if (mode == ReductionMode::IDRange && id_count <= 0) { return result; }
++
++        auto& mutable_pc = const_cast<WarpXParticleContainer&>(pc);
++        const bool is_photon = mass_override >= 0.0
++            ? is_photon_override : pc.AmIA<PhysicalSpecies::photon>();
++        const double mass = mass_override >= 0.0
++            ? mass_override : static_cast<double>(pc.getMass());
++
++        for (int lev = 0; lev <= pc.finestLevel(); ++lev) {
++            for (WarpXParIter pti(mutable_pc, lev); pti.isValid(); ++pti) {
++                const auto& ptd = pti.GetParticleTile().getConstParticleTileData();
++                const auto n = static_cast<std::size_t>(pti.numParticles());
++                if (n == 0) { continue; }
++
++                Gpu::HostVector<uint64_t> h_idcpu(n);
++                Gpu::HostVector<ParticleReal> h_w(n);
++                Gpu::HostVector<ParticleReal> h_ux(n);
++                Gpu::HostVector<ParticleReal> h_uy(n);
++                Gpu::HostVector<ParticleReal> h_uz(n);
++                Gpu::copy(Gpu::deviceToHost, ptd.m_idcpu, ptd.m_idcpu + n, h_idcpu.begin());
++                Gpu::copy(Gpu::deviceToHost, ptd.rdata(PIdx::w),
++                          ptd.rdata(PIdx::w) + n, h_w.begin());
++                Gpu::copy(Gpu::deviceToHost, ptd.rdata(PIdx::ux),
++                          ptd.rdata(PIdx::ux) + n, h_ux.begin());
++                Gpu::copy(Gpu::deviceToHost, ptd.rdata(PIdx::uy),
++                          ptd.rdata(PIdx::uy) + n, h_uy.begin());
++                Gpu::copy(Gpu::deviceToHost, ptd.rdata(PIdx::uz),
++                          ptd.rdata(PIdx::uz) + n, h_uz.begin());
++
++                for (std::size_t i = 0; i < n; ++i) {
++                    const ParticleIDWrapper id{h_idcpu[i]};
++                    if (!id.is_valid()) { continue; }
++                    const auto bare_id = static_cast<amrex::Long>(id);
++                    if (mode == ReductionMode::IDRange &&
++                        (bare_id < first_id || bare_id >= first_id + id_count)) {
++                        continue;
++                    }
++                    if (creator_cpu >= 0 &&
++                        static_cast<int>(ParticleCPUWrapper{h_idcpu[i]}) != creator_cpu) {
++                        continue;
++                    }
++
++                    const double weight = static_cast<double>(h_w[i]);
++                    result.count += 1;
++                    result.weight += weight;
++                    result.kinetic_energy += weight * kineticEnergyDouble(
++                        static_cast<double>(h_ux[i]), static_cast<double>(h_uy[i]),
++                        static_cast<double>(h_uz[i]), mass, is_photon);
++                }
++            }
++        }
++        return result;
++    }
++
++    void addIfSpeciesExists (ParticleCreationDiag& diag,
++                             std::vector<std::string> const& species_names,
++                             std::string const& species_name,
++                             std::string const& channel,
++                             bool has_destroyed)
++    {
++        auto const it = std::find(species_names.begin(), species_names.end(), species_name);
++        if (it != species_names.end()) {
++            diag.addChannel(static_cast<int>(std::distance(species_names.begin(), it)),
++                            channel, has_destroyed);
++        }
++    }
++
++    void addForNames (ParticleCreationDiag& diag,
++                      std::vector<std::string> const& species_names,
++                      std::vector<std::string> const& names,
++                      std::string const& channel,
++                      bool has_destroyed)
++    {
++        for (auto const& name : names) {
++            addIfSpeciesExists(diag, species_names, name, channel, has_destroyed);
++        }
++    }
++}
++
++ParticleCreationDiag::ParticleCreationDiag (const std::string& rd_name)
++    : ReducedDiags{rd_name}
++{
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        s_instance == nullptr,
++        "Only one ParticleCreation reduced diagnostic may be configured");
++
++    auto const& mypc = WarpX::GetInstance().GetPartContainer();
++    const auto species_names = mypc.GetSpeciesNames();
++    m_species.resize(species_names.size());
++
++    for (int i = 0; i < static_cast<int>(species_names.size()); ++i) {
++        m_species[i].name = species_names[i];
++        auto const& species = mypc.GetParticleContainer(i);
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            !species.DoQED() && !species.DoResampling() && !species.DoSplitting(),
++            "ParticleCreation does not support QED, particle resampling, or AMR "
++            "particle splitting paths; "
++            "enable it only for the named injection/reaction channels");
++        addChannel(i, "initial", false);
++        addChannel(i, "inject", false);
++
++        bool have_default_continuous = false;
++        bool have_default_flux = false;
++        for (int source_index = 0;; ++source_index) {
++            auto* injector = mypc.GetParticleContainer(i).GetPlasmaInjector(source_index);
++            if (injector == nullptr) { break; }
++            const auto& source_name = injector->getSourceName();
++            if (source_name.empty()) {
++                have_default_continuous = have_default_continuous || injector->doInjection();
++                have_default_flux = have_default_flux || injector->doFluxInjection();
++            } else {
++                WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++                    source_name != "initial" && source_name != "inject" &&
++                    source_name != "continuous" && source_name != "flux" &&
++                    source_name != "ionization" && source_name != "chargeexchange" &&
++                    source_name != "dsmc_split" &&
++                    source_name != "fusion",
++                    "ParticleCreation injection source name '" + source_name +
++                    "' is reserved by the diagnostic layout");
++                addChannel(i, source_name, false);
++            }
++        }
++        if (have_default_continuous) { addChannel(i, "continuous", false); }
++        if (have_default_flux) { addChannel(i, "flux", false); }
++
++        const ParmParse pp_species(species_names[i]);
++        int field_ionization = 0;
++        pp_species.query("do_field_ionization", field_ionization);
++        if (field_ionization) {
++            std::string product;
++            pp_species.query("ionization_product_species", product);
++            addIfSpeciesExists(*this, species_names, product, "ionization", false);
++        }
++    }
++
++    const ParmParse pp_collisions("collisions");
++    std::vector<std::string> collision_names;
++    pp_collisions.queryarr("collision_names", collision_names);
++    for (auto const& collision_name : collision_names) {
++        const ParmParse pp_collision(collision_name);
++        std::string type = "pairwisecoulomb";
++        pp_collision.query("type", type);
++
++        WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++            type != "bremsstrahlung" && type != "linear_breit_wheeler" &&
++            type != "linear_compton" && type != "pulsed_decay",
++            "ParticleCreation does not support QED or pulsed-decay collision "
++            "products; "
++            "disable ParticleCreation or use an injection/ionization/CX/fusion "
++            "configuration");
++
++        std::vector<std::string> involved;
++        pp_collision.queryarr("species", involved);
++        const auto collision_species = involved;
++        std::vector<std::string> products;
++        pp_collision.queryarr("product_species", products);
++        involved.insert(involved.end(), products.begin(), products.end());
++
++        std::string channel;
++        if (type == "nuclearfusion") {
++            channel = "fusion";
++        } else if (type == "dsmc") {
++            std::vector<std::string> processes;
++            pp_collision.queryarr("scattering_processes", processes);
++            bool has_split = false;
++            int product_process_count = 0;
++            for (auto const& process : processes) {
++                const bool is_ionization = process.find("ionization") != std::string::npos;
++                const bool is_charge_exchange =
++                    process.find("charge_exchange") != std::string::npos ||
++                    process.find("two_product_reaction") != std::string::npos;
++                product_process_count += (is_ionization || is_charge_exchange) ? 1 : 0;
++                if (!is_ionization && !is_charge_exchange) { has_split = true; }
++                if (is_ionization && channel.empty()) {
++                    channel = "ionization";
++                    std::string secondary;
++                    pp_collision.query("ionization_species", secondary);
++                    if (!secondary.empty()) { involved.push_back(secondary); }
++                }
++                if (is_charge_exchange && channel.empty()) {
++                    channel = "chargeexchange";
++                }
++            }
++            WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++                product_process_count <= 1,
++                "ParticleCreation does not support multiple DSMC product "
++                "processes in one collision configuration");
++            if (has_split) {
++                addForNames(*this, species_names, collision_species, "dsmc_split", true);
++            }
++        }
++
++        if (!channel.empty()) {
++            addForNames(*this, species_names, involved, channel, true);
++        }
++
++        if (type == "background_mcc") {
++            std::vector<std::string> processes;
++            pp_collision.queryarr("scattering_processes", processes);
++            const bool has_ionization = std::any_of(
++                processes.begin(), processes.end(), [](std::string const& process) {
++                    return process.find("ionization") != std::string::npos;
++                });
++            if (has_ionization) {
++                std::string secondary;
++                pp_collision.query("ionization_species", secondary);
++                auto ionization_species = collision_species;
++                ionization_species.push_back(secondary);
++                addForNames(*this, species_names, ionization_species, "ionization", true);
++            }
++        }
++    }
++
++    std::size_t n_groups = 0;
++    for (auto& species : m_species) {
++        for (auto& channel : species.channels) {
++            channel.column = n_groups++;
++            const auto prefix = species.name + "_" + channel.name;
++            m_layout_names.push_back(prefix + "_created");
++            if (channel.has_destroyed) {
++                ++n_groups;
++                m_layout_names.push_back(prefix + "_destroyed");
++            }
++        }
++    }
++    m_pending.resize(n_groups);
++    m_row.resize(n_groups);
++    m_checkpoint_pending.resize(n_groups);
++    writeHeader();
++    s_instance = this;
++}
++
++ParticleCreationDiag::~ParticleCreationDiag ()
++{
++    if (s_instance == this) { s_instance = nullptr; }
++}
++
++bool ParticleCreationDiag::Active () noexcept
++{
++    return s_instance != nullptr;
++}
++
++ParticleCreationDiag::Snapshot
++ParticleCreationDiag::Capture (WarpXParticleContainer const& pc,
++                               double mass_override,
++                               bool is_photon_override)
++{
++    return Snapshot{scanParticles(pc, ReductionMode::Valid, 0, 0, -1,
++                                  mass_override, is_photon_override)};
++}
++
++void ParticleCreationDiag::RecordIDRange (
++    WarpXParticleContainer const& pc, int species_id, const std::string& channel,
++    amrex::Long first_id, amrex::Long count, int creator_cpu)
++{
++    if (!s_instance || count <= 0) { return; }
++    s_instance->record(species_id, channel,
++                       scanParticles(pc, ReductionMode::IDRange, first_id, count,
++                                     creator_cpu), false);
++}
++
++void ParticleCreationDiag::RecordAmount (
++    int species_id, const std::string& channel, Amount const& amount, bool destroyed)
++{
++    if (!s_instance) { return; }
++    s_instance->record(species_id, channel, amount, destroyed);
++}
++
++void ParticleCreationDiag::addChannel (
++    int species_id, const std::string& channel, bool has_destroyed)
++{
++    auto& channels = m_species.at(static_cast<std::size_t>(species_id)).channels;
++    auto it = std::find_if(channels.begin(), channels.end(),
++                           [&](auto const& item){ return item.name == channel; });
++    if (it == channels.end()) {
++        channels.push_back(Channel{channel, has_destroyed, 0});
++    } else {
++        it->has_destroyed = it->has_destroyed || has_destroyed;
++    }
++}
++
++void ParticleCreationDiag::record (
++    int species_id, const std::string& channel, Amount const& amount, bool destroyed)
++{
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        species_id >= 0 && species_id < static_cast<int>(m_species.size()),
++        "ParticleCreation hook supplied an invalid species id");
++    auto& channels = m_species[species_id].channels;
++    auto it = std::find_if(channels.begin(), channels.end(),
++                           [&](auto const& item){ return item.name == channel; });
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        it != channels.end(),
++        "ParticleCreation hook supplied channel '" + channel +
++        "' that was absent from the diagnostic layout");
++    WARPX_ALWAYS_ASSERT_WITH_MESSAGE(
++        !destroyed || it->has_destroyed,
++        "ParticleCreation destruction hook supplied a creation-only channel");
++    const std::size_t offset = it->column + (destroyed ? 1 : 0);
++    m_pending[offset].count += amount.count;
++    m_pending[offset].weight += amount.weight;
++    m_pending[offset].kinetic_energy += amount.kinetic_energy;
++}
++
++void ParticleCreationDiag::ComputeDiags (int step)
++{
++    if (!DoDiags(step)) { return; }
++
++    const int n = static_cast<int>(m_pending.size());
++    std::vector<amrex::Long> counts(n);
++    std::vector<double> weights(n);
++    std::vector<double> kinetic_energies(n);
++    for (int i = 0; i < n; ++i) {
++        counts[i] = m_pending[i].count;
++        weights[i] = m_pending[i].weight;
++        kinetic_energies[i] = m_pending[i].kinetic_energy;
++    }
++    if (n > 0) {
++        ParallelDescriptor::ReduceLongSum(counts.data(), n);
++        ParallelDescriptor::ReduceRealSum(weights.data(), n);
++        ParallelDescriptor::ReduceRealSum(kinetic_energies.data(), n);
++    }
++    m_row.resize(static_cast<std::size_t>(n));
++    for (int i = 0; i < n; ++i) {
++        m_row[i] = Amount{counts[i], weights[i], kinetic_energies[i]};
++    }
++    std::fill(m_pending.begin(), m_pending.end(), Amount{});
++}
++
++void ParticleCreationDiag::PrepareCheckpointData ()
++{
++    const int n = static_cast<int>(m_pending.size());
++    m_checkpoint_pending.assign(m_pending.begin(), m_pending.end());
++    if (n == 0) { return; }
++
++    std::vector<amrex::Long> counts(n);
++    std::vector<double> weights(n);
++    std::vector<double> kinetic_energies(n);
++    for (int i = 0; i < n; ++i) {
++        counts[i] = m_pending[i].count;
++        weights[i] = m_pending[i].weight;
++        kinetic_energies[i] = m_pending[i].kinetic_energy;
++    }
++    ParallelDescriptor::ReduceLongSum(counts.data(), n);
++    ParallelDescriptor::ReduceRealSum(weights.data(), n);
++    ParallelDescriptor::ReduceRealSum(kinetic_energies.data(), n);
++    if (ParallelDescriptor::IOProcessor()) {
++        for (int i = 0; i < n; ++i) {
++            m_checkpoint_pending[i] = Amount{counts[i], weights[i], kinetic_energies[i]};
++        }
++    }
++}
++
++void ParticleCreationDiag::WriteCheckpointData (std::string const& dir)
++{
++    if (!ParallelDescriptor::IOProcessor()) { return; }
++    std::ofstream chkfile{dir + "/ParticleCreation_data.txt", std::ofstream::out};
++    if (!chkfile.good()) {
++        WARPX_ABORT_WITH_MESSAGE("ParticleCreationDiag::WriteCheckpointData: could not open checkpoint data");
++    }
++    chkfile << m_checkpoint_pending.size() << "\n";
++    chkfile << std::setprecision(17);
++    for (std::size_t i = 0; i < m_checkpoint_pending.size(); ++i) {
++        chkfile << m_layout_names.at(i) << "\n";
++        auto const& amount = m_checkpoint_pending[i];
++        chkfile << amount.count << " " << amount.weight << " "
++                << amount.kinetic_energy << "\n";
++    }
++}
++
++void ParticleCreationDiag::ReadCheckpointData (std::string const& dir)
++{
++    if (!ParallelDescriptor::IOProcessor()) { return; }
++    std::ifstream chkfile{dir + "/ParticleCreation_data.txt", std::ifstream::in};
++    if (!chkfile.good()) {
++        WARPX_ABORT_WITH_MESSAGE("ParticleCreationDiag::ReadCheckpointData: could not open checkpoint data");
++    }
++    std::size_t n = 0;
++    if (!(chkfile >> n) || n != m_pending.size()) {
++        WARPX_ABORT_WITH_MESSAGE("ParticleCreationDiag::ReadCheckpointData: checkpoint layout mismatch");
++    }
++    for (std::size_t i = 0; i < m_pending.size(); ++i) {
++        std::string layout_name;
++        if (!(chkfile >> layout_name) || layout_name != m_layout_names.at(i)) {
++            WARPX_ABORT_WITH_MESSAGE("ParticleCreationDiag::ReadCheckpointData: checkpoint layout mismatch");
++        }
++        auto& amount = m_pending[i];
++        if (!(chkfile >> amount.count >> amount.weight >> amount.kinetic_energy)) {
++            WARPX_ABORT_WITH_MESSAGE("ParticleCreationDiag::ReadCheckpointData: malformed checkpoint data");
++        }
++    }
++}
++
++void ParticleCreationDiag::writeHeader () const
++{
++    if (!ParallelDescriptor::IOProcessor() || !m_write_header) { return; }
++
++    std::ofstream ofs{m_path + m_rd_name + "." + m_extension, std::ofstream::out};
++    int column = 0;
++    ofs << "#";
++    ofs << "[" << column++ << "]step()" << m_sep;
++    ofs << "[" << column++ << "]time(s)";
++    for (auto const& species : m_species) {
++        for (auto const& channel : species.channels) {
++            auto const prefix = species.name + "_" + channel.name;
++            ofs << m_sep << "[" << column++ << "]" << prefix << "_created_count()";
++            ofs << m_sep << "[" << column++ << "]" << prefix << "_created_weight()";
++            ofs << m_sep << "[" << column++ << "]" << prefix << "_created_ke(J)";
++            if (channel.has_destroyed) {
++                ofs << m_sep << "[" << column++ << "]" << prefix << "_destroyed_count()";
++                ofs << m_sep << "[" << column++ << "]" << prefix << "_destroyed_weight()";
++                ofs << m_sep << "[" << column++ << "]" << prefix << "_destroyed_ke(J)";
++            }
++        }
++    }
++    ofs << "\n";
++}
++
++void ParticleCreationDiag::WriteToFile (int step) const
++{
++    if (!ParallelDescriptor::IOProcessor()) { return; }
++    std::ofstream ofs{m_path + m_rd_name + "." + m_extension,
++                      std::ofstream::out | std::ofstream::app};
++    ofs << step + 1 << m_sep;
++    ofs << std::fixed << std::setprecision(m_precision) << std::scientific
++        << WarpX::GetInstance().gett_new(0);
++    for (auto const& amount : m_row) {
++        ofs << m_sep << amount.count;
++        ofs << m_sep << std::fixed << std::setprecision(m_precision) << std::scientific
++            << amount.weight;
++        ofs << m_sep << std::fixed << std::setprecision(m_precision) << std::scientific
++            << amount.kinetic_energy;
++    }
++    ofs << "\n";
++}
