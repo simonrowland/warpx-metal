@@ -1,0 +1,198 @@
+--- a/Source/Particles/Deposition/CurrentDeposition.H
++++ b/Source/Particles/Deposition/CurrentDeposition.H
+@@ -1511,7 +1511,8 @@
+     amrex::Real const costheta_mid = (rp_mid > 0._rt ? xp_mid/rp_mid : 1._rt);
+     amrex::Real const sintheta_mid = (rp_mid > 0._rt ? yp_mid/rp_mid : 0._rt);
+ #if defined(WARPX_DIM_RZ)
+-    Complex const xy_mid0 = Complex{costheta_mid, sintheta_mid};
++    const amrex::Real xy_mid0_real = costheta_mid;
++    const amrex::Real xy_mid0_imag = sintheta_mid;
+ #endif
+ 
+     // Keep these double to avoid bug in single precision
+@@ -1877,6 +1878,8 @@
+         double const z0_bar = (z0_new + z0_old)/2.0;
+         const int i0_cell = compute_shape_factor_cell( sx_cell, x0_bar-0.5 );
+         const int k0_cell = compute_shape_factor_cell( sz_cell, z0_bar-0.5 );
++        LiteralShapeFactorArray<depos_order> sx_cell_values(sx_cell);
++        LiteralShapeFactorArray<depos_order> sz_cell_values(sz_cell);
+ 
+         if constexpr (depos_order >= 3) { // higher-order correction to the cell-based weights
+             const Compute_shape_factor_pair<depos_order-1> compute_shape_factors_cell;
+@@ -1887,9 +1890,13 @@
+             const int i0_cell_2 = compute_shape_factors_cell( sx_old_cell, sx_new_cell, x0_old-0.5, x0_new-0.5 );
+             const int k0_cell_2 = compute_shape_factors_cell( sz_old_cell, sz_new_cell, z0_old-0.5, z0_new-0.5 );
+             amrex::ignore_unused(i0_cell_2, k0_cell_2);
++            LiteralShapeFactorArray<depos_order> sx_old_cell_values(sx_old_cell);
++            LiteralShapeFactorArray<depos_order> sx_new_cell_values(sx_new_cell);
++            LiteralShapeFactorArray<depos_order> sz_old_cell_values(sz_old_cell);
++            LiteralShapeFactorArray<depos_order> sz_new_cell_values(sz_new_cell);
+             for (int m=0; m<depos_order; m++) {
+-                sx_cell[m] = (4.0*sx_cell[m] + sx_old_cell[m] + sx_new_cell[m])/6.0;
+-                sz_cell[m] = (4.0*sz_cell[m] + sz_old_cell[m] + sz_new_cell[m])/6.0;
++                sx_cell_values.set(m, (4.0*sx_cell_values[m] + sx_old_cell_values[m] + sx_new_cell_values[m])/6.0);
++                sz_cell_values.set(m, (4.0*sz_cell_values[m] + sz_old_cell_values[m] + sz_new_cell_values[m])/6.0);
+             }
+         }
+ 
+@@ -1900,21 +1907,30 @@
+         double sz_new_node[depos_order+1] = {0.};
+         const int i0_node = compute_shape_factors_node( sx_old_node, sx_new_node, x0_old, x0_new );
+         const int k0_node = compute_shape_factors_node( sz_old_node, sz_new_node, z0_old, z0_new );
++        LiteralShapeFactorArray<depos_order+1> sx_old_node_values(sx_old_node);
++        LiteralShapeFactorArray<depos_order+1> sx_new_node_values(sx_new_node);
++        LiteralShapeFactorArray<depos_order+1> sz_old_node_values(sz_old_node);
++        LiteralShapeFactorArray<depos_order+1> sz_new_node_values(sz_new_node);
+ 
+         // deposit Jx for this segment
+         amrex::Real this_Jx;
+         for (int i=0; i<=depos_order-1; i++) {
+             for (int k=0; k<=depos_order; k++) {
+-                this_Jx = wqx*sx_cell[i]*(sz_old_node[k] + sz_new_node[k])/2.0_rt*seg_factor_x;
++                this_Jx = wqx*sx_cell_values[i]*(sz_old_node_values[k] + sz_new_node_values[k])/2.0_rt*seg_factor_x;
+                 amrex::Gpu::Atomic::AddNoRet( &Jx_arr(lo.x+i0_cell+i, lo.y+k0_node+k, 0, 0), this_Jx);
+ #if defined(WARPX_DIM_RZ)
+-                Complex xy_mid = xy_mid0; // Throughout the following loop, xy_mid takes the value e^{i m theta}
++                amrex::Real xy_mid_real = xy_mid0_real;
++                amrex::Real xy_mid_imag = xy_mid0_imag;
+                 for (int imode=1 ; imode < n_rz_azimuthal_modes ; imode++) {
+                     // The factor 2 comes from the normalization of the modes
+-                    const Complex djr_cmplx = 2._rt*this_Jx*xy_mid;
+-                    amrex::Gpu::Atomic::AddNoRet( &Jx_arr(lo.x+i0_cell+i, lo.y+k0_node+k, 0, 2*imode-1), djr_cmplx.real());
+-                    amrex::Gpu::Atomic::AddNoRet( &Jx_arr(lo.x+i0_cell+i, lo.y+k0_node+k, 0, 2*imode), djr_cmplx.imag());
+-                    xy_mid = xy_mid*xy_mid0;
++                    const amrex::Real djr_real = 2._rt*this_Jx*xy_mid_real;
++                    const amrex::Real djr_imag = 2._rt*this_Jx*xy_mid_imag;
++                    amrex::Gpu::Atomic::AddNoRet( &Jx_arr(lo.x+i0_cell+i, lo.y+k0_node+k, 0, 2*imode-1), djr_real);
++                    amrex::Gpu::Atomic::AddNoRet( &Jx_arr(lo.x+i0_cell+i, lo.y+k0_node+k, 0, 2*imode), djr_imag);
++                    const amrex::Real next_xy_mid_real = xy_mid_real*xy_mid0_real - xy_mid_imag*xy_mid0_imag;
++                    const amrex::Real next_xy_mid_imag = xy_mid_real*xy_mid0_imag + xy_mid_imag*xy_mid0_real;
++                    xy_mid_real = next_xy_mid_real;
++                    xy_mid_imag = next_xy_mid_imag;
+                 }
+ #endif
+             }
+@@ -1925,20 +1941,24 @@
+         amrex::Real this_Jy;
+         for (int i=0; i<=depos_order; i++) {
+             for (int k=0; k<=depos_order; k++) {
+-                this_Jy = wqy*( sx_old_node[i]*sz_old_node[k]*one_third
+-                              + sx_old_node[i]*sz_new_node[k]*one_sixth
+-                              + sx_new_node[i]*sz_old_node[k]*one_sixth
+-                              + sx_new_node[i]*sz_new_node[k]*one_third )*seg_factor_y;
++                this_Jy = wqy*( sx_old_node_values[i]*sz_old_node_values[k]*one_third
++                              + sx_old_node_values[i]*sz_new_node_values[k]*one_sixth
++                              + sx_new_node_values[i]*sz_old_node_values[k]*one_sixth
++                              + sx_new_node_values[i]*sz_new_node_values[k]*one_third )*seg_factor_y;
+                 amrex::Gpu::Atomic::AddNoRet( &Jy_arr(lo.x+i0_node+i, lo.y+k0_node+k, 0, 0), this_Jy);
+ #if defined(WARPX_DIM_RZ)
+-                Complex xy_mid = xy_mid0;
+-                // Throughout the following loop, xy_ takes the value e^{i m theta_}
++                amrex::Real xy_mid_real = xy_mid0_real;
++                amrex::Real xy_mid_imag = xy_mid0_imag;
+                 for (int imode=1 ; imode < n_rz_azimuthal_modes ; imode++) {
+                     // The factor 2 comes from the normalization of the modes
+-                    const Complex djy_cmplx = 2._rt*this_Jy*xy_mid;
+-                    amrex::Gpu::Atomic::AddNoRet( &Jy_arr(lo.x+i0_node+i, lo.y+k0_node+k, 0, 2*imode-1), djy_cmplx.real());
+-                    amrex::Gpu::Atomic::AddNoRet( &Jy_arr(lo.x+i0_node+i, lo.y+k0_node+k, 0, 2*imode), djy_cmplx.imag());
+-                    xy_mid = xy_mid*xy_mid0;
++                    const amrex::Real djy_real = 2._rt*this_Jy*xy_mid_real;
++                    const amrex::Real djy_imag = 2._rt*this_Jy*xy_mid_imag;
++                    amrex::Gpu::Atomic::AddNoRet( &Jy_arr(lo.x+i0_node+i, lo.y+k0_node+k, 0, 2*imode-1), djy_real);
++                    amrex::Gpu::Atomic::AddNoRet( &Jy_arr(lo.x+i0_node+i, lo.y+k0_node+k, 0, 2*imode), djy_imag);
++                    const amrex::Real next_xy_mid_real = xy_mid_real*xy_mid0_real - xy_mid_imag*xy_mid0_imag;
++                    const amrex::Real next_xy_mid_imag = xy_mid_real*xy_mid0_imag + xy_mid_imag*xy_mid0_real;
++                    xy_mid_real = next_xy_mid_real;
++                    xy_mid_imag = next_xy_mid_imag;
+                 }
+ #endif
+             }
+@@ -1948,16 +1968,21 @@
+         amrex::Real this_Jz;
+         for (int i=0; i<=depos_order; i++) {
+             for (int k=0; k<=depos_order-1; k++) {
+-                this_Jz = wqz*sz_cell[k]*(sx_old_node[i] + sx_new_node[i])/2.0_rt*seg_factor_z;
++                this_Jz = wqz*sz_cell_values[k]*(sx_old_node_values[i] + sx_new_node_values[i])/2.0_rt*seg_factor_z;
+                 amrex::Gpu::Atomic::AddNoRet( &Jz_arr(lo.x+i0_node+i, lo.y+k0_cell+k, 0, 0), this_Jz);
+ #if defined(WARPX_DIM_RZ)
+-                Complex xy_mid = xy_mid0; // Throughout the following loop, xy_mid takes the value e^{i m theta}
++                amrex::Real xy_mid_real = xy_mid0_real;
++                amrex::Real xy_mid_imag = xy_mid0_imag;
+                 for (int imode=1 ; imode < n_rz_azimuthal_modes ; imode++) {
+                     // The factor 2 comes from the normalization of the modes
+-                    const Complex djz_cmplx = 2._rt*this_Jz*xy_mid;
+-                    amrex::Gpu::Atomic::AddNoRet( &Jz_arr(lo.x+i0_node+i, lo.y+k0_cell+k, 0, 2*imode-1), djz_cmplx.real());
+-                    amrex::Gpu::Atomic::AddNoRet( &Jz_arr(lo.x+i0_node+i, lo.y+k0_cell+k, 0, 2*imode), djz_cmplx.imag());
+-                    xy_mid = xy_mid*xy_mid0;
++                    const amrex::Real djz_real = 2._rt*this_Jz*xy_mid_real;
++                    const amrex::Real djz_imag = 2._rt*this_Jz*xy_mid_imag;
++                    amrex::Gpu::Atomic::AddNoRet( &Jz_arr(lo.x+i0_node+i, lo.y+k0_cell+k, 0, 2*imode-1), djz_real);
++                    amrex::Gpu::Atomic::AddNoRet( &Jz_arr(lo.x+i0_node+i, lo.y+k0_cell+k, 0, 2*imode), djz_imag);
++                    const amrex::Real next_xy_mid_real = xy_mid_real*xy_mid0_real - xy_mid_imag*xy_mid0_imag;
++                    const amrex::Real next_xy_mid_imag = xy_mid_real*xy_mid0_imag + xy_mid_imag*xy_mid0_real;
++                    xy_mid_real = next_xy_mid_real;
++                    xy_mid_imag = next_xy_mid_imag;
+                 }
+ #endif
+             }
+
+--- a/Source/Particles/ShapeFactorValues.H
++++ b/Source/Particles/ShapeFactorValues.H
+@@ -298,9 +298,57 @@
+         case 4: return Compute_esirkepov_shape_value<depos_order>{}.old_value(x_old, i_new, 4, reduced_old);
+         case 5: return Compute_esirkepov_shape_value<depos_order>{}.old_value(x_old, i_new, 5, reduced_old);
+         case 6: return Compute_esirkepov_shape_value<depos_order>{}.old_value(x_old, i_new, 6, reduced_old);
++        default: return 0.0;
++        }
++    }
++};
++
++/**
++ * Literal-slot view of a small shape-factor array materialized by an
++ * upstream helper.  Metal drops some runtime-indexed local-array reads;
++ * capture the values through literal reads, then expose only a switch-based
++ * access path to the deposition loops.
++ */
++template <int num_slots>
++struct LiteralShapeFactorArray
++{
++    double v0, v1, v2, v3, v4;
++
++    AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
++    explicit LiteralShapeFactorArray (double const* values)
++        : v0(values[0]), v1(0.0), v2(0.0), v3(0.0), v4(0.0)
++    {
++        if constexpr (num_slots > 1) { v1 = values[1]; }
++        if constexpr (num_slots > 2) { v2 = values[2]; }
++        if constexpr (num_slots > 3) { v3 = values[3]; }
++        if constexpr (num_slots > 4) { v4 = values[4]; }
++    }
++
++    AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
++    double operator[] (const int slot) const
++    {
++        switch (slot) {
++        case 0: return v0;
++        case 1: return v1;
++        case 2: return v2;
++        case 3: return v3;
++        case 4: return v4;
+         default: return 0.0;
+         }
+     }
++
++    AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
++    void set (const int slot, const double value)
++    {
++        switch (slot) {
++        case 0: v0 = value; break;
++        case 1: v1 = value; break;
++        case 2: v2 = value; break;
++        case 3: v3 = value; break;
++        case 4: v4 = value; break;
++        default: break;
++        }
++    }
+ };
+ 
+ #endif
