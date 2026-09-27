@@ -19,11 +19,11 @@ if [ "${WARPX_CPU_MPI:-OFF}" = "ON" ] || [ "${WARPX_CPU_MPI:-OFF}" = "TRUE" ]; t
     PACKAGES+=(open-mpi)
 fi
 for pkg in "${PACKAGES[@]}"; do
-    if brew list --formula "$pkg" &>/dev/null; then
+    if "${BREW_BIN}" list --formula "$pkg" &>/dev/null; then
         echo "  [OK] $pkg already installed"
     else
         echo "  [..] Installing $pkg..."
-        brew install "$pkg"
+        "${BREW_BIN}" install "$pkg"
     fi
 done
 
@@ -39,7 +39,7 @@ else
 fi
 
 # LLVM 18 provides ld64.lld (not included in LLVM 20 Homebrew bottle)
-LLD_PATH="$(brew --prefix llvm@18)/bin/ld64.lld"
+LLD_PATH="$(brew_prefix llvm@18)/bin/ld64.lld"
 if [ -x "${LLD_PATH}" ]; then
     echo "  [OK] ld64.lld: ${LLD_PATH}"
 else
@@ -111,7 +111,7 @@ fi
 echo ""
 echo "=== Step 5: Verify Boost ==="
 
-BOOST_PREFIX="$(brew --prefix boost 2>/dev/null || true)"
+BOOST_PREFIX="$(brew_prefix boost)"
 if [ -d "${BOOST_PREFIX}/include/boost" ]; then
     echo "  [OK] Boost headers: ${BOOST_PREFIX}/include/boost"
 else

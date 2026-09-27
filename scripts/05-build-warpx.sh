@@ -13,6 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
+ensure_macos_sdk
 
 WARPX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/warpx"
 ACPP="${ACPP_INSTALL_PREFIX}/bin/acpp"
@@ -265,7 +266,7 @@ echo "=== Step 4: Configure WarpX with CMake ==="
 cd "${BUILD_DIR}"
 
 # macOS SDK sysroot
-MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+MACOS_SDK="${WARPX_MACOS_SDK_RESOLVED}"
 
 # Use our Metal-patched AMReX source tree (WarpX builds it as a subproject).
 # WarpX will configure AMReX with the right components (2D/3D, PIC, EB, etc.).

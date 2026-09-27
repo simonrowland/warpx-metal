@@ -9,13 +9,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
+ensure_macos_sdk
 
 ACPP="${ACPP_INSTALL_PREFIX}/bin/acpp"
 AMREX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/amrex"
 AMREX_INSTALL_PREFIX="${WARPX_METAL_ROOT}/opt/amrex"
 TEST_SRC_DIR="${WARPX_METAL_ROOT}/tests/amrex/heat_equation"
 BUILD_DIR="${TEST_SRC_DIR}/build"
-MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+MACOS_SDK="${WARPX_MACOS_SDK_RESOLVED}"
 
 # Verify prerequisites
 if [ ! -x "${ACPP}" ]; then

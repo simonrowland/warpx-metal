@@ -14,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
+ensure_macos_sdk
 
 ACPP_ATTESTATION="${ACPP_INSTALL_PREFIX}/bin/BUILD-ATTESTATION.json"
 if [ ! -f "${ACPP_ATTESTATION}" ]; then
@@ -52,7 +53,7 @@ export WARPX_CPU_DIMS="${CPU_DIMS}"
 export WARPX_CPU_CXX="${CPU_CXX}"
 export WARPX_CPU_CC="${CPU_CC}"
 
-LIBOMP_PREFIX="$(brew --prefix libomp 2>/dev/null || echo /opt/homebrew/opt/libomp)"
+LIBOMP_PREFIX="$(brew_prefix libomp /opt/homebrew/opt/libomp)"
 BUILD_DIR="${WARPX_SOURCE_DIR}/build-cpu"
 
 echo ""
@@ -83,7 +84,7 @@ fi
 
 if [ ! -d "${LIBOMP_PREFIX}" ]; then
     echo "[FAIL] libomp not found at ${LIBOMP_PREFIX}"
-    echo "       Install with: brew install libomp"
+    echo "       Install with: ${BREW_BIN} install libomp"
     exit 1
 fi
 
@@ -147,7 +148,7 @@ python3 "${SCRIPT_DIR}/write-build-attestation.py" \
     --external WarpX \
     --skip-input-dir patches/amrex-post
 
-MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+MACOS_SDK="${WARPX_MACOS_SDK_RESOLVED}"
 
 cmake -S "${WARPX_SOURCE_DIR}" -B . \
     -G Ninja \

@@ -61,7 +61,9 @@ production prefix.
 Required on the build host:
 
 - Apple Silicon macOS with working Command Line Tools:
-  `xcrun --sdk macosx --show-sdk-path` and `xcrun -find clang++`;
+  `xcrun --sdk macosx --show-sdk-path` and `xcrun -find clang++`
+  (set `WARPX_MACOS_SDK=/path/to/MacOSX<ver>.sdk` to pin a specific SDK, for
+  example when the default Xcode SDK is newer than the toolchain supports);
 - Homebrew;
 - `git`, `python3`, `curl`, `unzip`, and normal POSIX utilities;
 - network access to GitHub, Homebrew, and Apple's `metal-cpp` archive;
@@ -364,7 +366,7 @@ trees while AMReX is still in the Metal-prepared state:
 export ACPP="$PREFIX/opt/adaptivecpp/bin/acpp"
 export WARPX_SRC="$PREFIX/extern/warpx"
 export AMREX_SRC="$PREFIX/extern/amrex"
-export MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+export MACOS_SDK="${WARPX_MACOS_SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
 export NPROC="$(sysctl -n hw.ncpu)"
 
 for DIM in 1 RZ; do
@@ -432,7 +434,7 @@ export CPU_CC="$(xcrun -find clang)"
 export LIBOMP_PREFIX="$(brew --prefix libomp)"
 export WARPX_SRC="$PREFIX/extern/warpx"
 export AMREX_SRC="$PREFIX/extern/amrex"
-export MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+export MACOS_SDK="${WARPX_MACOS_SDK:-$(xcrun --sdk macosx --show-sdk-path)}"
 export NPROC="$(sysctl -n hw.ncpu)"
 
 for DIM in 1 RZ; do

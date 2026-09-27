@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -228,6 +229,40 @@ def cmake_cache_record(build_dir: Path) -> dict[str, object]:
     }
 
 
+def macos_sdk_record(cmake: dict[str, object]) -> dict[str, str]:
+    definitions = cmake.get("definitions", {})
+    cached = definitions.get("CMAKE_OSX_SYSROOT") if isinstance(definitions, dict) else None
+    if not cached:
+        raise SystemExit("missing macOS SDK path in CMake cache")
+
+    path = Path(str(cached)).expanduser().resolve()
+    if not path.is_dir():
+        raise SystemExit(f"resolved macOS SDK does not exist: {path}")
+    configured = os.environ.get("WARPX_MACOS_SDK_RESOLVED")
+    if configured and Path(configured).expanduser().resolve() != path:
+        raise SystemExit(
+            "macOS SDK environment and CMake cache disagree: "
+            f"{Path(configured).expanduser().resolve()} != {path}"
+        )
+    settings_path = path / "SDKSettings.plist"
+    if not settings_path.is_file():
+        raise SystemExit(f"macOS SDK metadata not found: {settings_path}")
+    try:
+        with settings_path.open("rb") as stream:
+            settings = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException) as error:
+        raise SystemExit(f"cannot read macOS SDK metadata: {settings_path}: {error}") from error
+    canonical_name = settings.get("CanonicalName")
+    if not isinstance(canonical_name, str) or not canonical_name.startswith("macosx"):
+        raise SystemExit(
+            f"macOS SDK metadata is not for macOS (CanonicalName={canonical_name!r}): {path}"
+        )
+    version = settings.get("Version") or settings.get("ProductBuildVersion")
+    if not version:
+        raise SystemExit(f"macOS SDK metadata has no version: {settings_path}")
+    return {"path": str(path), "version": str(version)}
+
+
 def binary_inventory(binary_dir: Path, artifact_dirs: list[Path]) -> list[dict[str, str]]:
     binaries = []
     if not binary_dir.is_dir():
@@ -391,6 +426,7 @@ def main() -> None:
         raise SystemExit("--build-dir is required when writing a build attestation")
     artifacts = binary_inventory(binary_dir, [path.resolve() for path in args.artifact_dir])
     require_artifacts(args.kind, artifacts)
+    cmake = cmake_cache_record(build_dir)
     attestation = {
         "schema": "warpx-metal-build-attestation.v1",
         "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -402,7 +438,8 @@ def main() -> None:
         },
         "binary_dir": str(binary_dir),
         "artifacts": artifacts,
-        "cmake": cmake_cache_record(build_dir),
+        "cmake": cmake,
+        "macos_sdk": macos_sdk_record(cmake),
         "externals": externals,
     }
     configuration = configuration_record(root)

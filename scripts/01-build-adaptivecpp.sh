@@ -9,6 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
+ensure_macos_sdk
 
 echo ""
 echo "=== Step 1: Clone AdaptiveCpp ==="
@@ -75,15 +76,16 @@ echo "=== Step 3: Configure with CMake ==="
 cd "${BUILD_DIR}"
 
 # libomp is keg-only on Homebrew; help CMake find it
-OMP_PREFIX="$(brew --prefix libomp 2>/dev/null || echo /opt/homebrew/opt/libomp)"
+OMP_PREFIX="$(brew_prefix libomp /opt/homebrew/opt/libomp)"
 
 # macOS SDK sysroot (needed for SSCP libkernel bitcode compilation)
-MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+MACOS_SDK="${WARPX_MACOS_SDK_RESOLVED}"
 
 # ld64.lld: LLVM 20 Homebrew bottle doesn't include lld; use LLVM 18's copy
-LLD_PATH="$(brew --prefix llvm@18 2>/dev/null)/bin/ld64.lld"
+LLD_PATH="$(brew_prefix llvm@18)/bin/ld64.lld"
 if [ ! -x "${LLD_PATH}" ]; then
-    echo "  [WARN] ld64.lld not found at ${LLD_PATH}. Install llvm@18: brew install llvm@18"
+    echo "  [FAIL] ld64.lld not found at ${LLD_PATH}. Install llvm@18: ${BREW_BIN} install llvm@18" >&2
+    exit 1
 fi
 
 cmake .. \

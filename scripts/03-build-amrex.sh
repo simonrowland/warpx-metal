@@ -9,6 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
+ensure_macos_sdk
 
 ACPP_ATTESTATION="${ACPP_INSTALL_PREFIX}/bin/BUILD-ATTESTATION.json"
 if [ ! -f "${ACPP_ATTESTATION}" ]; then
@@ -231,7 +232,7 @@ echo "=== Step 3: Configure AMReX with CMake ==="
 cd "${BUILD_DIR}"
 
 # macOS SDK sysroot (needed for Homebrew LLVM)
-MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+MACOS_SDK="${WARPX_MACOS_SDK_RESOLVED}"
 
 cmake "${AMREX_SOURCE_DIR}" \
     -G Ninja \
