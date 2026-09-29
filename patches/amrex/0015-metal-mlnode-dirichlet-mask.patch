@@ -1,0 +1,98 @@
+diff --git a/Src/LinearSolvers/MLMG/AMReX_MLNodeLinOp_3D_K.H b/Src/LinearSolvers/MLMG/AMReX_MLNodeLinOp_3D_K.H
+--- a/Src/LinearSolvers/MLMG/AMReX_MLNodeLinOp_3D_K.H
++++ b/Src/LinearSolvers/MLMG/AMReX_MLNodeLinOp_3D_K.H
+@@ -666,66 +666,34 @@
+ {
+     const auto lo = amrex::lbound(bx);
+     const auto hi = amrex::ubound(bx);
+-    for (int k = lo.z; k <= hi.z; ++k) {
+-    for (int j = lo.y; j <= hi.y; ++j) {
+-    AMREX_PRAGMA_SIMD
+-    for (int i = lo.x; i <= hi.x; ++i) {
+-        if (!dmsk(i,j,k)) {
+-            dmsk(i,j,k) = (omsk(i-1,j-1,k-1) == 1 || omsk(i,j-1,k-1) == 1 ||
+-                           omsk(i-1,j  ,k-1) == 1 || omsk(i,j  ,k-1) == 1 ||
+-                           omsk(i-1,j-1,k  ) == 1 || omsk(i,j-1,k  ) == 1 ||
+-                           omsk(i-1,j  ,k  ) == 1 || omsk(i,j  ,k  ) == 1);
+-        }
+-    }}}
+-
+-    const auto domlo = amrex::lbound(dom);
+-    const auto domhi = amrex::ubound(dom);
+-
+-    if (bclo[0] == LinOpBCType::Dirichlet && lo.x == domlo.x) {
+-        for (int k = lo.z; k <= hi.z; ++k) {
+-        for (int j = lo.y; j <= hi.y; ++j) {
+-            dmsk(lo.x,j,k) = 1;
+-        }}
+-    }
+-
+-    if (bchi[0] == LinOpBCType::Dirichlet && hi.x == domhi.x) {
+-        for (int k = lo.z; k <= hi.z; ++k) {
+-        for (int j = lo.y; j <= hi.y; ++j) {
+-            dmsk(hi.x,j,k) = 1;
+-        }}
+-    }
+-
+-    if (bclo[1] == LinOpBCType::Dirichlet && lo.y == domlo.y) {
+-        for (int k = lo.z; k <= hi.z; ++k) {
+-        AMREX_PRAGMA_SIMD
+-        for (int i = lo.x; i <= hi.x; ++i) {
+-            dmsk(i,lo.y,k) = 1;
+-        }}
+-    }
+-
+-    if (bchi[1] == LinOpBCType::Dirichlet && hi.y == domhi.y) {
+-        for (int k = lo.z; k <= hi.z; ++k) {
+-        AMREX_PRAGMA_SIMD
+-        for (int i = lo.x; i <= hi.x; ++i) {
+-            dmsk(i,hi.y,k) = 1;
+-        }}
+-    }
+-
+-    if (bclo[2] == LinOpBCType::Dirichlet && lo.z == domlo.z) {
+-        for (int j = lo.y; j <= hi.y; ++j) {
+-        AMREX_PRAGMA_SIMD
+-        for (int i = lo.x; i <= hi.x; ++i) {
+-            dmsk(i,j,lo.z) = 1;
+-        }}
+-    }
+-
+-    if (bchi[2] == LinOpBCType::Dirichlet && hi.z == domhi.z) {
+-        for (int j = lo.y; j <= hi.y; ++j) {
+-        AMREX_PRAGMA_SIMD
+-        for (int i = lo.x; i <= hi.x; ++i) {
+-            dmsk(i,j,hi.z) = 1;
+-        }}
+-    }
++    const auto domlo = amrex::lbound(dom);
++    const auto domhi = amrex::ubound(dom);
++
++    const bool xlo_dirichlet = (bclo[0] == LinOpBCType::Dirichlet && lo.x == domlo.x);
++    const bool xhi_dirichlet = (bchi[0] == LinOpBCType::Dirichlet && hi.x == domhi.x);
++    const bool ylo_dirichlet = (bclo[1] == LinOpBCType::Dirichlet && lo.y == domlo.y);
++    const bool yhi_dirichlet = (bchi[1] == LinOpBCType::Dirichlet && hi.y == domhi.y);
++    const bool zlo_dirichlet = (bclo[2] == LinOpBCType::Dirichlet && lo.z == domlo.z);
++    const bool zhi_dirichlet = (bchi[2] == LinOpBCType::Dirichlet && hi.z == domhi.z);
++
++    for (int k = lo.z; k <= hi.z; ++k) {
++    for (int j = lo.y; j <= hi.y; ++j) {
++    AMREX_PRAGMA_SIMD
++    for (int i = lo.x; i <= hi.x; ++i) {
++        const bool on_dirichlet_boundary =
++            (xlo_dirichlet && i == lo.x) || (xhi_dirichlet && i == hi.x) ||
++            (ylo_dirichlet && j == lo.y) || (yhi_dirichlet && j == hi.y) ||
++            (zlo_dirichlet && k == lo.z) || (zhi_dirichlet && k == hi.z);
++        if (!dmsk(i,j,k)) {
++            const int covered = (omsk(i-1,j-1,k-1) == 1 || omsk(i,j-1,k-1) == 1 ||
++                                 omsk(i-1,j  ,k-1) == 1 || omsk(i,j  ,k-1) == 1 ||
++                                 omsk(i-1,j-1,k  ) == 1 || omsk(i,j-1,k  ) == 1 ||
++                                 omsk(i-1,j  ,k  ) == 1 || omsk(i,j  ,k  ) == 1);
++            dmsk(i,j,k) = on_dirichlet_boundary ? 1 : covered;
++        } else if (on_dirichlet_boundary) {
++            dmsk(i,j,k) = 1;
++        }
++    }}}
+ }
+ 
+ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
