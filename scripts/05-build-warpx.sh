@@ -18,6 +18,26 @@ ensure_macos_sdk
 WARPX_SOURCE_DIR="${WARPX_METAL_ROOT}/extern/warpx"
 ACPP="${ACPP_INSTALL_PREFIX}/bin/acpp"
 METAL_DIMS="${WARPX_METAL_DIMS:-1;2;RZ;3}"
+WARPX_OPENPMD_BP="${WARPX_OPENPMD_BP:-OFF}"
+
+if [[ "${WARPX_OPENPMD_BP}" == "ON" ]]; then
+    ADIOS2_DIR="${ADIOS2_DIR:-$(brew --prefix adios2)/lib/cmake/adios2}"
+    OPENPMD_CMAKE_ARGS=(
+        -DWarpX_OPENPMD=ON
+        -DWarpX_openpmd_internal=ON
+        -DWarpX_openpmd_branch=0.17.0
+        -DopenPMD_USE_ADIOS2=ON
+        -DopenPMD_USE_HDF5=OFF
+        -DopenPMD_USE_FILESYSTEM_HEADER=OFF
+        "-DADIOS2_DIR=${ADIOS2_DIR}"
+    )
+elif [[ "${WARPX_OPENPMD_BP}" == "OFF" ]]; then
+    OPENPMD_CMAKE_ARGS=(-DWarpX_OPENPMD=OFF)
+else
+    echo "[FAIL] WARPX_OPENPMD_BP must be ON or OFF"
+    exit 1
+fi
+export WARPX_OPENPMD_BP
 
 # Verify acpp is available
 if [ ! -x "${ACPP}" ]; then
@@ -283,7 +303,7 @@ cmake -S "${WARPX_SOURCE_DIR}" -B . \
     -DWarpX_MPI=OFF \
     -DWarpX_FFT=OFF \
     -DWarpX_QED=OFF \
-    -DWarpX_OPENPMD=OFF \
+    "${OPENPMD_CMAKE_ARGS[@]}" \
     -DWarpX_amrex_src="${AMREX_SOURCE_DIR}"
 
 echo ""
