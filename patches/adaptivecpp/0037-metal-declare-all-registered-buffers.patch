@@ -1,0 +1,78 @@
+Subject: [PATCH] Declare all registered Metal buffers for each dispatch
+
+Metal must know about resources reached through translated pointers embedded
+in kernel arguments, such as AMReX copy-tag vectors. Declare every registered
+USM buffer before dispatch so indirect targets remain available to the shader.
+
+diff --git a/src/runtime/metal/metal_queue.cpp b/src/runtime/metal/metal_queue.cpp
+--- a/src/runtime/metal/metal_queue.cpp
++++ b/src/runtime/metal/metal_queue.cpp
+@@ -539,14 +539,9 @@
+ }
+ 
+ bool make_pointer_translation_table(
+-    metal_allocator* allocator,
++    const std::vector<metal_allocator::pointer_translation_entry>& entries,
+     metal_pointer_translation_table& table,
+     std::string& error_msg) {
+-  if (!allocator) {
+-    return true;
+-  }
+-
+-  auto entries = allocator->get_pointer_translation_entries();
+   if (entries.size() > metal_pointer_translation_max_entries) {
+     std::ostringstream os;
+     os << "metal_queue: pointer translation table overflow: registered_buffers="
+@@ -615,7 +610,6 @@
+       auto [buffer, offset, _] = allocator->get_usm_block(usm_ptr);
+       if (buffer) {
+         arg_enc->setBuffer(buffer, offset, i);
+-        encoder->useResource(buffer, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+       } else {
+         // Argument buffer memory may be reused (e.g. mmap-backed region), so
+         // stale pointer slots must be explicitly zeroed rather than left as-is.
+@@ -714,9 +708,12 @@
+   const NS::UInteger buf_offset = metal_user_arg_buffer_offset;
+   encoder->setBytes(&user_local_mem_size, sizeof(uint32_t), metal_local_mem_size_buffer_index);
+   std::vector<NS::SharedPtr<MTL::Buffer>> buffers_out;
++  const auto registered_buffers = allocator
++      ? allocator->get_pointer_translation_entries()
++      : std::vector<metal_allocator::pointer_translation_entry>{};
+   metal_pointer_translation_table pointer_translation_table;
+   std::string pointer_translation_error;
+-  if (!make_pointer_translation_table(allocator, pointer_translation_table, pointer_translation_error)) {
++  if (!make_pointer_translation_table(registered_buffers, pointer_translation_table, pointer_translation_error)) {
+     encoder->endEncoding();
+     return make_error(__acpp_here(), error_info{pointer_translation_error});
+   }
+@@ -756,6 +753,30 @@
+   } else {
+     encode_arguments_argbuffer(
+       encoder, device, allocator, function.get(), args, arg_sizes, num_args, is_pointer_arg, buffers_out, buf_offset);
++  }
++
++  // Declare resources reached through translated pointers embedded in kernel
++  // arguments, such as AMReX copy-tag vectors. Direct bindings alone do not
++  // cover targets in other registered USM buffers.
++  std::vector<MTL::Resource*> resources;
++  resources.reserve(registered_buffers.size());
++  for (const auto& entry : registered_buffers) {
++    void* pointer = reinterpret_cast<void*>(
++        static_cast<std::uintptr_t>(entry.host_base));
++    auto [buffer, offset, type] = allocator->get_usm_block(pointer);
++    if (!buffer && entry.gpu_base != entry.host_base) {
++      pointer = reinterpret_cast<void*>(
++          static_cast<std::uintptr_t>(entry.gpu_base));
++      std::tie(buffer, offset, type) = allocator->get_usm_block(pointer);
++    }
++    if (buffer) {
++      resources.push_back(buffer);
++    }
++  }
++  if (!resources.empty()) {
++    encoder->useResources(
++        resources.data(), resources.size(),
++        MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+   }
+ 
+   MTL::Size num_groups_size = MTL::Size::Make(

@@ -12,7 +12,8 @@
 >
 > - `patches/warpx/` — `0001`, `0003`, `0004`, `0005`, `0006`, `0007`, `0008`, `0009`
 > - `patches/amrex-post/` — `0004`, `0005`, `0006`
-> - `patches/adaptivecpp/` — `0008`, `0018`–`0020`, `0022`, `0023`–`0033`
+> - `patches/adaptivecpp/` — `0008`, `0018`–`0020`, `0022`, `0023`–`0037`
+>   (`0037` declares registered Metal buffers reached through translated pointers)
 > - `patches/amrex/` — three replacement source files, not patches
 >
 > The numbering gaps are deliberate: retired patches keep their numbers rather
